@@ -1,13 +1,13 @@
 # Robust RAG
 
-面向中英双语通用企业知识库的完整 RAG 项目。阶段 2（Parser Router、各格式解析与 Canonical Model）已完成，下一步进入阶段 3 的 Cleaning Pipeline。
+面向中英双语通用企业知识库的完整 RAG 项目。阶段 10（管理后台、Chat UI 与图谱人工治理）已完成，下一步进入阶段 11 的 Ragas 与黄金集。
 
 完整实施方案见 [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md)。
 
 ## 当前工程组成
 
-- `backend/`：FastAPI、SQLAlchemy/Alembic、Celery Worker、Parser Router、Canonical Model、配置、日志与测试。
-- `frontend/`：Vite、React 19、TypeScript 与前端测试基线。
+- `backend/`：FastAPI、SQLAlchemy/Alembic、Celery Worker、完整入库流水线、OpenSearch 检索、RAG Generation、Neo4j 图谱、管理 API、配置、日志与测试。
+- `frontend/`：Vite、React 19、TypeScript、AI Elements 源码适配，以及总览、文档、任务、Chat、图谱和系统状态页面。
 - `data/`：本地原始文件和派生产物目录，运行时内容不提交 Git。
 - `evals/`：黄金集、Rubric 与评测报告。
 
@@ -19,7 +19,7 @@
 - pnpm 10+
 - PostgreSQL 17
 - Redis 8（Celery Broker）
-- PDF 解析另需可访问的 `mineru-api`；旧版 Office 文件建议安装 LibreOffice
+- PDF、Word、PowerPoint、HTML 解析需要 MinerU 云端精准 API Token；旧版 XLS 建议安装 LibreOffice
 
 ## 初始化
 
@@ -55,13 +55,14 @@ curl -F 'file=@./example.pdf' -F 'display_name=示例文档' \
   http://127.0.0.1:8000/api/v1/documents/uploads
 ```
 
-上传成功立即返回不可变文档版本和持久化 Job。Worker 完成解析后，Job 会推进到 `cleaning`，等待阶段 3；Parse Artifact 和 Canonical JSON 均已持久化。
+上传成功立即返回不可变文档版本和持久化 Job。Worker 会连续完成解析、清洗、文档质量评估、结构感知父子分块、节点门禁、Embedding 和 OpenSearch 索引；只有投影写入与数量校验成功后文档才进入 `ready`，高风险文档会隔离或拒绝。各阶段产物、向量、报告和同步审计均会持久化。
 
 - 同一业务文档相同 SHA-256 会返回 `DUPLICATE_VERSION`。
 - 不同文档的相同内容会返回 `DUPLICATE_CONTENT`，明确传入 `allow_duplicate_content=true` 才允许保留。
 - Worker 或 Redis 短暂中断不会丢失 Job；PostgreSQL 保留最终状态，恢复扫描可重新投递。
-- PDF 路由要求配置 `MINERU_BASE_URL`；未配置时任务以可解释的 `MINERU_UNAVAILABLE` 失败。
-- DOC、PPT、XLS 通过 LibreOffice 转换；DOCX、PPTX、XLSX、HTML、Markdown、TXT 使用本地解析器。
+- PDF、DOC/DOCX、PPT/PPTX、HTML/HTM 通过 MinerU 云端精准 API 解析，必须配置 `MINERU_TOKEN`；原件会上传至 MinerU 云端。
+- XLSX 使用本地结构化解析器，XLS 通过 LibreOffice 转为 XLSX；Markdown、TXT 使用本地解析器。
+- MinerU 失败时会记录明确错误和可重试性，不会静默切换到 Agent 轻量 API。
 
 解析完成后可以读取结果：
 
@@ -69,9 +70,47 @@ curl -F 'file=@./example.pdf' -F 'display_name=示例文档' \
 GET /api/v1/documents/{document_id}/versions/{version_id}/parse-runs
 GET /api/v1/documents/{document_id}/versions/{version_id}/canonical/metadata
 GET /api/v1/documents/{document_id}/versions/{version_id}/canonical
+GET /api/v1/documents/{document_id}/versions/{version_id}/cleaning-runs
+GET /api/v1/documents/{document_id}/versions/{version_id}/cleaning-runs/{run_id}/document
+GET /api/v1/documents/{document_id}/versions/{version_id}/cleaning-runs/{run_id}/report
+GET /api/v1/documents/{document_id}/versions/{version_id}/cleaning-runs/{run_id}/compare?against_run_id={run_id}
+GET /api/v1/documents/{document_id}/quality
+GET /api/v1/documents/{document_id}/versions/{version_id}/quality-assessments
+GET /api/v1/documents/{document_id}/versions/{version_id}/quality-assessments/{assessment_id}/report
+GET /api/v1/documents/{document_id}/quality/review-actions
+POST /api/v1/documents/{document_id}/release
+POST /api/v1/documents/{document_id}/reject
+POST /api/v1/documents/{document_id}/quality/re-evaluate
+POST /api/v1/documents/{document_id}/reprocess
+POST /api/v1/documents/{document_id}/restore
+DELETE /api/v1/documents/{document_id}/purge
+GET /api/v1/documents/{document_id}/versions/{version_id}/chunking-runs
+GET /api/v1/documents/{document_id}/versions/{version_id}/chunking-runs/{run_id}/artifact
+GET /api/v1/documents/{document_id}/versions/{version_id}/chunking-runs/{run_id}/report
+GET /api/v1/documents/{document_id}/versions/{version_id}/retrieval-nodes
+GET /api/v1/documents/{document_id}/versions/{version_id}/retrieval-nodes/{node_id}
+GET /api/v1/documents/{document_id}/versions/{version_id}/embedding-runs
+GET /api/v1/documents/{document_id}/versions/{version_id}/indexing-runs
+GET /api/v1/system/search-capabilities
+POST /api/v1/system/search-indexes/rebuild
+POST /api/v1/system/search-indexes/switch
+POST /api/v1/documents/{document_id}/search-projection/rebuild
+DELETE /api/v1/documents/{document_id}/search-projection
+DELETE /api/v1/documents/{document_id}
+POST /api/v1/retrieval/search
+GET /api/v1/retrieval/traces
+GET /api/v1/retrieval/traces/{trace_id}
 ```
 
 阶段 2 的设计和运行说明见 [docs/STAGE2_PARSING.md](docs/STAGE2_PARSING.md)。
+阶段 3 的设计和运行说明见 [docs/STAGE3_CLEANING.md](docs/STAGE3_CLEANING.md)。
+阶段 4 的设计和运行说明见 [docs/STAGE4_QUALITY.md](docs/STAGE4_QUALITY.md)。
+阶段 5 的设计和运行说明见 [docs/STAGE5_CHUNKING.md](docs/STAGE5_CHUNKING.md)。
+阶段 6 的设计和运行说明见 [docs/STAGE6_EMBEDDING_OPENSEARCH.md](docs/STAGE6_EMBEDDING_OPENSEARCH.md)。
+阶段 7 的设计和运行说明见 [docs/STAGE7_RETRIEVAL.md](docs/STAGE7_RETRIEVAL.md)。
+阶段 8 的生成、会话和引用说明见 [docs/STAGE8_GENERATION.md](docs/STAGE8_GENERATION.md)。
+阶段 9 的知识图谱构建与检索说明见 [docs/STAGE9_KNOWLEDGE_GRAPH.md](docs/STAGE9_KNOWLEDGE_GRAPH.md)。
+阶段 10 的管理后台、Chat UI 与生命周期操作说明见 [docs/STAGE10_ADMIN_UI.md](docs/STAGE10_ADMIN_UI.md)。
 
 ## 工程检查
 

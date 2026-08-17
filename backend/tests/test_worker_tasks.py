@@ -109,3 +109,161 @@ def test_advance_handles_missing_and_terminal_jobs(
 
     assert result["status"] == "cancelled"
     assert result["current_stage"] == "indexing"
+
+
+def test_advance_dispatches_cleaning_service(
+    session_factory: sessionmaker[Session], monkeypatch: MonkeyPatch
+) -> None:
+    job_id = create_job(session_factory, stage=StageName.CLEANING)
+    monkeypatch.setattr(tasks, "SessionLocal", session_factory)
+    executed: list[uuid.UUID] = []
+
+    def execute(value: uuid.UUID) -> str:
+        executed.append(value)
+        return "deferred"
+
+    fake_service = SimpleNamespace(execute=execute)
+    monkeypatch.setattr(tasks, "get_cleaning_service", lambda _factory: fake_service)
+
+    result = tasks.advance_ingestion(str(job_id))
+
+    assert executed == [job_id]
+    assert result == {
+        "job_id": str(job_id),
+        "status": "deferred",
+        "current_stage": "cleaning",
+    }
+
+
+def test_advance_dispatches_quality_service(
+    session_factory: sessionmaker[Session], monkeypatch: MonkeyPatch
+) -> None:
+    job_id = create_job(session_factory, stage=StageName.DOCUMENT_EVALUATING)
+    monkeypatch.setattr(tasks, "SessionLocal", session_factory)
+    executed: list[uuid.UUID] = []
+
+    def execute(value: uuid.UUID) -> str:
+        executed.append(value)
+        return "quarantined"
+
+    fake_service = SimpleNamespace(execute=execute)
+    monkeypatch.setattr(tasks, "get_quality_service", lambda _factory: fake_service)
+
+    result = tasks.advance_ingestion(str(job_id))
+
+    assert executed == [job_id]
+    assert result == {
+        "job_id": str(job_id),
+        "status": "quarantined",
+        "current_stage": "document_evaluating",
+    }
+
+
+def test_advance_dispatches_chunking_service(
+    session_factory: sessionmaker[Session], monkeypatch: MonkeyPatch
+) -> None:
+    job_id = create_job(session_factory, stage=StageName.CHUNKING)
+    monkeypatch.setattr(tasks, "SessionLocal", session_factory)
+    executed: list[uuid.UUID] = []
+
+    def execute(value: uuid.UUID) -> str:
+        executed.append(value)
+        return "deferred"
+
+    fake_service = SimpleNamespace(execute=execute)
+    monkeypatch.setattr(tasks, "get_chunking_service", lambda _factory: fake_service)
+
+    result = tasks.advance_ingestion(str(job_id))
+
+    assert executed == [job_id]
+    assert result == {
+        "job_id": str(job_id),
+        "status": "deferred",
+        "current_stage": "chunking",
+    }
+
+
+def test_quality_success_continues_into_chunking(
+    session_factory: sessionmaker[Session], monkeypatch: MonkeyPatch
+) -> None:
+    job_id = create_job(session_factory, stage=StageName.DOCUMENT_EVALUATING)
+    monkeypatch.setattr(tasks, "SessionLocal", session_factory)
+    chunked: list[uuid.UUID] = []
+
+    def evaluate(value: uuid.UUID) -> str:
+        with session_factory.begin() as db:
+            job = db.get(IngestionJob, value)
+            assert job is not None
+            job.current_stage = StageName.CHUNKING
+        return "deferred"
+
+    def chunk(value: uuid.UUID) -> str:
+        chunked.append(value)
+        return "deferred"
+
+    monkeypatch.setattr(
+        tasks, "get_quality_service", lambda _factory: SimpleNamespace(execute=evaluate)
+    )
+    monkeypatch.setattr(
+        tasks, "get_chunking_service", lambda _factory: SimpleNamespace(execute=chunk)
+    )
+
+    result = tasks.advance_ingestion(str(job_id))
+
+    assert chunked == [job_id]
+    assert result == {
+        "job_id": str(job_id),
+        "status": "deferred",
+        "current_stage": "chunking",
+    }
+
+
+def test_chunk_evaluation_continues_through_embedding_and_indexing(
+    session_factory: sessionmaker[Session], monkeypatch: MonkeyPatch
+) -> None:
+    job_id = create_job(session_factory, stage=StageName.CHUNK_EVALUATING)
+    monkeypatch.setattr(tasks, "SessionLocal", session_factory)
+    executed: list[str] = []
+
+    def gate(value: uuid.UUID) -> str:
+        executed.append("gate")
+        with session_factory.begin() as db:
+            job = db.get(IngestionJob, value)
+            assert job is not None
+            job.current_stage = StageName.EMBEDDING
+        return "deferred"
+
+    def embed(value: uuid.UUID) -> str:
+        executed.append("embedding")
+        with session_factory.begin() as db:
+            job = db.get(IngestionJob, value)
+            assert job is not None
+            job.current_stage = StageName.INDEXING
+        return "deferred"
+
+    def index(value: uuid.UUID) -> str:
+        executed.append("indexing")
+        with session_factory.begin() as db:
+            job = db.get(IngestionJob, value)
+            assert job is not None
+            job.status = JobStatus.SUCCEEDED
+        return "succeeded"
+
+    monkeypatch.setattr(
+        tasks, "RetrievalNodeGateService", lambda _factory: SimpleNamespace(execute=gate)
+    )
+    monkeypatch.setattr(
+        tasks, "get_embedding_service", lambda _factory: SimpleNamespace(execute=embed)
+    )
+    monkeypatch.setattr(
+        tasks, "get_indexing_service", lambda _factory: SimpleNamespace(execute=index)
+    )
+
+    result = tasks.advance_ingestion(str(job_id))
+
+    assert executed == ["gate", "embedding", "indexing"]
+    assert result == {
+        "job_id": str(job_id),
+        "status": "succeeded",
+        "current_stage": "indexing",
+    }

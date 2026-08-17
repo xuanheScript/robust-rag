@@ -185,6 +185,55 @@ def retry_failed_job(db: Session, dispatcher: JobDispatcher, job_id: uuid.UUID) 
     return job
 
 
+def create_reprocess_job(
+    db: Session, dispatcher: JobDispatcher, document_id: uuid.UUID
+) -> IngestionJob:
+    document = db.scalar(select(Document).where(Document.id == document_id).with_for_update())
+    if document is None or document.status is DocumentStatus.DELETED:
+        raise AppError(code="DOCUMENT_NOT_FOUND", message="Document was not found", status_code=404)
+    if document.current_version_id is None:
+        raise AppError(
+            code="DOCUMENT_VERSION_NOT_READY",
+            message="The document has no current version to reprocess",
+            status_code=409,
+        )
+    active_job = db.scalar(
+        select(IngestionJob)
+        .where(
+            IngestionJob.document_version_id == document.current_version_id,
+            IngestionJob.status.in_([JobStatus.PENDING, JobStatus.RUNNING]),
+        )
+        .order_by(IngestionJob.created_at.desc())
+        .limit(1)
+    )
+    if active_job is not None:
+        raise AppError(
+            code="DOCUMENT_REPROCESS_IN_PROGRESS",
+            message="This document already has an active processing job",
+            status_code=409,
+            details={"job_id": str(active_job.id)},
+        )
+
+    job = IngestionJob(
+        document_version_id=document.current_version_id,
+        job_type=JobType.REPROCESS,
+        status=JobStatus.PENDING,
+        current_stage=StageName.PARSING,
+        progress_current=1,
+        progress_total=8,
+    )
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+    try:
+        job.celery_task_id = dispatcher.dispatch(job.id)
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        logger.warning("job_reprocess_dispatch_deferred", job_id=str(job.id), error=str(exc))
+    return job
+
+
 def _resolve_document(
     db: Session,
     document_id: uuid.UUID | None,

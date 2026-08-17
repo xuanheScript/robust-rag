@@ -25,7 +25,13 @@ dependencies = [
   "sqlalchemy>=2.0,<3",
   "structlog>=25.4,<26",
   "uvicorn[standard]>=0.35,<1",
+  "llama-index-core>=0.14.23,<0.15",
+  "llama-index-graph-stores-neo4j>=0.7,<0.8",
+  "neo4j>=5.16,<6",
 ]
+
+[project.optional-dependencies]
+dingo = ["dingo-python==2.5.0"]
 
 [dependency-groups]
 dev = [
@@ -63,6 +69,9 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 addopts = "--strict-config --strict-markers --cov=robust_rag --cov-report=term-missing"
 testpaths = ["tests"]
+markers = [
+  "integration_live: opt-in tests that call configured external or paid services",
+]
 
 [tool.coverage.run]
 branch = true

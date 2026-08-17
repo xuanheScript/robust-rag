@@ -6,6 +6,7 @@ import uuid
 import zipfile
 from pathlib import Path
 
+import httpx
 import pytest
 from docx import Document as WordDocument
 from openpyxl import Workbook
@@ -210,6 +211,191 @@ def test_mineru_content_list_mapping_and_zip_validation(tmp_path: Path) -> None:
         archive.writestr("report.md", "text")
     with pytest.raises(ParseError, match="content_list"):
         MinerUParser._extract_content_list(missing_payload.getvalue())
+
+    ppt_metadata = FileMetadata(
+        filename="briefing.pptx",
+        mime_type="application/pptx",
+        file_size=100,
+        sha256="b" * 64,
+    )
+    ppt = MinerUParser.from_content_list(content_list[1:3], ppt_metadata)
+    assert ppt.metadata["slide_count"] == 1
+    assert ppt.blocks[0].block_type is BlockType.SLIDE
+    assert ppt.blocks[1].source_locators[0].slide_number == 1
+
+
+def test_mineru_precision_api_signed_upload_poll_and_download(tmp_path: Path) -> None:
+    pdf_path = tmp_path / "report.pdf"
+    pdf_bytes = b"%PDF-1.7\nprecision"
+    pdf_path.write_bytes(pdf_bytes)
+    file_metadata = metadata(pdf_path, "application/pdf")
+    content_list = [
+        {"type": "text", "text": "精准报告", "text_level": 1, "page_idx": 0},
+        {"type": "text", "text": "Revenue 收入", "page_idx": 0},
+    ]
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w") as output:
+        output.writestr("report/report_content_list.json", json.dumps(content_list))
+        output.writestr("report/full.md", "# 精准报告")
+
+    poll_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal poll_count
+        if request.url.path == "/api/v4/file-urls/batch":
+            assert request.method == "POST"
+            assert request.headers["Authorization"] == "Bearer test-token"
+            body = json.loads(request.content)
+            assert body["model_version"] == "vlm"
+            assert body["files"] == [{"name": "report.pdf", "data_id": "a" * 64, "is_ocr": True}]
+            return httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "data": {
+                        "batch_id": "batch-1",
+                        "file_urls": ["https://upload.example/report.pdf"],
+                    },
+                    "trace_id": "trace-submit",
+                },
+            )
+        if request.url.host == "upload.example":
+            assert request.method == "PUT"
+            assert "Authorization" not in request.headers
+            assert request.headers["Content-Length"] == str(len(pdf_bytes))
+            assert request.read() == pdf_bytes
+            return httpx.Response(200)
+        if request.url.path == "/api/v4/extract-results/batch/batch-1":
+            assert request.headers["Authorization"] == "Bearer test-token"
+            poll_count += 1
+            state = "running" if poll_count == 1 else "done"
+            result: dict[str, object] = {
+                "file_name": "report.pdf",
+                "data_id": "a" * 64,
+                "state": state,
+                "err_msg": "",
+            }
+            if state == "done":
+                result["full_zip_url"] = "https://cdn.example/result.zip"
+            return httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "data": {"batch_id": "batch-1", "extract_result": [result]},
+                    "trace_id": "trace-result",
+                },
+            )
+        if request.url.host == "cdn.example":
+            assert "Authorization" not in request.headers
+            return httpx.Response(200, content=archive.getvalue())
+        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+    parser = MinerUParser(
+        base_url="https://mineru.net/api/v4",
+        token="test-token",
+        timeout_seconds=5,
+        poll_interval_seconds=0.001,
+        model_version="vlm",
+        transport=httpx.MockTransport(handler),
+    )
+    artifact = parser.parse(pdf_path, file_metadata)
+
+    assert "test-token" not in json.dumps(parser.config_snapshot)
+    assert artifact.parser_name == "mineru-precision"
+    assert artifact.title == "精准报告"
+    assert artifact.metadata["mineru_batch_id"] == "batch-1"
+    assert artifact.metadata["mineru_trace_id"] == "trace-result"
+    assert artifact.metadata["mineru_model_version"] == "vlm"
+    assert poll_count == 2
+
+
+def test_mineru_precision_html_and_explicit_auth_failures(tmp_path: Path) -> None:
+    html_path = tmp_path / "policy.htm"
+    html_path.write_text("<p>original</p>", encoding="utf-8")
+    file_metadata = metadata(html_path, "text/html")
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w") as output:
+        output.writestr(
+            "policy/main.html",
+            "<html><head><title>制度</title></head><body><h1>Policy</h1><p>正文</p></body></html>",
+        )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v4/file-urls/batch":
+            body = json.loads(request.content)
+            assert body["model_version"] == "MinerU-HTML"
+            assert body["files"][0]["name"] == "policy.html"
+            return httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "data": {
+                        "batch_id": "html-batch",
+                        "file_urls": ["https://upload.example/policy.html"],
+                    },
+                },
+            )
+        if request.url.host == "upload.example":
+            return httpx.Response(200)
+        if request.url.path.endswith("/html-batch"):
+            return httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "data": {
+                        "extract_result": [
+                            {
+                                "data_id": "a" * 64,
+                                "state": "done",
+                                "full_zip_url": "https://cdn.example/html.zip",
+                            }
+                        ]
+                    },
+                },
+            )
+        if request.url.host == "cdn.example":
+            return httpx.Response(200, content=archive.getvalue())
+        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+    parser = MinerUParser(
+        base_url="https://mineru.net/api/v4",
+        token="test-token",
+        timeout_seconds=5,
+        poll_interval_seconds=0.001,
+        model_version="vlm",
+        transport=httpx.MockTransport(handler),
+    )
+    artifact = parser.parse(html_path, file_metadata)
+    assert artifact.title == "制度"
+    assert artifact.metadata["mineru_model_version"] == "MinerU-HTML"
+    assert any(block.original_text == "正文" for block in artifact.blocks)
+
+    missing_token = MinerUParser(
+        base_url="https://mineru.net/api/v4",
+        token=None,
+        timeout_seconds=5,
+        poll_interval_seconds=1,
+        model_version="vlm",
+    )
+    with pytest.raises(ParseError) as missing_error:
+        missing_token.parse(html_path, file_metadata)
+    assert missing_error.value.code == "MINERU_TOKEN_MISSING"
+
+    def auth_handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"code": "A0202", "msg": "Token invalid"})
+
+    invalid_token = MinerUParser(
+        base_url="https://mineru.net/api/v4",
+        token="bad-token",
+        timeout_seconds=5,
+        poll_interval_seconds=1,
+        model_version="vlm",
+        transport=httpx.MockTransport(auth_handler),
+    )
+    with pytest.raises(ParseError) as auth_error:
+        invalid_token.parse(html_path, file_metadata)
+    assert auth_error.value.code == "MINERU_AUTH_FAILED"
+    assert auth_error.value.retryable is False
 
 
 def test_router_and_canonicalizer_are_deterministic(tmp_path: Path) -> None:

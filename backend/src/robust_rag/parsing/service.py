@@ -25,12 +25,9 @@ from robust_rag.parsing.canonicalizer import Canonicalizer
 from robust_rag.parsing.mineru import MinerUParser
 from robust_rag.parsing.native import (
     ExcelParser,
-    HtmlParser,
     LegacyOfficeParser,
     MarkdownParser,
     PlainTextParser,
-    PowerPointParser,
-    WordParser,
 )
 from robust_rag.parsing.router import ParserRouter
 from robust_rag.parsing.schemas import CANONICAL_SCHEMA_VERSION
@@ -39,7 +36,7 @@ from robust_rag.storage.local import get_file_storage
 
 
 class ParsingService:
-    config_version = "stage2-parsing-v1"
+    config_version = "stage2-parsing-v2"
 
     def __init__(
         self,
@@ -106,12 +103,15 @@ class ParsingService:
                 + 1
             )
             now = datetime.now(UTC)
+            parser_config: dict[str, object] = {"config_version": self.config_version}
+            if isinstance(parser, MinerUParser):
+                parser_config.update(parser.config_snapshot)
             parse_run = ParseRun(
                 document_version_id=version.id,
                 parser_name=parser.name,
                 parser_version=parser.version,
                 parser_mode=parser.mode,
-                parser_config={"config_version": self.config_version},
+                parser_config=parser_config,
                 status=ParseRunStatus.RUNNING,
                 started_at=now,
             )
@@ -121,7 +121,11 @@ class ParsingService:
                 implementation_name=parser.name,
                 implementation_version=parser.version,
                 config_version=self.config_version,
-                config_snapshot={"mode": parser.mode, "mime_type": metadata.mime_type},
+                config_snapshot={
+                    "mode": parser.mode,
+                    "mime_type": metadata.mime_type,
+                    **parser_config,
+                },
                 status=StageRunStatus.RUNNING,
                 attempt=attempt,
                 input_artifact_uri=version.storage_uri,
@@ -274,25 +278,22 @@ class ParsingService:
 
 
 def build_parser_router(settings: Settings) -> ParserRouter:
-    word = WordParser()
-    powerpoint = PowerPointParser()
     excel = ExcelParser()
     return ParserRouter(
         [
             MinerUParser(
                 base_url=settings.mineru_base_url,
-                api_key=settings.mineru_api_key,
+                token=(settings.mineru_token.get_secret_value() if settings.mineru_token else None),
                 timeout_seconds=settings.mineru_timeout_seconds,
-                backend=settings.mineru_backend,
+                poll_interval_seconds=settings.mineru_poll_interval_seconds,
+                model_version=settings.mineru_model_version,
+                ocr_enabled=settings.mineru_ocr_enabled,
             ),
-            word,
-            powerpoint,
             excel,
             LegacyOfficeParser(
                 settings.libreoffice_path,
-                {".docx": word, ".pptx": powerpoint, ".xlsx": excel},
+                {".xlsx": excel},
             ),
-            HtmlParser(),
             MarkdownParser(),
             PlainTextParser(),
         ]

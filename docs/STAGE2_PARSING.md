@@ -20,12 +20,12 @@ PostgreSQL 保存 ParseRun、CanonicalDocumentRecord、Job 和 StageRun；LocalF
 
 | 输入 | Parser | 关键结构与定位 |
 | --- | --- | --- |
-| PDF | MinerU HTTP Adapter | Page、BBox、标题层级、正文、表格、公式、代码、列表、脚注、原生标题文字 |
-| DOCX | python-docx | 原始正文顺序、标题、段落、列表项、表格、段落/表格序号 |
-| PPTX | python-pptx | Slide、标题、文本框、表格、Speaker Notes、Shape 序号 |
+| PDF | MinerU 云端精准 API | Page、BBox、标题层级、正文、表格、公式、代码、列表、脚注、原生标题文字 |
+| DOC/DOCX | MinerU 云端精准 API | 页面、标题、段落、列表、表格和公式；云端负责旧格式转换 |
+| PPT/PPTX | MinerU 云端精准 API | Slide/Page、标题、文本框、表格和公式 |
 | XLSX | openpyxl | 可见 Sheet、逻辑表、Display Value、Formula、Cell Range；隐藏 Sheet 排除 |
-| DOC/PPT/XLS | LibreOffice → OOXML Parser | 转换来源写入 Parse Artifact；不可用或转换失败时显式失败 |
-| HTML | BeautifulSoup | 标题、段落、列表、表格、引用、代码、链接、DOM Path；移除导航和脚本等噪声 |
+| XLS | LibreOffice → XLSX Parser | 转换来源写入 Parse Artifact；不可用或转换失败时显式失败 |
+| HTML/HTM | MinerU 云端精准 API（MinerU-HTML） | 从结果 `main.html` 生成标题、段落、列表、表格、引用、代码、链接和 DOM Path |
 | Markdown | markdown-it-py | 标题、段落、嵌套列表、代码与行号/字符范围 |
 | TXT | 原生文本 Parser | 段落、行号与字符范围 |
 
@@ -33,26 +33,39 @@ Router 同时校验 MIME、扩展名与文件签名，不只信任文件名。�
 
 ## 3. MinerU 边界
 
-PDF 通过独立运行的 `mineru-api` 调用同步 `/file_parse` 接口。Adapter 请求 ZIP 输出，并读取官方定义的 `content_list.json`，保存为内部 Parse Artifact 后再生成 Canonical Document。
+项目使用 MinerU 云端**精准解析 API**，不部署本地 MinerU，也不使用免 Token 的 Agent 轻量解析 API。PDF、DOC/DOCX、PPT/PPTX、HTML/HTM 原件会上传至 MinerU 云端。精准 API 当前官方格式列表没有 XLS/XLSX、Markdown、TXT，因此这些格式保持本地解析。
 
-选择 v1 Content List 的原因：它提供按阅读顺序排列的扁平内容块，并包含 `page_idx` 和 `bbox`；官方目前将 `content_list_v2.json` 标记为开发版本、可能变化。因此 V2 不进入内部长期契约，MinerU 升级只影响 Adapter。
+管理后台上传的本地文件采用精准 API 的签名上传流程：
+
+```text
+POST /api/v4/file-urls/batch
+  → PUT signed file_url
+  → GET /api/v4/extract-results/batch/{batch_id}
+  → GET full_zip_url
+```
+
+只有 MinerU API 请求携带 `Authorization: Bearer <MINERU_TOKEN>`；签名上传和 CDN 结果下载不得携带 Token。Adapter 对非 HTML 读取官方 `content_list.json`，对 HTML 读取 `main.html`，保存为内部 Parse Artifact 后再生成 Canonical Document。
+
+选择 v1 Content List 的原因：它提供按阅读顺序排列的扁平内容块，并包含 `page_idx` 和 `bbox`；V2 不进入内部长期契约，MinerU 升级只影响 Adapter。
 
 配置：
 
 ```dotenv
-MINERU_BASE_URL=http://127.0.0.1:8001
-MINERU_API_KEY=
+MINERU_BASE_URL=https://mineru.net/api/v4
+MINERU_TOKEN=
 MINERU_TIMEOUT_SECONDS=600
-MINERU_BACKEND=vlm-auto-engine
+MINERU_POLL_INTERVAL_SECONDS=3
+MINERU_MODEL_VERSION=vlm
+MINERU_OCR_ENABLED=true
 ```
 
-未配置或 MinerU 不可用时，PDF Job 会进入 FAILED，并记录可重试错误；不会静默降级成低质量 PDF 抽取。
+Token 缺失、鉴权失败、上传失败、轮询超时、远程任务失败或结果格式异常时，Job 会进入 FAILED 并记录明确错误；不会静默降级到 Agent 轻量 API 或本地低质量解析器。初期文件量使用 Worker 轮询，后续吞吐量提升时再引入持久化远程任务状态与回调。
 
 官方参考：
 
-- [MinerU Quick Usage](https://github.com/opendatalab/MinerU/blob/master/docs/en/usage/quick_usage.md)
+- [MinerU 云端 API 文档](https://mineru.net/doc/docs/)
+- [MinerU API Token](https://mineru.net/apiManage/token)
 - [MinerU Output Files](https://opendatalab.github.io/MinerU/reference/output_files/)
-- [MinerU Repository](https://github.com/opendatalab/MinerU)
 
 ## 4. Canonical Contract
 
@@ -85,7 +98,7 @@ GET /api/v1/documents/{document_id}/versions/{version_id}/canonical
 
 ## 7. 验收结果
 
-- 27 个后端测试全部通过，总覆盖率 89%。
+- 29 个后端测试全部通过，总覆盖率 89%。
 - Ruff、mypy strict、Alembic check 全部通过。
 - 已在本机 PostgreSQL、Redis 和 Celery 上完成真实 Markdown 上传解析：Job 从 Parsing 推进到 Cleaning，生成 7 个可追溯 Block，并通过 API 读取 Canonical JSON。
 - E2E 临时数据库记录与产物已清理，仓库只保留可重复 Fixture。

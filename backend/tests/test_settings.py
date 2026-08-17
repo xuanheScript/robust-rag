@@ -8,6 +8,26 @@ def test_settings_defaults_are_local_only() -> None:
 
     assert settings.api_host == "127.0.0.1"
     assert settings.redis_url.startswith("redis://127.0.0.1")
+    assert settings.mineru_base_url == "https://mineru.net/api/v4"
+    assert settings.mineru_token is None
+    assert settings.mineru_model_version == "vlm"
+    assert settings.mineru_ocr_enabled is True
+    assert settings.cleaning_config_version == "stage3-cleaning-v1"
+    assert settings.cleaning_near_duplicate_threshold == 0.92
+    assert settings.quality_rule_set_version == "stage4-quality-rules-v1"
+    assert settings.quality_policy_version == "stage4-quality-policy-v1"
+    assert settings.dingo_enabled is False
+    assert settings.dingo_llm_enabled is False
+    assert settings.chunking_config_version == "stage5-parent-child-v1"
+    assert settings.chunking_parent_target_tokens == 1800
+    assert settings.chunking_child_overlap_tokens == 64
+    assert settings.voyage_embedding_model == "voyage-4"
+    assert settings.voyage_embedding_dimension == 1024
+    assert settings.voyage_rerank_model == "rerank-2.5"
+    assert settings.opensearch_chunks_index == "rag-chunks-v1"
+    assert settings.opensearch_chunks_read_alias == "rag-chunks-read"
+    assert settings.retrieval_rrf_rank_constant == 60
+    assert settings.retrieval_final_child_top_k == 10
     assert settings.llm_base_url == "http://127.0.0.1:15721/v1"
     assert settings.llm_model == "gpt-5.6-luna"
 
@@ -15,8 +35,38 @@ def test_settings_defaults_are_local_only() -> None:
 def test_settings_can_be_overridden(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setenv("APP_ENV", "test")
     monkeypatch.setenv("API_PORT", "9000")
+    monkeypatch.setenv("MINERU_TOKEN", "secret-token")
+    monkeypatch.setenv("CLEANING_CONFIG_VERSION", "test-cleaning-v2")
+    monkeypatch.setenv("QUALITY_POLICY_VERSION", "test-quality-v2")
+    monkeypatch.setenv("DINGO_ENABLED", "true")
+    monkeypatch.setenv("CHUNKING_CHILD_TARGET_TOKENS", "420")
 
     settings = Settings(_env_file=None)
 
     assert settings.app_env == "test"
     assert settings.api_port == 9000
+    assert settings.mineru_token is not None
+    assert settings.mineru_token.get_secret_value() == "secret-token"
+    assert settings.cleaning_config_version == "test-cleaning-v2"
+    assert settings.quality_policy_version == "test-quality-v2"
+    assert settings.dingo_enabled is True
+    assert settings.chunking_child_target_tokens == 420
+    assert "secret-token" not in repr(settings)
+
+
+def test_blank_optional_external_settings_are_treated_as_missing(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VOYAGE_API_KEY", "")
+    monkeypatch.setenv("VOYAGE_EMBEDDING_PRICE_PER_MILLION_TOKENS", "")
+    monkeypatch.setenv("VOYAGE_RERANK_PRICE_PER_MILLION_TOKENS", "")
+    monkeypatch.setenv("OPENSEARCH_URL", "")
+    monkeypatch.setenv("OPENSEARCH_CA_CERT", "")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.voyage_api_key is None
+    assert settings.voyage_embedding_price_per_million_tokens is None
+    assert settings.voyage_rerank_price_per_million_tokens is None
+    assert settings.opensearch_url is None
+    assert settings.opensearch_ca_cert is None

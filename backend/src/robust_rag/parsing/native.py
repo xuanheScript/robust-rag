@@ -637,7 +637,8 @@ class LegacyOfficeParser:
         self.delegates = delegates
 
     def can_handle(self, metadata: FileMetadata) -> bool:
-        return metadata.extension in self.conversions
+        target_extension = self.conversions.get(metadata.extension)
+        return target_extension is not None and target_extension in self.delegates
 
     def parse(self, source_path: Path, metadata: FileMetadata) -> ParseArtifact:
         executable = shutil.which(self.executable)

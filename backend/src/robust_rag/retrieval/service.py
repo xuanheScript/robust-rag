@@ -1,0 +1,666 @@
+"""Online BM25/Dense/RRF/Rerank retrieval with durable explainability traces."""
+
+from __future__ import annotations
+
+import random
+import re
+import time
+import uuid
+from collections.abc import Callable
+from datetime import UTC, datetime
+from functools import lru_cache
+from typing import Protocol
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session, sessionmaker
+
+from robust_rag.core.settings import Settings, get_settings
+from robust_rag.db.enums import (
+    DocumentStatus,
+    ProjectionStatus,
+    RetrievalMode,
+    RetrievalNodeLevel,
+    RetrievalTraceStatus,
+    VersionStatus,
+)
+from robust_rag.db.models import Document, DocumentVersion, RetrievalNode, RetrievalTrace
+from robust_rag.db.session import SessionLocal
+from robust_rag.graph.schemas import GraphQueryResult, GraphSearchHit
+from robust_rag.indexing.embedding import EmbeddingAdapter, EmbeddingAdapterError, EmbeddingResponse
+from robust_rag.indexing.embedding_service import build_embedding_adapter
+from robust_rag.indexing.opensearch import (
+    OpenSearchAdapter,
+    OpenSearchAdapterError,
+    SearchHit,
+)
+from robust_rag.indexing.service import get_opensearch_adapter
+from robust_rag.retrieval.context import assemble_context
+from robust_rag.retrieval.fusion import FusedRank, diversify_candidates, reciprocal_rank_fusion
+from robust_rag.retrieval.query import (
+    IdentityQueryRewriter,
+    QueryRewriter,
+    QueryRewriteResult,
+    normalize_query,
+)
+from robust_rag.retrieval.rerank import (
+    RerankAdapter,
+    RerankAdapterError,
+    RerankResponse,
+    UnavailableRerankAdapter,
+    VoyageRerankAdapter,
+)
+from robust_rag.retrieval.schemas import (
+    Candidate,
+    NodeValue,
+    RetrievalSearchRequest,
+    RetrievalSearchResponse,
+    RetrievedChildRead,
+)
+
+
+class RetrievalError(Exception):
+    def __init__(self, code: str, message: str, *, retryable: bool) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.retryable = retryable
+
+
+class GraphRetriever(Protocol):
+    def search(
+        self, question: str, *, rewritten_question: str | None = None
+    ) -> GraphQueryResult: ...
+
+
+class RetrievalService:
+    def __init__(
+        self,
+        *,
+        session_factory: sessionmaker[Session],
+        search_adapter: OpenSearchAdapter,
+        embedding_adapter: EmbeddingAdapter,
+        rerank_adapter: RerankAdapter,
+        query_rewriter: QueryRewriter,
+        settings: Settings,
+        graph_retriever: GraphRetriever | None = None,
+        sleeper: Callable[[float], None] = time.sleep,
+        jitter: Callable[[], float] = random.random,
+    ) -> None:
+        self.session_factory = session_factory
+        self.search_adapter = search_adapter
+        self.embedding_adapter = embedding_adapter
+        self.rerank_adapter = rerank_adapter
+        self.query_rewriter = query_rewriter
+        self.settings = settings
+        self.graph_retriever = graph_retriever
+        self.sleeper = sleeper
+        self.jitter = jitter
+
+    @property
+    def config_snapshot(self) -> dict[str, object]:
+        return {
+            "query_max_chars": self.settings.retrieval_query_max_chars,
+            "bm25_top_k": self.settings.retrieval_bm25_top_k,
+            "dense_top_k": self.settings.retrieval_dense_top_k,
+            "rrf_top_k": self.settings.retrieval_rrf_top_k,
+            "rrf_rank_constant": self.settings.retrieval_rrf_rank_constant,
+            "bm25_weight": self.settings.retrieval_bm25_weight,
+            "dense_weight": self.settings.retrieval_dense_weight,
+            "graph_enabled": self.graph_retriever is not None and self.settings.graph_query_enabled,
+            "graph_weight": self.settings.graph_rrf_weight,
+            "max_children_per_document": self.settings.retrieval_max_children_per_document,
+            "max_children_per_parent": self.settings.retrieval_max_children_per_parent,
+            "rerank_candidate_top_k": self.settings.retrieval_rerank_candidate_top_k,
+            "final_child_top_k": self.settings.retrieval_final_child_top_k,
+            "rerank_fallback_enabled": self.settings.retrieval_rerank_fallback_enabled,
+            "context_max_tokens": self.settings.retrieval_context_max_tokens,
+            "context_parent_max_tokens": self.settings.retrieval_context_parent_max_tokens,
+            "context_neighbor_limit": self.settings.retrieval_context_neighbor_limit,
+            "chunks_read_alias": self.settings.opensearch_chunks_read_alias,
+        }
+
+    def search(
+        self,
+        request: RetrievalSearchRequest,
+        *,
+        rewrite_override: QueryRewriteResult | None = None,
+    ) -> RetrievalSearchResponse:
+        total_started = time.perf_counter()
+        normalized = normalize_query(
+            request.query, max_chars=self.settings.retrieval_query_max_chars
+        )
+        rewrite = rewrite_override or self.query_rewriter.rewrite(normalized)
+        budget = min(
+            request.context_budget_tokens or self.settings.retrieval_context_max_tokens,
+            self.settings.retrieval_context_max_tokens,
+        )
+        trace_id = self._create_trace(
+            request, normalized, rewrite.query, rewrite.snapshot(), budget
+        )
+        latency: dict[str, object] = {}
+        usage: dict[str, object] = {}
+        bm25_hits: list[SearchHit] = []
+        dense_hits: list[SearchHit] = []
+        graph_hits: list[GraphSearchHit] = []
+        graph_query_trace_id: uuid.UUID | None = None
+        graph_fallback_reason: str | None = None
+        rerank_fallback_reason: str | None = None
+        trace_status = RetrievalTraceStatus.SUCCEEDED
+
+        try:
+            if request.mode in {
+                RetrievalMode.BM25,
+                RetrievalMode.HYBRID,
+                RetrievalMode.HYBRID_RERANK,
+            }:
+                started = time.perf_counter()
+                bm25_hits, bm25_retries = self._search_with_retry(
+                    lambda: self.search_adapter.search_bm25_hits(
+                        self.settings.opensearch_chunks_read_alias,
+                        rewrite.query,
+                        self.settings.retrieval_bm25_top_k,
+                    )
+                )
+                usage["bm25_retries"] = bm25_retries
+                latency["bm25"] = _elapsed_ms(started)
+
+            if request.mode in {
+                RetrievalMode.DENSE,
+                RetrievalMode.HYBRID,
+                RetrievalMode.HYBRID_RERANK,
+            }:
+                started = time.perf_counter()
+                embedding, embedding_retries = self._embed_query_with_retry(rewrite.query)
+                latency["query_embedding"] = _elapsed_ms(started)
+                usage["query_embedding_tokens"] = embedding.total_tokens
+                usage["query_embedding_retries"] = embedding_retries
+                if (
+                    embedding.total_tokens is not None
+                    and self.settings.voyage_embedding_price_per_million_tokens is not None
+                ):
+                    usage["query_embedding_cost_usd"] = (
+                        embedding.total_tokens
+                        * self.settings.voyage_embedding_price_per_million_tokens
+                        / 1_000_000
+                    )
+                started = time.perf_counter()
+                dense_hits, dense_retries = self._search_with_retry(
+                    lambda: self.search_adapter.search_dense_hits(
+                        self.settings.opensearch_chunks_read_alias,
+                        embedding.vectors[0],
+                        self.settings.retrieval_dense_top_k,
+                    )
+                )
+                usage["dense_retries"] = dense_retries
+                latency["dense"] = _elapsed_ms(started)
+
+            if (
+                self.graph_retriever is not None
+                and self.settings.graph_query_enabled
+                and request.mode in {RetrievalMode.HYBRID, RetrievalMode.HYBRID_RERANK}
+            ):
+                started = time.perf_counter()
+                graph_result = self.graph_retriever.search(
+                    request.query, rewritten_question=rewrite.query
+                )
+                graph_hits = graph_result.hits
+                graph_query_trace_id = graph_result.trace_id
+                graph_fallback_reason = graph_result.fallback_reason
+                if graph_fallback_reason:
+                    trace_status = RetrievalTraceStatus.DEGRADED
+                latency["graph"] = _elapsed_ms(started)
+
+            started = time.perf_counter()
+            fused = reciprocal_rank_fusion(
+                bm25_hits,
+                dense_hits,
+                graph_hits,
+                rank_constant=self.settings.retrieval_rrf_rank_constant,
+                bm25_weight=self.settings.retrieval_bm25_weight,
+                dense_weight=self.settings.retrieval_dense_weight,
+                graph_weight=self.settings.graph_rrf_weight,
+                limit=self.settings.retrieval_rrf_top_k,
+            )
+            candidates = self._hydrate_candidates(fused, rewrite.query)
+            diversified, excluded = diversify_candidates(
+                candidates,
+                max_per_document=self.settings.retrieval_max_children_per_document,
+                max_per_parent=self.settings.retrieval_max_children_per_parent,
+                limit=self.settings.retrieval_rerank_candidate_top_k,
+            )
+            latency["fusion_and_diversity"] = _elapsed_ms(started)
+
+            reranked: list[Candidate] = []
+            if request.mode is RetrievalMode.HYBRID_RERANK and diversified:
+                started = time.perf_counter()
+                try:
+                    response, rerank_retries = self._rerank_with_retry(
+                        rewrite.query,
+                        [candidate.rerank_text() for candidate in diversified],
+                    )
+                    reranked = self._apply_rerank(diversified, response)
+                    usage["rerank_tokens"] = response.total_tokens
+                    usage["rerank_retries"] = rerank_retries
+                    if (
+                        response.total_tokens is not None
+                        and self.settings.voyage_rerank_price_per_million_tokens is not None
+                    ):
+                        usage["rerank_cost_usd"] = (
+                            response.total_tokens
+                            * self.settings.voyage_rerank_price_per_million_tokens
+                            / 1_000_000
+                        )
+                except RerankAdapterError as exc:
+                    if not self.settings.retrieval_rerank_fallback_enabled:
+                        raise
+                    rerank_fallback_reason = exc.code
+                    trace_status = RetrievalTraceStatus.DEGRADED
+                    reranked = list(diversified)
+                latency["rerank"] = _elapsed_ms(started)
+            else:
+                reranked = list(diversified)
+
+            final_limit = min(
+                request.top_k or self.settings.retrieval_final_child_top_k,
+                self.settings.retrieval_final_child_top_k,
+            )
+            selected = reranked[:final_limit]
+            for rank, candidate in enumerate(selected, start=1):
+                candidate.final_rank = rank
+            nodes = self._load_context_nodes(selected)
+            started = time.perf_counter()
+            context_nodes, context_used = assemble_context(
+                selected,
+                nodes,
+                budget_tokens=budget,
+                parent_max_tokens=self.settings.retrieval_context_parent_max_tokens,
+                neighbor_limit=self.settings.retrieval_context_neighbor_limit,
+            )
+            latency["context_assembly"] = _elapsed_ms(started)
+            latency["total"] = _elapsed_ms(total_started)
+            stage_values = {
+                "bm25": [_hit_snapshot(hit) for hit in bm25_hits],
+                "dense": [_hit_snapshot(hit) for hit in dense_hits],
+                "graph": [hit.snapshot() for hit in graph_hits],
+                "rrf": [value.snapshot() for value in fused],
+                "diversified": [
+                    *[dict(candidate.snapshot(), selected=True) for candidate in diversified],
+                    *[dict(value, selected=False) for value in excluded],
+                ],
+                "reranked": [candidate.snapshot() for candidate in reranked],
+                "selected": [candidate.snapshot() for candidate in selected],
+                "context": [value.model_dump(mode="json") for value in context_nodes],
+            }
+            self._complete_trace(
+                trace_id=trace_id,
+                status=trace_status,
+                stage_values=stage_values,
+                context_used=context_used,
+                usage=usage,
+                latency=latency,
+                rerank_fallback_reason=rerank_fallback_reason,
+                graph_query_trace_id=graph_query_trace_id,
+                graph_fallback_reason=graph_fallback_reason,
+            )
+        except (EmbeddingAdapterError, OpenSearchAdapterError, RerankAdapterError) as exc:
+            latency["total"] = _elapsed_ms(total_started)
+            error = _external_error(exc)
+            self._fail_trace(trace_id, error, latency)
+            raise RetrievalError(
+                str(error["code"]),
+                str(error["message"]),
+                retryable=bool(error["retryable"]),
+            ) from exc
+
+        return RetrievalSearchResponse(
+            trace_id=trace_id,
+            status=trace_status,
+            mode=request.mode,
+            query_original=request.query,
+            query_normalized=normalized,
+            query_rewritten=rewrite.query,
+            children=[self._child_read(candidate) for candidate in selected],
+            context_nodes=context_nodes,
+            context_budget_tokens=budget,
+            context_used_tokens=context_used,
+            rerank_fallback_reason=rerank_fallback_reason,
+            graph_query_trace_id=graph_query_trace_id,
+            graph_fallback_reason=graph_fallback_reason,
+            usage=usage,
+            latency_ms=latency,
+            debug=stage_values if request.debug else None,
+        )
+
+    def _create_trace(
+        self,
+        request: RetrievalSearchRequest,
+        normalized: str,
+        rewritten: str,
+        rewrite_snapshot: dict[str, object],
+        budget: int,
+    ) -> uuid.UUID:
+        with self.session_factory.begin() as db:
+            trace = RetrievalTrace(
+                query_original=request.query,
+                query_normalized=normalized,
+                query_rewritten=rewritten,
+                mode=request.mode,
+                status=RetrievalTraceStatus.RUNNING,
+                config_version=self.settings.retrieval_config_version,
+                config_snapshot={
+                    **self.config_snapshot,
+                    "request_top_k": request.top_k,
+                    "effective_final_child_top_k": min(
+                        request.top_k or self.settings.retrieval_final_child_top_k,
+                        self.settings.retrieval_final_child_top_k,
+                    ),
+                    "request_context_budget_tokens": request.context_budget_tokens,
+                    "effective_context_budget_tokens": budget,
+                },
+                rewrite_snapshot=rewrite_snapshot,
+                embedding_provider=(
+                    self.embedding_adapter.provider
+                    if request.mode is not RetrievalMode.BM25
+                    else None
+                ),
+                embedding_model=(
+                    self.embedding_adapter.model if request.mode is not RetrievalMode.BM25 else None
+                ),
+                embedding_dimension=(
+                    self.embedding_adapter.dimension
+                    if request.mode is not RetrievalMode.BM25
+                    else None
+                ),
+                rerank_provider=(
+                    self.rerank_adapter.provider
+                    if request.mode is RetrievalMode.HYBRID_RERANK
+                    else None
+                ),
+                rerank_model=(
+                    self.rerank_adapter.model
+                    if request.mode is RetrievalMode.HYBRID_RERANK
+                    else None
+                ),
+                context_budget_tokens=budget,
+                started_at=datetime.now(UTC),
+            )
+            db.add(trace)
+            db.flush()
+            return trace.id
+
+    def _hydrate_candidates(self, fused: list[FusedRank], query: str) -> list[Candidate]:
+        node_ids: list[uuid.UUID] = []
+        for value in fused:
+            try:
+                node_ids.append(uuid.UUID(value.node_id))
+            except ValueError:
+                continue
+        with self.session_factory() as db:
+            nodes = list(
+                db.scalars(
+                    select(RetrievalNode)
+                    .join(DocumentVersion, RetrievalNode.document_version_id == DocumentVersion.id)
+                    .join(Document, RetrievalNode.document_id == Document.id)
+                    .where(
+                        RetrievalNode.id.in_(node_ids),
+                        RetrievalNode.node_level.in_(
+                            [RetrievalNodeLevel.CHILD, RetrievalNodeLevel.PARENT]
+                        ),
+                        RetrievalNode.index_status == ProjectionStatus.SUCCEEDED,
+                        DocumentVersion.status == VersionStatus.READY,
+                        Document.current_version_id == RetrievalNode.document_version_id,
+                        Document.status == DocumentStatus.ACTIVE,
+                    )
+                )
+            )
+        by_id = {str(node.id): node for node in nodes}
+        candidates: list[Candidate] = []
+        for rank in fused:
+            node = by_id.get(rank.node_id)
+            if node is None:
+                continue
+            candidates.append(
+                Candidate(
+                    node_id=node.id,
+                    document_id=node.document_id,
+                    document_version_id=node.document_version_id,
+                    parent_node_id=node.parent_node_id,
+                    previous_node_id=node.previous_node_id,
+                    next_node_id=node.next_node_id,
+                    title=node.title,
+                    heading_path=node.heading_path,
+                    content=node.content,
+                    retrieval_text=node.retrieval_text,
+                    content_types=node.content_types,
+                    source_locators=node.source_locators_json,
+                    attributes=node.attributes_json,
+                    token_count=node.token_count,
+                    bm25_rank=rank.bm25_rank,
+                    bm25_score=rank.bm25_score,
+                    dense_rank=rank.dense_rank,
+                    dense_score=rank.dense_score,
+                    graph_rank=rank.graph_rank,
+                    graph_score=rank.graph_score,
+                    graph_path=rank.graph_path,
+                    rrf_score=rank.rrf_score,
+                    exact_match=_is_exact_match(query, node),
+                )
+            )
+        return candidates
+
+    def _load_context_nodes(self, selected: list[Candidate]) -> dict[uuid.UUID, NodeValue]:
+        node_ids: set[uuid.UUID] = set()
+        for candidate in selected:
+            node_ids.add(candidate.node_id)
+            node_ids.update(
+                value
+                for value in (
+                    candidate.parent_node_id,
+                    candidate.previous_node_id,
+                    candidate.next_node_id,
+                )
+                if value is not None
+            )
+        with self.session_factory() as db:
+            nodes = list(db.scalars(select(RetrievalNode).where(RetrievalNode.id.in_(node_ids))))
+        return {
+            node.id: NodeValue(
+                node_id=node.id,
+                parent_node_id=node.parent_node_id,
+                previous_node_id=node.previous_node_id,
+                next_node_id=node.next_node_id,
+                title=node.title,
+                heading_path=node.heading_path,
+                content=node.content,
+                content_types=node.content_types,
+                source_locators=node.source_locators_json,
+                attributes=node.attributes_json,
+                token_count=node.token_count,
+            )
+            for node in nodes
+        }
+
+    def _embed_query_with_retry(self, query: str) -> tuple[EmbeddingResponse, int]:
+        for retry_count in range(self.settings.voyage_embedding_max_retries + 1):
+            try:
+                return self.embedding_adapter.embed([query], input_type="query"), retry_count
+            except EmbeddingAdapterError as exc:
+                if not exc.retryable or retry_count >= self.settings.voyage_embedding_max_retries:
+                    raise
+                self._sleep_backoff(
+                    retry_count,
+                    self.settings.voyage_embedding_retry_base_seconds,
+                    self.settings.voyage_embedding_retry_max_seconds,
+                )
+        raise AssertionError("retry loop must return or raise")
+
+    def _rerank_with_retry(self, query: str, documents: list[str]) -> tuple[RerankResponse, int]:
+        for retry_count in range(self.settings.voyage_rerank_max_retries + 1):
+            try:
+                return (
+                    self.rerank_adapter.rerank(query, documents, top_k=len(documents)),
+                    retry_count,
+                )
+            except RerankAdapterError as exc:
+                if not exc.retryable or retry_count >= self.settings.voyage_rerank_max_retries:
+                    raise
+                self._sleep_backoff(
+                    retry_count,
+                    self.settings.voyage_rerank_retry_base_seconds,
+                    self.settings.voyage_rerank_retry_max_seconds,
+                )
+        raise AssertionError("retry loop must return or raise")
+
+    def _search_with_retry(
+        self, operation: Callable[[], list[SearchHit]]
+    ) -> tuple[list[SearchHit], int]:
+        for retry_count in range(self.settings.opensearch_max_retries + 1):
+            try:
+                return operation(), retry_count
+            except OpenSearchAdapterError as exc:
+                if not exc.retryable or retry_count >= self.settings.opensearch_max_retries:
+                    raise
+                self._sleep_backoff(
+                    retry_count,
+                    self.settings.opensearch_retry_base_seconds,
+                    self.settings.opensearch_retry_max_seconds,
+                )
+        raise AssertionError("retry loop must return or raise")
+
+    def _sleep_backoff(self, retry_count: int, base: float, maximum: float) -> None:
+        self.sleeper(min(maximum, base * (2**retry_count) * (0.5 + self.jitter())))
+
+    @staticmethod
+    def _apply_rerank(candidates: list[Candidate], response: RerankResponse) -> list[Candidate]:
+        reranked: list[Candidate] = []
+        for item in response.results:
+            candidate = candidates[item.index]
+            candidate.rerank_score = item.relevance_score
+            candidate.selection_reasons.append("reranked")
+            reranked.append(candidate)
+        return reranked
+
+    def _complete_trace(
+        self,
+        *,
+        trace_id: uuid.UUID,
+        status: RetrievalTraceStatus,
+        stage_values: dict[str, list[dict[str, object]]],
+        context_used: int,
+        usage: dict[str, object],
+        latency: dict[str, object],
+        rerank_fallback_reason: str | None,
+        graph_query_trace_id: uuid.UUID | None,
+        graph_fallback_reason: str | None,
+    ) -> None:
+        with self.session_factory.begin() as db:
+            trace = db.get(RetrievalTrace, trace_id)
+            if trace is None:
+                raise RuntimeError("Retrieval trace disappeared before completion")
+            trace.status = status
+            trace.bm25_candidates_json = stage_values["bm25"]
+            trace.dense_candidates_json = stage_values["dense"]
+            trace.graph_candidates_json = stage_values["graph"]
+            trace.rrf_candidates_json = stage_values["rrf"]
+            trace.diversified_candidates_json = stage_values["diversified"]
+            trace.reranked_candidates_json = stage_values["reranked"]
+            trace.selected_children_json = stage_values["selected"]
+            trace.context_nodes_json = stage_values["context"]
+            trace.context_used_tokens = context_used
+            trace.usage_json = usage
+            trace.latency_json = latency
+            trace.rerank_fallback_reason = rerank_fallback_reason
+            trace.graph_query_trace_id = graph_query_trace_id
+            trace.graph_fallback_reason = graph_fallback_reason
+            trace.finished_at = datetime.now(UTC)
+
+    def _fail_trace(
+        self, trace_id: uuid.UUID, error: dict[str, object], latency: dict[str, object]
+    ) -> None:
+        with self.session_factory.begin() as db:
+            trace = db.get(RetrievalTrace, trace_id)
+            if trace is not None:
+                trace.status = RetrievalTraceStatus.FAILED
+                trace.error = error
+                trace.latency_json = latency
+                trace.finished_at = datetime.now(UTC)
+
+    @staticmethod
+    def _child_read(candidate: Candidate) -> RetrievedChildRead:
+        return RetrievedChildRead(
+            node_id=candidate.node_id,
+            document_id=candidate.document_id,
+            document_version_id=candidate.document_version_id,
+            parent_node_id=candidate.parent_node_id,
+            title=candidate.title,
+            heading_path=candidate.heading_path,
+            content=candidate.content,
+            content_types=candidate.content_types,
+            source_locators=candidate.source_locators,
+            bm25_rank=candidate.bm25_rank,
+            bm25_score=candidate.bm25_score,
+            dense_rank=candidate.dense_rank,
+            dense_score=candidate.dense_score,
+            graph_rank=candidate.graph_rank,
+            graph_score=candidate.graph_score,
+            graph_path=candidate.graph_path,
+            rrf_score=candidate.rrf_score,
+            rerank_score=candidate.rerank_score,
+            final_rank=candidate.final_rank or 0,
+            exact_match=candidate.exact_match,
+        )
+
+
+def build_rerank_adapter(settings: Settings) -> RerankAdapter:
+    if settings.voyage_api_key is None:
+        return UnavailableRerankAdapter(settings.voyage_rerank_model)
+    return VoyageRerankAdapter(
+        api_key=settings.voyage_api_key.get_secret_value(),
+        model=settings.voyage_rerank_model,
+        base_url=settings.voyage_base_url,
+        timeout_seconds=settings.voyage_timeout_seconds,
+    )
+
+
+@lru_cache(maxsize=1)
+def get_retrieval_service() -> RetrievalService:
+    settings = get_settings()
+    from robust_rag.graph.factory import get_graph_query_gateway
+
+    return RetrievalService(
+        session_factory=SessionLocal,
+        search_adapter=get_opensearch_adapter(),
+        embedding_adapter=build_embedding_adapter(settings),
+        rerank_adapter=build_rerank_adapter(settings),
+        query_rewriter=IdentityQueryRewriter(),
+        settings=settings,
+        graph_retriever=get_graph_query_gateway(),
+    )
+
+
+def _hit_snapshot(hit: SearchHit) -> dict[str, object]:
+    return {"node_id": hit.node_id, "rank": hit.rank, "score": hit.score}
+
+
+def _elapsed_ms(started: float) -> float:
+    return round((time.perf_counter() - started) * 1000, 3)
+
+
+def _is_exact_match(query: str, node: RetrievalNode) -> bool:
+    normalized_query = query.casefold()
+    haystack = f"{node.title or ''}\n{node.retrieval_text}".casefold()
+    if normalized_query in haystack:
+        return True
+    identifiers = re.findall(r"(?=\S*[0-9])[\w./-]{3,}", normalized_query)
+    return any(re.search(rf"(?<!\w){re.escape(value)}(?!\w)", haystack) for value in identifiers)
+
+
+def _external_error(
+    error: EmbeddingAdapterError | OpenSearchAdapterError | RerankAdapterError,
+) -> dict[str, object]:
+    return {
+        "code": error.code,
+        "message": error.message,
+        "retryable": error.retryable,
+        "status_code": error.status_code,
+    }
