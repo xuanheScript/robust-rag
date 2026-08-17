@@ -8,15 +8,18 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from robust_rag.api.schemas.documents import (
+    CanonicalDocumentRecordRead,
     DocumentListResponse,
     DocumentRead,
     DocumentVersionRead,
+    ParseRunRead,
     UploadResponse,
 )
 from robust_rag.core.errors import AppError
 from robust_rag.db.enums import DocumentStatus
-from robust_rag.db.models import Document, DocumentVersion
+from robust_rag.db.models import CanonicalDocumentRecord, Document, DocumentVersion, ParseRun
 from robust_rag.db.session import get_db
+from robust_rag.parsing.schemas import CanonicalDocument
 from robust_rag.services.dispatcher import JobDispatcher, get_job_dispatcher
 from robust_rag.services.ingestion import create_document_upload
 from robust_rag.storage.base import FileStorage
@@ -95,3 +98,66 @@ def list_document_versions(document_id: uuid.UUID, db: DatabaseSession) -> list[
             .order_by(DocumentVersion.version_number.desc())
         )
     )
+
+
+@router.get("/{document_id}/versions/{version_id}/parse-runs", response_model=list[ParseRunRead])
+def list_parse_runs(
+    document_id: uuid.UUID, version_id: uuid.UUID, db: DatabaseSession
+) -> list[ParseRun]:
+    _require_version(db, document_id, version_id)
+    return list(
+        db.scalars(
+            select(ParseRun)
+            .where(ParseRun.document_version_id == version_id)
+            .order_by(ParseRun.started_at.desc())
+        )
+    )
+
+
+@router.get(
+    "/{document_id}/versions/{version_id}/canonical/metadata",
+    response_model=CanonicalDocumentRecordRead,
+)
+def get_canonical_metadata(
+    document_id: uuid.UUID, version_id: uuid.UUID, db: DatabaseSession
+) -> CanonicalDocumentRecord:
+    _require_version(db, document_id, version_id)
+    record = db.scalar(
+        select(CanonicalDocumentRecord)
+        .where(CanonicalDocumentRecord.document_version_id == version_id)
+        .order_by(CanonicalDocumentRecord.created_at.desc())
+        .limit(1)
+    )
+    if record is None:
+        raise AppError(
+            code="CANONICAL_DOCUMENT_NOT_FOUND",
+            message="Canonical document is not available",
+            status_code=404,
+        )
+    return record
+
+
+@router.get("/{document_id}/versions/{version_id}/canonical", response_model=CanonicalDocument)
+def get_canonical_document(
+    document_id: uuid.UUID,
+    version_id: uuid.UUID,
+    db: DatabaseSession,
+    storage: StorageDependency,
+) -> CanonicalDocument:
+    record = get_canonical_metadata(document_id, version_id, db)
+    return CanonicalDocument.model_validate(storage.read_json(record.artifact_uri))
+
+
+def _require_version(db: Session, document_id: uuid.UUID, version_id: uuid.UUID) -> DocumentVersion:
+    version = db.scalar(
+        select(DocumentVersion).where(
+            DocumentVersion.id == version_id, DocumentVersion.document_id == document_id
+        )
+    )
+    if version is None:
+        raise AppError(
+            code="DOCUMENT_VERSION_NOT_FOUND",
+            message="Document version was not found",
+            status_code=404,
+        )
+    return version

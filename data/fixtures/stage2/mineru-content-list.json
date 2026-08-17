@@ -1,0 +1,6 @@
+[
+  {"type":"header","text":"discarded header","bbox":[0,0,1000,20],"page_idx":0},
+  {"type":"text","text":"年度报告 Annual Report","text_level":1,"bbox":[80,100,920,160],"page_idx":0},
+  {"type":"text","text":"本年度收入增长 20%。","bbox":[80,200,920,260],"page_idx":0},
+  {"type":"table","table_caption":["表 1 核心指标"],"table_body":"<table><tr><th>指标</th><th>值</th></tr><tr><td>Revenue</td><td>100</td></tr></table>","bbox":[80,300,920,700],"page_idx":0}
+]

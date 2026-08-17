@@ -41,11 +41,13 @@ def create_job(
         return job.id
 
 
-def test_advance_is_idempotent_and_stops_at_unimplemented_parser(
+def test_advance_dispatches_parsing_service_idempotently(
     session_factory: sessionmaker[Session], monkeypatch: MonkeyPatch
 ) -> None:
     job_id = create_job(session_factory, stage=StageName.UPLOAD)
     monkeypatch.setattr(tasks, "SessionLocal", session_factory)
+    fake_service = SimpleNamespace(execute=lambda _job_id: "deferred")
+    monkeypatch.setattr(tasks, "get_parsing_service", lambda _factory: fake_service)
 
     first = tasks.advance_ingestion(str(job_id))
     second = tasks.advance_ingestion(str(job_id))

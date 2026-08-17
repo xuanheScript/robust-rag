@@ -9,6 +9,7 @@ from robust_rag.db.enums import (
     DocumentStatus,
     JobStatus,
     JobType,
+    ParseRunStatus,
     StageName,
     StageRunStatus,
     VersionStatus,
@@ -96,6 +97,37 @@ class UploadResponse(BaseModel):
 class DocumentListResponse(BaseModel):
     items: list[DocumentRead]
     total: int
+
+
+class ParseRunRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    document_version_id: uuid.UUID
+    parser_name: str
+    parser_version: str
+    parser_mode: str
+    parser_config: dict[str, object]
+    status: ParseRunStatus
+    artifact_uri: str | None
+    started_at: datetime
+    finished_at: datetime | None
+    error: dict[str, object] | None
+
+
+class CanonicalDocumentRecordRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    document_version_id: uuid.UUID
+    parse_run_id: uuid.UUID
+    schema_version: str
+    artifact_uri: str
+    language: str | None
+    title: str | None
+    block_count: int
+    content_hash: str
+    created_at: datetime
 
 
 class JobListResponse(BaseModel):

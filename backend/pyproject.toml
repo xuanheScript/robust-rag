@@ -13,9 +13,14 @@ dependencies = [
   "celery[redis]>=5.5,<6",
   "fastapi>=0.116,<1",
   "httpx>=0.28,<1",
+  "beautifulsoup4>=4.13,<5",
+  "markdown-it-py>=4,<5",
+  "openpyxl>=3.1,<4",
   "psycopg[binary]>=3.2,<4",
   "pydantic-settings>=2.10,<3",
   "python-multipart>=0.0.20,<1",
+  "python-docx>=1.2,<2",
+  "python-pptx>=1.0,<2",
   "redis>=6.2,<7",
   "sqlalchemy>=2.0,<3",
   "structlog>=25.4,<26",
@@ -52,7 +57,7 @@ plugins = ["pydantic.mypy"]
 warn_unused_ignores = true
 
 [[tool.mypy.overrides]]
-module = ["celery", "celery.*"]
+module = ["bs4", "celery", "celery.*", "docx", "docx.*", "openpyxl", "openpyxl.*", "pptx", "pptx.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

@@ -54,6 +54,14 @@ class Settings(BaseSettings):
         validation_alias="JOB_RECOVERY_AGE_SECONDS",
     )
 
+    mineru_base_url: str | None = Field(default=None, validation_alias="MINERU_BASE_URL")
+    mineru_api_key: str | None = Field(default=None, validation_alias="MINERU_API_KEY")
+    mineru_timeout_seconds: int = Field(
+        default=600, ge=1, validation_alias="MINERU_TIMEOUT_SECONDS"
+    )
+    mineru_backend: str = Field(default="vlm-auto-engine", validation_alias="MINERU_BACKEND")
+    libreoffice_path: str = Field(default="soffice", validation_alias="LIBREOFFICE_PATH")
+
     llm_base_url: str = Field(default="http://127.0.0.1:15721/v1", validation_alias="LLM_BASE_URL")
     llm_model: str = Field(default="gpt-5.6-luna", validation_alias="LLM_MODEL")
     llm_api_style: Literal["responses", "chat_completions"] = Field(

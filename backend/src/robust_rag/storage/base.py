@@ -3,7 +3,7 @@
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from fastapi import UploadFile
 
@@ -27,3 +27,9 @@ class FileStorage(Protocol):
     def discard(self, prepared: PreparedUpload) -> None: ...
 
     def delete(self, storage_uri: str) -> None: ...
+
+    def resolve(self, storage_uri: str) -> Path: ...
+
+    def write_json(self, relative_path: Path, value: Any) -> str: ...
+
+    def read_json(self, storage_uri: str) -> Any: ...

@@ -10,6 +10,7 @@ from robust_rag.core.settings import get_settings
 from robust_rag.db.enums import JobStatus, StageName, StageRunStatus
 from robust_rag.db.models import IngestionJob, StageRun
 from robust_rag.db.session import SessionLocal
+from robust_rag.parsing.service import get_parsing_service
 from robust_rag.workers.celery_app import celery_app
 
 
@@ -40,15 +41,18 @@ def advance_ingestion(job_id: str) -> AdvanceResult:
         if job.current_stage is StageName.UPLOAD:
             _complete_upload_stage(job)
 
-        # Parsing is intentionally introduced in stage 2. Keeping this durable PENDING
-        # state makes deployment/restart recovery explicit rather than reporting false success.
-        job.status = JobStatus.PENDING
-        job.updated_at = datetime.now(UTC)
-        return {
-            "job_id": job_id,
-            "status": "deferred",
-            "current_stage": job.current_stage.value,
-        }
+        current_stage = job.current_stage
+        if current_stage is not StageName.PARSING:
+            job.status = JobStatus.PENDING
+            job.updated_at = datetime.now(UTC)
+
+    if current_stage is StageName.PARSING:
+        parsing_status = get_parsing_service(SessionLocal).execute(parsed_job_id)
+        with SessionLocal() as db:
+            updated_job = db.get(IngestionJob, parsed_job_id)
+            updated_stage = updated_job.current_stage.value if updated_job else "unknown"
+        return {"job_id": job_id, "status": parsing_status, "current_stage": updated_stage}
+    return {"job_id": job_id, "status": "deferred", "current_stage": current_stage.value}
 
 
 @celery_app.task(name="ingestion.recover_pending")  # type: ignore[untyped-decorator]

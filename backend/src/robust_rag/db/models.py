@@ -25,6 +25,7 @@ from robust_rag.db.enums import (
     DocumentStatus,
     JobStatus,
     JobType,
+    ParseRunStatus,
     StageName,
     StageRunStatus,
     VersionStatus,
@@ -115,6 +116,12 @@ class DocumentVersion(Base):
 
     document: Mapped[Document] = relationship(back_populates="versions", foreign_keys=[document_id])
     jobs: Mapped[list["IngestionJob"]] = relationship(
+        back_populates="document_version", cascade="all, delete-orphan"
+    )
+    parse_runs: Mapped[list["ParseRun"]] = relationship(
+        back_populates="document_version", cascade="all, delete-orphan"
+    )
+    canonical_documents: Mapped[list["CanonicalDocumentRecord"]] = relationship(
         back_populates="document_version", cascade="all, delete-orphan"
     )
 
@@ -209,3 +216,61 @@ class StageRun(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     job: Mapped[IngestionJob] = relationship(back_populates="stage_runs")
+
+
+class ParseRun(Base):
+    __tablename__ = "parse_runs"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('running', 'succeeded', 'failed')", name="ck_parse_runs_status"
+        ),
+        Index("ix_parse_runs_version_status", "document_version_id", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    document_version_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("document_versions.id", ondelete="CASCADE"), index=True
+    )
+    parser_name: Mapped[str] = mapped_column(String(255))
+    parser_version: Mapped[str] = mapped_column(String(100))
+    parser_mode: Mapped[str] = mapped_column(String(100))
+    parser_config: Mapped[dict[str, object]] = mapped_column(JSON, default=dict)
+    status: Mapped[ParseRunStatus] = mapped_column(
+        enum_type(ParseRunStatus, "parse_run_status"), default=ParseRunStatus.RUNNING
+    )
+    artifact_uri: Mapped[str | None] = mapped_column(Text)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    error: Mapped[dict[str, object] | None] = mapped_column(JSON)
+
+    document_version: Mapped[DocumentVersion] = relationship(back_populates="parse_runs")
+    canonical_document: Mapped["CanonicalDocumentRecord | None"] = relationship(
+        back_populates="parse_run", uselist=False
+    )
+
+
+class CanonicalDocumentRecord(Base):
+    __tablename__ = "canonical_documents"
+    __table_args__ = (
+        UniqueConstraint(
+            "document_version_id", "schema_version", name="uq_canonical_version_schema"
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    document_version_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("document_versions.id", ondelete="CASCADE"), index=True
+    )
+    parse_run_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("parse_runs.id", ondelete="CASCADE"), unique=True
+    )
+    schema_version: Mapped[str] = mapped_column(String(50))
+    artifact_uri: Mapped[str] = mapped_column(Text)
+    language: Mapped[str | None] = mapped_column(String(50))
+    title: Mapped[str | None] = mapped_column(String(1000))
+    block_count: Mapped[int] = mapped_column(Integer)
+    content_hash: Mapped[str] = mapped_column(String(64), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    document_version: Mapped[DocumentVersion] = relationship(back_populates="canonical_documents")
+    parse_run: Mapped[ParseRun] = relationship(back_populates="canonical_document")

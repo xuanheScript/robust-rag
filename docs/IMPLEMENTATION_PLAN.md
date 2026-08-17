@@ -2,7 +2,7 @@
 
 > 文档状态：已确认，可作为实施基线
 > 项目类型：中英双语通用企业知识库 RAG
-> 当前阶段：阶段 1 已完成，准备进入阶段 2
+> 当前阶段：阶段 2 已完成，准备进入阶段 3
 > 最后更新：2026-08-17
 
 ## 1. 文档目的
@@ -1447,7 +1447,7 @@ eval-golden
 
 ## 30. 分阶段实施计划
 
-### 阶段 0：项目骨架与开发基线
+### 阶段 0：项目骨架与开发基线（已完成）
 
 任务：
 
@@ -1461,7 +1461,7 @@ eval-golden
 - 后端、Worker 和前端均可本机启动。
 - CI 可运行静态检查与无外部费用的测试。
 
-### 阶段 1：数据库、存储与异步任务
+### 阶段 1：数据库、存储与异步任务（已完成）
 
 任务：
 
@@ -1477,7 +1477,7 @@ eval-golden
 - Worker 重启后任务不会静默丢失。
 - 相同文件重复上传可识别。
 
-### 阶段 2：Parser Router 与 Canonical Model
+### 阶段 2：Parser Router 与 Canonical Model（已完成）
 
 任务：
 
@@ -1492,7 +1492,17 @@ eval-golden
 - Block 可追溯到页、幻灯片、Sheet/Cell 或行号。
 - 解析结果可重放。
 
-### 阶段 3：Cleaning Pipeline
+完成记录（2026-08-17）：
+
+- 已实现版本化 `parse-artifact/1.0` 与 `canonical-document/1.0` Schema。
+- PDF 使用 MinerU HTTP Adapter，并把 `content_list.json` v1 隔离在适配层；V2 暂不作为内部契约。
+- DOCX、PPTX、XLSX 使用轻量原生解析器；DOC、PPT、XLS 经可选 LibreOffice 转换后复用原生解析器。
+- HTML、Markdown、TXT 使用结构感知原生解析器，保留列表、标题、代码、表格和来源位置。
+- ParseRun、CanonicalDocumentRecord、StageRun 与文件产物均已持久化；PostgreSQL advisory lock 防止同一 Job 并发重复解析。
+- 已提供 Canonical 元数据、正文和 ParseRun 查询 API，并完成真实 PostgreSQL + Redis + Celery 端到端验收。
+- 27 个后端测试通过，覆盖全部目标格式的成功映射、签名失败、解析失败、幂等与可重放路径。
+
+### 阶段 3：Cleaning Pipeline（下一阶段）
 
 任务：
 

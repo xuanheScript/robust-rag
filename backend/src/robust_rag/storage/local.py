@@ -2,6 +2,7 @@
 
 import codecs
 import hashlib
+import json
 import os
 import re
 import tempfile
@@ -10,6 +11,7 @@ import uuid
 import zipfile
 from functools import lru_cache
 from pathlib import Path, PurePath
+from typing import Any
 
 from fastapi import UploadFile
 
@@ -157,13 +159,38 @@ class LocalFileStorage:
         prepared.temporary_path.unlink(missing_ok=True)
 
     def delete(self, storage_uri: str) -> None:
+        path = self.resolve(storage_uri)
+        path.unlink(missing_ok=True)
+
+    def resolve(self, storage_uri: str) -> Path:
         prefix = "local://"
         if not storage_uri.startswith(prefix):
             raise AppError(code="INVALID_STORAGE_URI", message="Unsupported storage URI")
         path = (self.root / storage_uri.removeprefix(prefix)).resolve()
         if not path.is_relative_to(self.root):
             raise AppError(code="INVALID_STORAGE_PATH", message="Unsafe storage path")
-        path.unlink(missing_ok=True)
+        return path
+
+    def write_json(self, relative_path: Path, value: Any) -> str:
+        destination = (self.root / relative_path).resolve()
+        if not destination.is_relative_to(self.root):
+            raise AppError(code="INVALID_STORAGE_PATH", message="Unsafe storage path")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        file_descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent
+        )
+        try:
+            with os.fdopen(file_descriptor, "w", encoding="utf-8") as output:
+                json.dump(value, output, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            os.replace(temporary_name, destination)
+        except Exception:
+            Path(temporary_name).unlink(missing_ok=True)
+            raise
+        return f"local://{relative_path.as_posix()}"
+
+    def read_json(self, storage_uri: str) -> Any:
+        with self.resolve(storage_uri).open(encoding="utf-8") as source:
+            return json.load(source)
 
     @staticmethod
     def _detect_mime(path: Path, extension: str) -> str:
