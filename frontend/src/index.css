@@ -1,0 +1,172 @@
+@import "tailwindcss";
+
+:root {
+  font-family:
+    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+    sans-serif;
+  color: #18231c;
+  background: #f2f5ed;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  background:
+    radial-gradient(circle at 15% 0%, rgb(222 237 217 / 75%), transparent 38rem),
+    #f2f5ed;
+}
+
+button,
+input,
+textarea {
+  font: inherit;
+}
+
+.app-shell {
+  width: min(1120px, calc(100% - 40px));
+  min-height: 100vh;
+  margin: 0 auto;
+  padding: 56px 0 32px;
+  display: flex;
+  flex-direction: column;
+  gap: 48px;
+}
+
+.hero {
+  padding: clamp(32px, 6vw, 72px);
+  border: 1px solid rgb(40 71 52 / 18%);
+  border-radius: 28px;
+  background: rgb(251 252 247 / 80%);
+  box-shadow: 0 30px 80px rgb(55 83 60 / 10%);
+}
+
+.hero-topline,
+footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.eyebrow {
+  font-size: 0.78rem;
+  font-weight: 800;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: #426149;
+}
+
+h1 {
+  max-width: 820px;
+  margin: 56px 0 20px;
+  font-size: clamp(2.6rem, 7vw, 5.7rem);
+  line-height: 0.98;
+  letter-spacing: -0.055em;
+  font-weight: 680;
+}
+
+.lede {
+  max-width: 680px;
+  margin: 0;
+  font-size: clamp(1rem, 2vw, 1.2rem);
+  line-height: 1.8;
+  color: #58655c;
+}
+
+.status {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-radius: 999px;
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
+.status::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.status-ready {
+  color: #23633a;
+  background: #dff2e4;
+}
+
+.status-pending {
+  color: #806516;
+  background: #f6edcb;
+}
+
+.status-error {
+  color: #963f34;
+  background: #f7dfdb;
+}
+
+.stage-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.stage-card {
+  min-height: 150px;
+  padding: 24px;
+  border-top: 1px solid #9cab9d;
+  background: rgb(251 252 247 / 42%);
+}
+
+.stage-card span {
+  color: #809083;
+  font-size: 0.8rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.stage-card h2 {
+  margin: 34px 0 0;
+  font-size: 1.08rem;
+  font-weight: 620;
+}
+
+footer {
+  margin-top: auto;
+  padding: 20px 0 0;
+  border-top: 1px solid rgb(40 71 52 / 18%);
+  color: #69756c;
+  font-size: 0.82rem;
+}
+
+@media (max-width: 760px) {
+  .app-shell {
+    width: min(100% - 24px, 1120px);
+    padding-top: 12px;
+  }
+
+  .hero {
+    padding: 28px 22px 36px;
+    border-radius: 20px;
+  }
+
+  .hero-topline {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  h1 {
+    margin-top: 42px;
+  }
+
+  .stage-grid {
+    grid-template-columns: 1fr;
+  }
+}

@@ -1,0 +1,63 @@
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Editors and IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Node
+node_modules/
+frontend/dist/
+frontend/coverage/
+*.tsbuildinfo
+
+# Local caches and runtime data
+.cache/
+tmp/
+temp/
+data/originals/*
+data/parse-artifacts/*
+data/canonical/*
+!data/originals/.gitkeep
+!data/parse-artifacts/.gitkeep
+!data/canonical/.gitkeep
+evals/reports/*
+!evals/reports/.gitkeep
+
+# Logs
+*.log
+logs/
+
+# Local databases and task-runner state
+*.db
+*.sqlite
+*.sqlite3
+celerybeat-schedule*

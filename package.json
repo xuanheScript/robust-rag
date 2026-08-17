@@ -1,0 +1,17 @@
+{
+  "name": "robust-rag",
+  "private": true,
+  "packageManager": "pnpm@10.14.0",
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
+  },
+  "scripts": {
+    "dev:web": "pnpm --dir frontend dev",
+    "build:web": "pnpm --dir frontend build",
+    "lint:web": "pnpm --dir frontend lint",
+    "test:web": "pnpm --dir frontend test",
+    "typecheck:web": "pnpm --dir frontend typecheck"
+  }
+}
