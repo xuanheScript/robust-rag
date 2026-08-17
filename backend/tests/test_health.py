@@ -24,3 +24,10 @@ def test_system_info_does_not_expose_secrets() -> None:
     assert payload["version"] == "0.1.0"
     assert "database_url" not in payload
     assert "redis_url" not in payload
+
+
+def test_ready_health_checks_database_and_redis(client: TestClient) -> None:
+    response = client.get("/health/ready")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ready", "database": "ok", "redis": "ok"}

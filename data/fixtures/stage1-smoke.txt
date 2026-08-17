@@ -1,0 +1,3 @@
+Robust RAG stage 1 smoke test.
+
+这是一份不包含敏感信息的中英混合上传样本。

@@ -25,32 +25,42 @@ class Settings(BaseSettings):
     api_host: str = Field(default="127.0.0.1", validation_alias="API_HOST")
     api_port: int = Field(default=8000, validation_alias="API_PORT")
     log_level: str = Field(default="INFO", validation_alias="LOG_LEVEL")
-    log_format: Literal["console", "json"] = Field(
-        default="console", validation_alias="LOG_FORMAT"
-    )
+    log_format: Literal["console", "json"] = Field(default="console", validation_alias="LOG_FORMAT")
 
     database_url: str = Field(
         default="postgresql+psycopg://localhost:5432/robust_rag",
         validation_alias="DATABASE_URL",
     )
-    redis_url: str = Field(
-        default="redis://127.0.0.1:6379/0", validation_alias="REDIS_URL"
-    )
+    database_echo: bool = Field(default=False, validation_alias="DATABASE_ECHO")
+    redis_url: str = Field(default="redis://127.0.0.1:6379/0", validation_alias="REDIS_URL")
     celery_result_backend: str = Field(
         default="redis://127.0.0.1:6379/1",
         validation_alias="CELERY_RESULT_BACKEND",
     )
     storage_root: Path = Field(default=Path("../data"), validation_alias="STORAGE_ROOT")
-
-    llm_base_url: str = Field(
-        default="http://127.0.0.1:15721/v1", validation_alias="LLM_BASE_URL"
+    upload_max_bytes: int = Field(
+        default=100 * 1024 * 1024,
+        ge=1,
+        validation_alias="UPLOAD_MAX_BYTES",
     )
+    upload_chunk_bytes: int = Field(
+        default=1024 * 1024,
+        ge=64 * 1024,
+        validation_alias="UPLOAD_CHUNK_BYTES",
+    )
+    job_recovery_age_seconds: int = Field(
+        default=300,
+        ge=0,
+        validation_alias="JOB_RECOVERY_AGE_SECONDS",
+    )
+
+    llm_base_url: str = Field(default="http://127.0.0.1:15721/v1", validation_alias="LLM_BASE_URL")
     llm_model: str = Field(default="gpt-5.6-luna", validation_alias="LLM_MODEL")
     llm_api_style: Literal["responses", "chat_completions"] = Field(
         default="responses", validation_alias="LLM_API_STYLE"
     )
-    llm_reasoning_effort: Literal["none", "low", "medium", "high", "xhigh", "max"] = (
-        Field(default="medium", validation_alias="LLM_REASONING_EFFORT")
+    llm_reasoning_effort: Literal["none", "low", "medium", "high", "xhigh", "max"] = Field(
+        default="medium", validation_alias="LLM_REASONING_EFFORT"
     )
 
 

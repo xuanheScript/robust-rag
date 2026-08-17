@@ -13,6 +13,7 @@ celery_app = Celery(
     "robust_rag",
     broker=settings.redis_url,
     backend=settings.celery_result_backend,
+    include=["robust_rag.workers.tasks"],
 )
 celery_app.conf.update(
     accept_content=["json"],
@@ -25,6 +26,14 @@ celery_app.conf.update(
     task_track_started=True,
     worker_send_task_events=True,
     task_send_sent_event=True,
+    broker_transport_options={"visibility_timeout": 6 * 60 * 60},
+    result_backend_transport_options={"global_keyprefix": "robust-rag:"},
+    beat_schedule={
+        "recover-stale-ingestion-jobs": {
+            "task": "ingestion.recover_pending",
+            "schedule": 300.0,
+        }
+    },
 )
 
 
