@@ -9,6 +9,7 @@ import {
   getConversation,
   getDependencies,
   getDocumentQuality,
+  getDocumentGraphRuns,
   getDocumentVersions,
   getGraphNeighborhood,
   getMessageTrace,
@@ -110,6 +111,7 @@ describe("getSystemInfo", () => {
       listDocuments(),
       getDocumentVersions("doc"),
       getDocumentQuality("doc"),
+      getDocumentGraphRuns("doc", "version"),
       uploadDocument(new File(["content"], "demo.txt"), "Demo"),
       retryDocumentJob("job"),
       reprocessDocument("doc"),
@@ -139,6 +141,6 @@ describe("getSystemInfo", () => {
       getSearchCapabilities(),
     ]);
 
-    expect(fetchMock).toHaveBeenCalledTimes(31);
+    expect(fetchMock).toHaveBeenCalledTimes(32);
   });
 });

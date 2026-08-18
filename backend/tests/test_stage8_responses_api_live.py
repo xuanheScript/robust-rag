@@ -1,4 +1,4 @@
-"""Opt-in live contract for the configured cc switch gpt-5.6-luna route."""
+"""Opt-in live contract for the configured Responses-compatible LLM API."""
 
 import json
 import os
@@ -6,36 +6,36 @@ import os
 import pytest
 
 from robust_rag.core.settings import Settings
-from robust_rag.generation.provider import CCSwitchResponsesProvider, LLMRequest
+from robust_rag.generation.provider import LLMRequest, ResponsesAPIProvider
 
 pytestmark = [
     pytest.mark.integration_live,
     pytest.mark.skipif(
-        os.getenv("RUN_LIVE_CC_SWITCH_TESTS") != "1",
-        reason="set RUN_LIVE_CC_SWITCH_TESTS=1 to allow real model calls",
+        os.getenv("RUN_LIVE_LLM_TESTS") != "1",
+        reason="set RUN_LIVE_LLM_TESTS=1 to allow real model calls",
     ),
 ]
 
 
-def test_cc_switch_gpt_5_6_luna_responses_contract() -> None:
+def test_configured_responses_api_contract() -> None:
     settings = Settings()
-    assert settings.llm_model == "gpt-5.6-luna"
-    provider = CCSwitchResponsesProvider(
+    assert settings.llm_api_key is not None
+    provider = ResponsesAPIProvider(
         base_url=settings.llm_base_url,
         model=settings.llm_model,
         reasoning_effort=settings.llm_reasoning_effort,
-        api_key=settings.llm_api_key.get_secret_value() if settings.llm_api_key else None,
+        api_key=settings.llm_api_key.get_secret_value(),
         timeout_seconds=settings.llm_timeout_seconds,
     )
 
     non_stream = provider.generate(
         LLMRequest(
-            instructions="Return exactly CCSWITCH_OK and nothing else.",
+            instructions="Return exactly RESPONSES_API_OK and nothing else.",
             input=[{"role": "user", "content": "Run the contract check."}],
             max_output_tokens=50,
         )
     )
-    assert non_stream.text.strip() == "CCSWITCH_OK"
+    assert non_stream.text.strip() == "RESPONSES_API_OK"
     assert non_stream.response_id
     assert non_stream.usage.input_tokens is not None
     assert non_stream.usage.output_tokens is not None

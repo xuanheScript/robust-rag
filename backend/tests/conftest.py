@@ -13,9 +13,12 @@ from robust_rag.api.routes.health import get_redis_client
 from robust_rag.db.base import Base
 from robust_rag.db.session import get_db
 from robust_rag.main import create_app
-from robust_rag.services.dispatcher import get_job_dispatcher
+from robust_rag.services.dispatcher import (
+    get_graph_extraction_dispatcher,
+    get_job_dispatcher,
+)
 from robust_rag.storage.local import LocalFileStorage, get_file_storage
-from tests.fakes import FakeDispatcher
+from tests.fakes import FakeDispatcher, FakeGraphDispatcher
 
 
 class FakeRedis:
@@ -59,6 +62,11 @@ def dispatcher() -> FakeDispatcher:
 
 
 @pytest.fixture
+def graph_dispatcher() -> FakeGraphDispatcher:
+    return FakeGraphDispatcher()
+
+
+@pytest.fixture
 def storage(tmp_path: Path) -> LocalFileStorage:
     return LocalFileStorage(root=tmp_path / "data", max_bytes=1024 * 1024, chunk_bytes=64 * 1024)
 
@@ -67,6 +75,7 @@ def storage(tmp_path: Path) -> LocalFileStorage:
 def client(
     session_factory: sessionmaker[Session],
     dispatcher: FakeDispatcher,
+    graph_dispatcher: FakeGraphDispatcher,
     storage: LocalFileStorage,
 ) -> Generator[TestClient, None, None]:
     app = create_app()
@@ -78,6 +87,7 @@ def client(
     app.dependency_overrides[get_db] = override_db
     app.dependency_overrides[get_file_storage] = lambda: storage
     app.dependency_overrides[get_job_dispatcher] = lambda: dispatcher
+    app.dependency_overrides[get_graph_extraction_dispatcher] = lambda: graph_dispatcher
     app.dependency_overrides[get_redis_client] = FakeRedis
     with TestClient(app) as test_client:
         yield test_client

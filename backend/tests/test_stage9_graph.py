@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from collections.abc import Generator
+from collections.abc import Generator, Sequence
 from typing import Any, cast
 
 import pytest
@@ -12,6 +12,7 @@ from pydantic import BaseModel, PrivateAttr
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
+from robust_rag.api.routes import graph as graph_routes
 from robust_rag.db.enums import (
     GraphOrigin,
     GraphProjectionStatus,
@@ -19,8 +20,10 @@ from robust_rag.db.enums import (
     GraphReviewStatus,
     GraphRunStatus,
     RetrievalMode,
+    VersionStatus,
 )
 from robust_rag.db.models import (
+    Document,
     DocumentVersion,
     GraphConflictRecord,
     GraphCorrectionAudit,
@@ -41,8 +44,8 @@ from robust_rag.graph.cypher import (
     tokenize_cypher,
 )
 from robust_rag.graph.llama_index import (
-    CCSwitchLlamaLLM,
     LlamaIndexGraphExtractor,
+    ResponsesLlamaLLM,
     build_schema_extractor,
 )
 from robust_rag.graph.query import GraphQueryGateway, _rows_to_hits, _strip_code_fence
@@ -72,6 +75,7 @@ from robust_rag.retrieval.query import IdentityQueryRewriter
 from robust_rag.retrieval.schemas import RetrievalSearchRequest
 from robust_rag.retrieval.service import RetrievalService
 from robust_rag.storage.local import LocalFileStorage
+from tests.fakes import FakeGraphDispatcher
 from tests.test_stage6_indexing import _prepare_chunked_job
 from tests.test_stage7_retrieval import (
     FakeQueryEmbeddingAdapter,
@@ -117,6 +121,16 @@ class RecordingProvider:
     def stream(self, request: LLMRequest) -> Generator[Any, None, None]:
         raise NotImplementedError
         yield
+
+
+class CountingGraphExtractor(StaticGraphExtractor):
+    def __init__(self, values: dict[str, list[ExtractedTriplet]]) -> None:
+        super().__init__(values)
+        self.calls = 0
+
+    def extract(self, sources: Sequence[tuple[str, str]]) -> dict[str, list[ExtractedTriplet]]:
+        self.calls += 1
+        return super().extract(sources)
 
 
 class StructuredSample(BaseModel):
@@ -214,9 +228,9 @@ def test_cypher_validator_accepts_bounded_read_and_tightens_limit() -> None:
     ]
 
 
-def test_llama_cc_switch_bridge_uses_responses_structured_output() -> None:
+def test_llama_responses_bridge_uses_structured_output() -> None:
     provider = RecordingProvider('{"name":"sample","count":2}')
-    llm = CCSwitchLlamaLLM(provider, max_output_tokens=123)
+    llm = ResponsesLlamaLLM(provider, max_output_tokens=123)
     result = llm.structured_predict(
         StructuredSample,
         type("Prompt", (), {"format": lambda self, **kwargs: f"value={kwargs['value']}"})(),
@@ -284,10 +298,14 @@ def test_graph_extraction_is_sourced_idempotent_and_rebuildable(
     assert parents
     values = {str(parent.id): [_triplet()] for parent in parents}
     store = InMemoryGraphStore()
-    service = _graph_service(session_factory, storage, StaticGraphExtractor(values), store)
+    extractor = CountingGraphExtractor(values)
+    service = _graph_service(session_factory, storage, extractor, store)
 
     assert service.execute(version_id) == "succeeded"
     assert service.execute(version_id) == "succeeded"
+    assert extractor.calls == 1
+    assert service.execute(version_id, force=True) == "succeeded"
+    assert extractor.calls == 2
     with session_factory() as db:
         assert db.scalar(select(func.count()).select_from(GraphEntityRecord)) == 2
         assert db.scalar(select(func.count()).select_from(GraphFactRecord)) == 1
@@ -317,6 +335,43 @@ def test_graph_extraction_is_sourced_idempotent_and_rebuildable(
     versions = client.get(f"/api/v1/documents/{document_id}/versions")
     assert versions.status_code == 200
     assert versions.json()[0]["graph_status"] == "succeeded"
+
+
+def test_document_graph_rebuild_queues_forced_extraction(
+    session_factory: sessionmaker[Session],
+    storage: LocalFileStorage,
+    client: Any,
+    graph_dispatcher: FakeGraphDispatcher,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    document_id, version_id, _job_id = _prepare_chunked_job(session_factory, storage)
+    with session_factory.begin() as db:
+        document = db.get(Document, document_id)
+        version = db.get(DocumentVersion, version_id)
+        assert document is not None and version is not None
+        document.current_version_id = version_id
+        version.status = VersionStatus.READY
+        version.graph_status = GraphProjectionStatus.FAILED
+
+    monkeypatch.setattr(graph_routes, "graph_is_configured", lambda _settings: True)
+    response = client.post(f"/api/v1/documents/{document_id}/graph/rebuild")
+
+    assert response.status_code == 202
+    assert response.json() == {
+        "document_id": str(document_id),
+        "document_version_id": str(version_id),
+        "status": "queued",
+        "task_id": f"graph-task-{version_id}",
+    }
+    assert graph_dispatcher.dispatched == [(version_id, True)]
+    with session_factory() as db:
+        version = db.get(DocumentVersion, version_id)
+        assert version is not None
+        assert version.graph_status is GraphProjectionStatus.PENDING
+
+    duplicate = client.post(f"/api/v1/documents/{document_id}/graph/rebuild")
+    assert duplicate.status_code == 409
+    assert duplicate.json()["error"]["code"] == "GRAPH_EXTRACTION_IN_PROGRESS"
 
 
 def test_graph_extraction_rejects_out_of_schema_and_records_failure(

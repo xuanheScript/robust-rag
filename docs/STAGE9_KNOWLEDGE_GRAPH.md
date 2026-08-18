@@ -7,7 +7,7 @@
 - 版本化 `enterprise-core-v1` Schema，包含 9 类实体、11 类关系及明确的允许三元组。
 - 中英文名称 NFKC/大小写/标点归一化、受控别名和 UUIDv5 稳定实体/事实 ID。
 - LlamaIndex `PropertyGraphIndex` 与 `SchemaLLMPathExtractor(strict=True)`；抽取输入限定为 Parent 节点。
-- cc switch `gpt-5.6-luna` Structured Output 适配器，不向 LlamaIndex 或前端暴露上游凭据。
+- 可配置 Responses API Structured Output 适配器，不向 LlamaIndex 或前端暴露上游凭据。
 - PostgreSQL 权威记录：抽取 Run、实体、事实、多来源证据、人工修正审计和 Text-to-Cypher Trace。
 - Neo4j 约束、索引、健康检查、幂等投影、版本隐藏、永久证据清理和全量重建接口。
 - LlamaIndex `TextToCypherRetriever` 通过应用网关执行，生成结果不能绕过校验器。
@@ -73,7 +73,7 @@ NEO4J_PASSWORD=<secret>
 NEO4J_DATABASE=neo4j
 ```
 
-还需保持阶段 8 的 `LLM_BASE_URL`、`LLM_MODEL=gpt-5.6-luna` 等 cc switch 配置。凭据仅存在后端环境变量中。
+还需配置阶段 8 的 `LLM_BASE_URL`、`LLM_API_KEY` 与 `LLM_MODEL`。凭据仅存在后端环境变量中；缺少 API Key 时图谱抽取会返回明确配置错误，不发送匿名请求。
 
 ## 迁移和运行
 
@@ -109,4 +109,4 @@ POST   /api/v1/documents/{document_id}/graph/rebuild
 
 阶段测试覆盖 Schema/稳定键、危险 Cypher、安全边界、LlamaIndex 严格配置、Structured Output、幂等抽取、多来源证据、无效候选隔离、投影失败、Text-to-Cypher Trace、Neo4j 回退、统一 Rerank、人工锁和管理 API。
 
-默认测试不连接 AuraDB 或调用付费模型。真实 AuraDB 与 cc switch 抽取验证需在显式配置的集成环境中运行。
+默认测试不连接 AuraDB 或调用付费模型。真实 AuraDB 与 LLM API 抽取验证需在显式配置的集成环境中运行。

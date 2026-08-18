@@ -189,6 +189,38 @@ class DeterministicRuleEvaluator:
                 )
             )
 
+        source_file_size = _positive_int(document.metadata.get("source_file_size"))
+        extracted_chars_per_mb: float | None = None
+        if (
+            source_file_size is not None
+            and source_file_size >= self.config.sparse_extraction_min_bytes
+        ):
+            extracted_chars_per_mb = len(joined) / (source_file_size / (1024 * 1024))
+            if joined and extracted_chars_per_mb < self.config.sparse_extraction_min_chars_per_mb:
+                issues.append(
+                    self._issue(
+                        code="SUSPICIOUSLY_SPARSE_EXTRACTION",
+                        dimension=QualityDimension.PARSE_COMPLETENESS,
+                        severity=QualityIssueSeverity.HIGH,
+                        message="Extracted text is unexpectedly sparse for the source file size",
+                        evidence=[
+                            QualityEvidence(
+                                metric="extracted_chars_per_mb",
+                                value=extracted_chars_per_mb,
+                                threshold=self.config.sparse_extraction_min_chars_per_mb,
+                                details={
+                                    "source_file_size": source_file_size,
+                                    "extracted_character_count": len(joined),
+                                },
+                            )
+                        ],
+                    )
+                )
+                parse_score = min(
+                    parse_score,
+                    extracted_chars_per_mb / self.config.sparse_extraction_min_chars_per_mb,
+                )
+
         corrupt_count = len(re.findall(r"[\ufffd\u25a1\u25a0]", joined))
         nonspace_count = len(re.sub(r"\s", "", joined))
         corrupt_ratio = corrupt_count / max(1, nonspace_count)
@@ -466,6 +498,8 @@ class DeterministicRuleEvaluator:
                     "content_block_count": len(content_blocks),
                     "valid_block_count": len(valid_blocks),
                     "character_count": len(joined),
+                    "source_file_size": source_file_size,
+                    "extracted_chars_per_mb": extracted_chars_per_mb,
                     "empty_page_ratio": empty_page_ratio,
                     "corruption_ratio": corrupt_ratio,
                     "duplicate_ratio": duplicate_ratio,
@@ -505,6 +539,14 @@ def _score(dimension: QualityDimension, score: float, metric: str) -> DimensionS
         score=bounded,
         evidence=[QualityEvidence(metric=metric, value=bounded)],
     )
+
+
+def _positive_int(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int) and value > 0:
+        return value
+    return None
 
 
 def _has_cleaning_flag(block: CanonicalBlock, flag: str) -> bool:

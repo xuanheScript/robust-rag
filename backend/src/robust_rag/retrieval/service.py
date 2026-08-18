@@ -14,6 +14,7 @@ from typing import Protocol
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
+from robust_rag.core.observability import observe
 from robust_rag.core.settings import Settings, get_settings
 from robust_rag.db.enums import (
     DocumentStatus,
@@ -154,13 +155,23 @@ class RetrievalService:
                 RetrievalMode.HYBRID_RERANK,
             }:
                 started = time.perf_counter()
-                bm25_hits, bm25_retries = self._search_with_retry(
-                    lambda: self.search_adapter.search_bm25_hits(
-                        self.settings.opensearch_chunks_read_alias,
-                        rewrite.query,
-                        self.settings.retrieval_bm25_top_k,
+                with observe(
+                    "retrieval.bm25",
+                    as_type="retriever",
+                    input={"query": rewrite.query},
+                    metadata={"retrieval_trace_id": str(trace_id)},
+                ) as span:
+                    bm25_hits, bm25_retries = self._search_with_retry(
+                        lambda: self.search_adapter.search_bm25_hits(
+                            self.settings.opensearch_chunks_read_alias,
+                            rewrite.query,
+                            self.settings.retrieval_bm25_top_k,
+                        )
                     )
-                )
+                    span.update(
+                        output={"hit_count": len(bm25_hits)},
+                        metadata={"retry_count": bm25_retries},
+                    )
                 usage["bm25_retries"] = bm25_retries
                 latency["bm25"] = _elapsed_ms(started)
 
@@ -170,7 +181,23 @@ class RetrievalService:
                 RetrievalMode.HYBRID_RERANK,
             }:
                 started = time.perf_counter()
-                embedding, embedding_retries = self._embed_query_with_retry(rewrite.query)
+                with observe(
+                    "retrieval.query_embedding",
+                    as_type="embedding",
+                    input={"query": rewrite.query},
+                    metadata={"retrieval_trace_id": str(trace_id)},
+                    model=self.embedding_adapter.model,
+                ) as span:
+                    embedding, embedding_retries = self._embed_query_with_retry(rewrite.query)
+                    span.update(
+                        output={"vector_count": len(embedding.vectors)},
+                        metadata={"retry_count": embedding_retries},
+                        usage_details=(
+                            {"total": embedding.total_tokens}
+                            if embedding.total_tokens is not None
+                            else None
+                        ),
+                    )
                 latency["query_embedding"] = _elapsed_ms(started)
                 usage["query_embedding_tokens"] = embedding.total_tokens
                 usage["query_embedding_retries"] = embedding_retries
@@ -184,13 +211,22 @@ class RetrievalService:
                         / 1_000_000
                     )
                 started = time.perf_counter()
-                dense_hits, dense_retries = self._search_with_retry(
-                    lambda: self.search_adapter.search_dense_hits(
-                        self.settings.opensearch_chunks_read_alias,
-                        embedding.vectors[0],
-                        self.settings.retrieval_dense_top_k,
+                with observe(
+                    "retrieval.dense",
+                    as_type="retriever",
+                    metadata={"retrieval_trace_id": str(trace_id)},
+                ) as span:
+                    dense_hits, dense_retries = self._search_with_retry(
+                        lambda: self.search_adapter.search_dense_hits(
+                            self.settings.opensearch_chunks_read_alias,
+                            embedding.vectors[0],
+                            self.settings.retrieval_dense_top_k,
+                        )
                     )
-                )
+                    span.update(
+                        output={"hit_count": len(dense_hits)},
+                        metadata={"retry_count": dense_retries},
+                    )
                 usage["dense_retries"] = dense_retries
                 latency["dense"] = _elapsed_ms(started)
 
@@ -200,9 +236,20 @@ class RetrievalService:
                 and request.mode in {RetrievalMode.HYBRID, RetrievalMode.HYBRID_RERANK}
             ):
                 started = time.perf_counter()
-                graph_result = self.graph_retriever.search(
-                    request.query, rewritten_question=rewrite.query
-                )
+                with observe(
+                    "retrieval.graph",
+                    as_type="retriever",
+                    input={"query": rewrite.query},
+                    metadata={"retrieval_trace_id": str(trace_id)},
+                ) as span:
+                    graph_result = self.graph_retriever.search(
+                        request.query, rewritten_question=rewrite.query
+                    )
+                    span.update(
+                        output={"hit_count": len(graph_result.hits)},
+                        metadata={"fallback_reason": graph_result.fallback_reason},
+                        level="WARNING" if graph_result.fallback_reason else "DEFAULT",
+                    )
                 graph_hits = graph_result.hits
                 graph_query_trace_id = graph_result.trace_id
                 graph_fallback_reason = graph_result.fallback_reason
@@ -234,11 +281,27 @@ class RetrievalService:
             if request.mode is RetrievalMode.HYBRID_RERANK and diversified:
                 started = time.perf_counter()
                 try:
-                    response, rerank_retries = self._rerank_with_retry(
-                        rewrite.query,
-                        [candidate.rerank_text() for candidate in diversified],
-                    )
-                    reranked = self._apply_rerank(diversified, response)
+                    with observe(
+                        "retrieval.rerank",
+                        as_type="retriever",
+                        input={"query": rewrite.query, "candidate_count": len(diversified)},
+                        metadata={"retrieval_trace_id": str(trace_id)},
+                        model=self.rerank_adapter.model,
+                    ) as span:
+                        response, rerank_retries = self._rerank_with_retry(
+                            rewrite.query,
+                            [candidate.rerank_text() for candidate in diversified],
+                        )
+                        reranked = self._apply_rerank(diversified, response)
+                        span.update(
+                            output={"result_count": len(reranked)},
+                            metadata={"retry_count": rerank_retries},
+                            usage_details=(
+                                {"total": response.total_tokens}
+                                if response.total_tokens is not None
+                                else None
+                            ),
+                        )
                     usage["rerank_tokens"] = response.total_tokens
                     usage["rerank_retries"] = rerank_retries
                     if (
@@ -256,6 +319,19 @@ class RetrievalService:
                     rerank_fallback_reason = exc.code
                     trace_status = RetrievalTraceStatus.DEGRADED
                     reranked = list(diversified)
+                    with observe(
+                        "retrieval.rerank_fallback",
+                        as_type="retriever",
+                        metadata={
+                            "retrieval_trace_id": str(trace_id),
+                            "fallback_reason": exc.code,
+                        },
+                    ) as fallback_span:
+                        fallback_span.update(
+                            output={"result_count": len(reranked)},
+                            level="WARNING",
+                            status_message=exc.code,
+                        )
                 latency["rerank"] = _elapsed_ms(started)
             else:
                 reranked = list(diversified)

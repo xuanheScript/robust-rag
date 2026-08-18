@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 
+import structlog
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -29,10 +30,13 @@ from robust_rag.db.models import (
     GraphFactRecord,
     RetrievalNode,
 )
+from robust_rag.generation.provider import LLMProviderError
 from robust_rag.graph.schema import GraphSchema
 from robust_rag.graph.schemas import ExtractedEntity, ExtractedTriplet, GraphExtractionArtifact
 from robust_rag.graph.store import GraphStoreAdapter
 from robust_rag.storage.base import FileStorage
+
+logger = structlog.get_logger(__name__)
 
 
 class GraphExtractor(Protocol):
@@ -62,10 +66,13 @@ class GraphExtractionService:
         self.model = model
         self.prompt_version = prompt_version
 
-    def execute(self, version_id: uuid.UUID) -> str:
+    def execute(self, version_id: uuid.UUID, *, force: bool = False) -> str:
         with self.session_factory() as db:
             version = db.get(DocumentVersion, version_id)
             if version is None:
+                logger.warning(
+                    "graph_extraction_version_not_found", document_version_id=str(version_id)
+                )
                 return "not_found"
             nodes = list(
                 db.scalars(
@@ -83,6 +90,11 @@ class GraphExtractionService:
             if not nodes:
                 version.graph_status = GraphProjectionStatus.FAILED
                 db.commit()
+                logger.warning(
+                    "graph_extraction_no_parent_nodes",
+                    document_id=str(version.document_id),
+                    document_version_id=str(version_id),
+                )
                 return "no_parent_nodes"
             input_hash = _input_hash(nodes, self.schema.digest())
             existing = db.scalar(
@@ -93,7 +105,14 @@ class GraphExtractionService:
                     GraphExtractionRun.input_hash == input_hash,
                 )
             )
-            if existing is not None and existing.status is GraphRunStatus.SUCCEEDED:
+            if existing is not None and existing.status is GraphRunStatus.SUCCEEDED and not force:
+                logger.info(
+                    "graph_extraction_skipped",
+                    document_id=str(version.document_id),
+                    document_version_id=str(version_id),
+                    run_id=str(existing.id),
+                    reason="matching_run_already_succeeded",
+                )
                 return "succeeded"
             run = existing or GraphExtractionRun(
                 document_version_id=version_id,
@@ -108,6 +127,8 @@ class GraphExtractionService:
                     "schema_digest": self.schema.digest(),
                     "strict": True,
                     "source_level": "parent",
+                    "parent_token_count": sum(node.token_count for node in nodes),
+                    "parent_character_count": sum(len(node.content) for node in nodes),
                 },
             )
             if existing is None:
@@ -117,9 +138,27 @@ class GraphExtractionService:
                 run.error = None
                 run.started_at = datetime.now(UTC)
                 run.finished_at = None
+                run.entity_count = 0
+                run.relation_count = 0
+                run.artifact_uri = None
             version.graph_status = GraphProjectionStatus.RUNNING
             db.commit()
             run_id = run.id
+            document_id = version.document_id
+
+        logger.info(
+            "graph_extraction_started",
+            document_id=str(document_id),
+            document_version_id=str(version_id),
+            run_id=str(run_id),
+            model=self.model,
+            extractor=self.extractor.name,
+            extractor_version=self.extractor.version,
+            parent_count=len(nodes),
+            parent_token_count=sum(node.token_count for node in nodes),
+            parent_character_count=sum(len(node.content) for node in nodes),
+            force=force,
+        )
 
         try:
             extracted = self.extractor.extract(
@@ -137,12 +176,9 @@ class GraphExtractionService:
                 facts=facts,
                 evidences=evidences,
             )
-            self._switch_online_version(version.document_id, version_id)
+            self._switch_online_version(document_id, version_id)
             artifact_uri = self.storage.write_json(
-                Path("graph-artifacts")
-                / str(version.document_id)
-                / str(version_id)
-                / f"{run_id}.json",
+                Path("graph-artifacts") / str(document_id) / str(version_id) / f"{run_id}.json",
                 artifact.model_dump(mode="json"),
             )
             with self.session_factory.begin() as db:
@@ -158,17 +194,39 @@ class GraphExtractionService:
                     stored_version.graph_status = GraphProjectionStatus.SUCCEEDED
                     stored_version.graph_schema_version = self.schema.version
                     stored_version.graph_projected_at = datetime.now(UTC)
+            logger.info(
+                "graph_extraction_succeeded",
+                document_id=str(document_id),
+                document_version_id=str(version_id),
+                run_id=str(run_id),
+                entity_count=len(entities),
+                relation_count=len(facts),
+                evidence_count=len(evidences),
+            )
             return "succeeded"
         except Exception as exc:
+            error = _graph_error_snapshot(exc)
             with self.session_factory.begin() as db:
                 stored_run = db.get(GraphExtractionRun, run_id)
                 stored_version = db.get(DocumentVersion, version_id)
                 if stored_run is not None:
                     stored_run.status = GraphRunStatus.FAILED
-                    stored_run.error = {"type": type(exc).__name__, "message": str(exc)[:1000]}
+                    stored_run.error = error
                     stored_run.finished_at = datetime.now(UTC)
                 if stored_version is not None:
                     stored_version.graph_status = GraphProjectionStatus.FAILED
+            logger.exception(
+                "graph_extraction_failed",
+                document_id=str(document_id),
+                document_version_id=str(version_id),
+                run_id=str(run_id),
+                model=self.model,
+                error_type=error["type"],
+                error_message=error["message"],
+                error_code=error.get("code"),
+                http_status=error.get("status_code"),
+                retryable=error.get("retryable"),
+            )
             raise
 
     def _switch_online_version(self, document_id: uuid.UUID, version_id: uuid.UUID) -> None:
@@ -427,6 +485,22 @@ class GraphExtractionService:
             entities, facts, evidences = _projection_snapshot(db, None)
         self.graph_store.upsert_projection(entities=entities, facts=facts, evidences=evidences)
         return {"entities": len(entities), "facts": len(facts), "evidences": len(evidences)}
+
+
+def _graph_error_snapshot(exc: Exception) -> dict[str, object]:
+    error: dict[str, object] = {
+        "type": type(exc).__name__,
+        "message": str(exc)[:1000],
+    }
+    if isinstance(exc, LLMProviderError):
+        error.update(
+            {
+                "code": exc.code,
+                "retryable": exc.retryable,
+                "status_code": exc.status_code,
+            }
+        )
+    return error
 
 
 def _input_hash(nodes: list[RetrievalNode], schema_digest: str) -> str:

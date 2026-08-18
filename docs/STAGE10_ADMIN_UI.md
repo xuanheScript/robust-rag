@@ -84,4 +84,4 @@ make web
 - Alembic 全链路 PostgreSQL 离线 SQL 编译通过，项目数据库已升级并核验为 `20260817_0010 (head)`。
 - 已使用浏览器检查总览、文档、Chat 及 390×844 窄屏布局；无控制台错误和横向溢出。
 
-默认测试不会调用 MinerU、Dingo、Voyage、cc switch、OpenSearch 或 Neo4j，不产生外部模型费用。
+默认测试不会调用 MinerU、Dingo、Voyage、外部 LLM API、OpenSearch 或 Neo4j，不产生外部模型费用。

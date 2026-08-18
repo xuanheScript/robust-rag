@@ -28,6 +28,8 @@ from robust_rag.db.enums import (
     ConversationStatus,
     DocumentStatus,
     EmbeddingBatchStatus,
+    EvaluationRunStatus,
+    EvaluationSampleStatus,
     GraphConflictStatus,
     GraphCorrectionAction,
     GraphOrigin,
@@ -794,7 +796,7 @@ class GraphExtractionRun(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
     document_version_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("document_versions.id", ondelete="CASCADE"), index=True
+        ForeignKey("document_versions.id", ondelete="CASCADE")
     )
     schema_version: Mapped[str] = mapped_column(String(100))
     extractor_name: Mapped[str] = mapped_column(String(255))
@@ -1202,3 +1204,97 @@ class ModelInvocation(Base):
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class EvaluationRun(Base):
+    """A reproducible evaluation of one immutable golden dataset snapshot."""
+
+    __tablename__ = "evaluation_runs"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending', 'running', 'succeeded', 'failed')",
+            name="ck_evaluation_runs_status",
+        ),
+        CheckConstraint(
+            "retrieval_mode IN ('bm25', 'dense', 'hybrid', 'hybrid_rerank')",
+            name="ck_evaluation_runs_retrieval_mode",
+        ),
+        Index("ix_evaluation_runs_created_status", "created_at", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    dataset_version: Mapped[str] = mapped_column(String(100), index=True)
+    dataset_digest: Mapped[str] = mapped_column(String(64))
+    status: Mapped[EvaluationRunStatus] = mapped_column(
+        enum_type(EvaluationRunStatus, "evaluation_run_status"),
+        default=EvaluationRunStatus.PENDING,
+    )
+    retrieval_mode: Mapped[RetrievalMode] = mapped_column(
+        enum_type(RetrievalMode, "evaluation_retrieval_mode")
+    )
+    config_snapshot: Mapped[dict[str, object]] = mapped_column(JSON, default=dict)
+    model_snapshot: Mapped[dict[str, object]] = mapped_column(JSON, default=dict)
+    metric_config_json: Mapped[dict[str, object]] = mapped_column(JSON, default=dict)
+    sample_count: Mapped[int] = mapped_column(Integer, default=0)
+    completed_count: Mapped[int] = mapped_column(Integer, default=0)
+    failed_count: Mapped[int] = mapped_column(Integer, default=0)
+    metrics_json: Mapped[dict[str, object]] = mapped_column(JSON, default=dict)
+    regression_json: Mapped[dict[str, object]] = mapped_column(JSON, default=dict)
+    estimated_cost_usd: Mapped[float | None] = mapped_column(Float)
+    report_uri: Mapped[str | None] = mapped_column(Text)
+    failure_samples_json: Mapped[list[dict[str, object]]] = mapped_column(JSON, default=list)
+    baseline_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("evaluation_runs.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    error: Mapped[dict[str, object] | None] = mapped_column(JSON)
+
+    results: Mapped[list["EvaluationSampleResult"]] = relationship(
+        back_populates="evaluation_run",
+        cascade="all, delete-orphan",
+        order_by="EvaluationSampleResult.sample_id",
+    )
+
+
+class EvaluationSampleResult(Base):
+    """Per-question evidence retained so aggregate regressions remain auditable."""
+
+    __tablename__ = "evaluation_sample_results"
+    __table_args__ = (
+        UniqueConstraint("evaluation_run_id", "sample_id", name="uq_evaluation_sample_run"),
+        CheckConstraint(
+            "status IN ('succeeded', 'failed')", name="ck_evaluation_sample_results_status"
+        ),
+        Index("ix_evaluation_sample_results_run_status", "evaluation_run_id", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    evaluation_run_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("evaluation_runs.id", ondelete="CASCADE"), index=True
+    )
+    sample_id: Mapped[str] = mapped_column(String(100))
+    status: Mapped[EvaluationSampleStatus] = mapped_column(
+        enum_type(EvaluationSampleStatus, "evaluation_sample_status")
+    )
+    question: Mapped[str] = mapped_column(Text)
+    expected_answer: Mapped[str | None] = mapped_column(Text)
+    generated_answer: Mapped[str | None] = mapped_column(Text)
+    retrieved_document_ids_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    retrieved_node_ids_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    citation_locators_json: Mapped[list[dict[str, object]]] = mapped_column(JSON, default=list)
+    retrieval_trace_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("retrieval_traces.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    graph_query_trace_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("graph_query_traces.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    metrics_json: Mapped[dict[str, object]] = mapped_column(JSON, default=dict)
+    ragas_metrics_json: Mapped[dict[str, object]] = mapped_column(JSON, default=dict)
+    usage_json: Mapped[dict[str, object]] = mapped_column(JSON, default=dict)
+    latency_ms: Mapped[float | None] = mapped_column(Float)
+    estimated_cost_usd: Mapped[float | None] = mapped_column(Float)
+    error: Mapped[dict[str, object] | None] = mapped_column(JSON)
+
+    evaluation_run: Mapped[EvaluationRun] = relationship(back_populates="results")

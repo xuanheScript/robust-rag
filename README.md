@@ -1,6 +1,6 @@
 # Robust RAG
 
-面向中英双语通用企业知识库的完整 RAG 项目。阶段 10（管理后台、Chat UI 与图谱人工治理）已完成，下一步进入阶段 11 的 Ragas 与黄金集。
+面向中英双语通用企业知识库的完整 RAG 项目。阶段 12 正在实施，已接入默认启用、可失败降级且默认不采集正文的 Langfuse Cloud 可观测层，并补充 HTTP/Celery Trace、运行时健康状态与任务恢复加固。
 
 完整实施方案见 [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md)。
 
@@ -47,6 +47,8 @@ make web
 - 前端：<http://127.0.0.1:5173>
 - 存活检查：<http://127.0.0.1:8000/health/live>
 - 就绪检查：<http://127.0.0.1:8000/health/ready>
+- 依赖与降级状态：<http://127.0.0.1:8000/health/dependencies>
+- Langfuse 状态：<http://127.0.0.1:8000/health/observability>
 
 ## 上传与任务
 
@@ -100,6 +102,9 @@ DELETE /api/v1/documents/{document_id}
 POST /api/v1/retrieval/search
 GET /api/v1/retrieval/traces
 GET /api/v1/retrieval/traces/{trace_id}
+POST /api/v1/evaluations
+GET  /api/v1/evaluations
+GET  /api/v1/evaluations/{evaluation_id}
 ```
 
 阶段 2 的设计和运行说明见 [docs/STAGE2_PARSING.md](docs/STAGE2_PARSING.md)。
@@ -111,6 +116,8 @@ GET /api/v1/retrieval/traces/{trace_id}
 阶段 8 的生成、会话和引用说明见 [docs/STAGE8_GENERATION.md](docs/STAGE8_GENERATION.md)。
 阶段 9 的知识图谱构建与检索说明见 [docs/STAGE9_KNOWLEDGE_GRAPH.md](docs/STAGE9_KNOWLEDGE_GRAPH.md)。
 阶段 10 的管理后台、Chat UI 与生命周期操作说明见 [docs/STAGE10_ADMIN_UI.md](docs/STAGE10_ADMIN_UI.md)。
+阶段 11 的黄金集、Ragas、确定性/图谱指标与回归报告说明见 [docs/STAGE11_EVALUATION.md](docs/STAGE11_EVALUATION.md)。
+阶段 12 的 Langfuse、Trace、健康检查、恢复和故障处理说明见 [docs/STAGE12_OBSERVABILITY.md](docs/STAGE12_OBSERVABILITY.md)。
 
 ## 工程检查
 

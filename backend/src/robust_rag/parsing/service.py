@@ -144,6 +144,15 @@ class ParsingService:
 
         try:
             artifact = parser.parse(source_path, metadata)
+            artifact = artifact.model_copy(
+                update={
+                    "metadata": {
+                        **artifact.metadata,
+                        "source_file_size": metadata.file_size,
+                        "source_mime_type": metadata.mime_type,
+                    }
+                }
+            )
             canonical = self.canonicalizer.convert(
                 artifact=artifact, document_id=document_id, version_id=version_id
             )

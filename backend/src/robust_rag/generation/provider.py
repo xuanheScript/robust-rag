@@ -1,9 +1,9 @@
-"""Replaceable LLM providers with a cc switch Responses implementation."""
+"""Replaceable LLM providers with a direct Responses API implementation."""
 
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from typing import Literal, Protocol
 
@@ -24,6 +24,30 @@ class LLMProviderError(Exception):
         self.message = message
         self.retryable = retryable
         self.status_code = status_code
+
+    def __reduce__(
+        self,
+    ) -> tuple[Callable[..., LLMProviderError], tuple[str, str, bool, int | None]]:
+        """Keep the error safe to move across Celery process boundaries."""
+
+        return (
+            _restore_llm_provider_error,
+            (self.code, self.message, self.retryable, self.status_code),
+        )
+
+
+def _restore_llm_provider_error(
+    code: str,
+    message: str,
+    retryable: bool,
+    status_code: int | None,
+) -> LLMProviderError:
+    return LLMProviderError(
+        code,
+        message,
+        retryable=retryable,
+        status_code=status_code,
+    )
 
 
 @dataclass(frozen=True)
@@ -76,10 +100,10 @@ class LLMProvider(Protocol):
     def stream(self, request: LLMRequest) -> Iterator[LLMStreamEvent]: ...
 
 
-class CCSwitchResponsesProvider:
-    """OpenAI Responses-compatible provider routed through local cc switch."""
+class ResponsesAPIProvider:
+    """Call a configured OpenAI Responses-compatible API directly."""
 
-    provider = "cc-switch"
+    provider = "responses-api"
 
     def __init__(
         self,
@@ -87,16 +111,19 @@ class CCSwitchResponsesProvider:
         base_url: str,
         model: str,
         reasoning_effort: str,
-        api_key: str | None = None,
+        api_key: str,
         timeout_seconds: float = 120,
         client: httpx.Client | None = None,
     ) -> None:
+        if not api_key.strip():
+            raise ValueError("LLM_API_KEY is required for direct Responses API access")
         self.model = model
         self.reasoning_effort = reasoning_effort
         self.endpoint = f"{base_url.rstrip('/')}/responses"
-        headers = {"Accept": "text/event-stream, application/json"}
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
+        headers = {
+            "Accept": "text/event-stream, application/json",
+            "Authorization": f"Bearer {api_key.strip()}",
+        }
         if client is not None:
             client.headers.update(headers)
             self.client = client

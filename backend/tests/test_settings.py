@@ -16,6 +16,7 @@ def test_settings_defaults_are_local_only() -> None:
     assert settings.cleaning_near_duplicate_threshold == 0.92
     assert settings.quality_rule_set_version == "stage4-quality-rules-v1"
     assert settings.quality_policy_version == "stage4-quality-policy-v1"
+    assert settings.quality_sparse_extraction_min_chars_per_mb == 100
     assert settings.dingo_enabled is False
     assert settings.dingo_llm_enabled is False
     assert settings.chunking_config_version == "stage5-parent-child-v1"
@@ -28,8 +29,12 @@ def test_settings_defaults_are_local_only() -> None:
     assert settings.opensearch_chunks_read_alias == "rag-chunks-read"
     assert settings.retrieval_rrf_rank_constant == 60
     assert settings.retrieval_final_child_top_k == 10
-    assert settings.llm_base_url == "http://127.0.0.1:15721/v1"
-    assert settings.llm_model == "gpt-5.6-luna"
+    assert settings.llm_base_url == "https://api.openai.com/v1"
+    assert settings.llm_model == "gpt-5.4"
+    assert settings.langfuse_enabled is True
+    assert settings.langfuse_base_url == "https://cloud.langfuse.com"
+    assert settings.langfuse_sample_rate == 1.0
+    assert settings.langfuse_capture_content is False
 
 
 def test_settings_can_be_overridden(monkeypatch: MonkeyPatch) -> None:

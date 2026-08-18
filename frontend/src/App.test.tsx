@@ -72,14 +72,39 @@ function json(value: unknown, status = 200) {
 }
 
 function installFetch() {
+  let isDocumentDeleted = false;
   vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
     const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
     if (url.endsWith("/system/info")) return json({ name: "Robust RAG", version: "0.1.0", environment: "test" });
     if (url.endsWith("/health/dependencies")) return json({ database: { status: "ok" }, redis: { status: "ok" }, graph: { status: "disabled", schema_version: "enterprise-core-v1" } });
     if (url.includes("/system/search-capabilities")) return json({ version: "2.19", plugins: ["knn", "icu"], knn_available: true, icu_available: true, neural_search_available: false });
+    if (url.includes("/documents/doc-1/versions/version-1/graph-runs")) return json([{ id: "graph-run-1", document_version_id: "version-1", schema_version: "enterprise-core-v1", extractor_name: "LlamaIndex.SchemaLLMPathExtractor", extractor_version: "llama-schema-v1", model: "test-model", prompt_version: "stage9-extraction-v1", input_hash: "hash", status: "succeeded", parent_count: 3, entity_count: 4, relation_count: 2, artifact_uri: "local://graph.json", error: null }]);
+    if (url.includes("/documents/doc-1/versions/version-1/canonical/metadata")) return json({ id: "canonical-1", document_version_id: "version-1", title: "企业制度", language: "zh", block_count: 12 });
+    if (url.includes("/documents/doc-1/versions/version-1/chunking-runs")) return json([{ id: "chunk-run-1", status: "succeeded", parent_count: 3, child_count: 8, total_tokens: 3200 }]);
+    if (url.includes("/documents/doc-1/versions/version-1/parse-runs")) return json([{ id: "parse-1", parser_name: "mineru-precision", parser_version: "1", parser_mode: "precision-cloud", parser_config: {}, status: "succeeded", artifact_uri: "local://parse.json", started_at: "2026-08-17T01:00:00Z", finished_at: "2026-08-17T01:01:00Z", error: null }]);
+    if (url.includes("/cleaning-runs/clean-1/document")) return json({ document_id: "doc-1", document_version_id: "version-1", title: "企业制度", language: "zh", metadata: {}, root_node_id: "root", blocks: [{ id: "root", block_type: "document", parent_id: null, semantic_order: 0, heading_path: [], original_text: "", normalized_text: "", source_locators: [], attributes: {}, language: "zh", token_count: 0, quality_status: "unassessed", quality_flags: [] }, { id: "block-1", block_type: "paragraph", parent_id: "root", semantic_order: 1, heading_path: ["总则"], original_text: "  企业制度解析正文  ", normalized_text: "企业制度清洗后完整正文", source_locators: [{ page_number: 1 }], attributes: { cleaning: { flags: ["whitespace_normalized"] } }, language: "zh", token_count: 12, quality_status: "passed", quality_flags: [] }] });
+    if (url.includes("/cleaning-runs/clean-1/report")) return json({ input_block_count: 2, output_block_count: 2, changed_block_count: 1, removed_block_count: 0, operator_executions: [{ name: "whitespace-normalizer", version: "1", config: {}, changed_block_ids: ["block-1"], removed_block_ids: [], issue_count: 0 }], issues: [] });
+    if (url.includes("/documents/doc-1/versions/version-1/cleaning-runs")) return json([{ id: "clean-1", pipeline_name: "deterministic-cleaning", pipeline_version: "1", config_version: "v1", config_snapshot: {}, status: "succeeded", input_block_count: 2, output_block_count: 2, changed_block_count: 1, removed_block_count: 0, issue_count: 0, operator_executions: [], started_at: "2026-08-17T01:01:00Z", finished_at: "2026-08-17T01:02:00Z", error: null }]);
+    if (url.includes("/documents/doc-1/versions/version-1/retrieval-nodes")) {
+      if (url.includes("parent_node_id=")) return json([]);
+      return json([{ node_id: "parent-1", node_level: "parent", parent_node_id: null, previous_node_id: null, next_node_id: null, title: "企业制度", heading_path: ["总则"], content: "企业制度分块后的完整父节点正文", retrieval_text: "企业制度\n总则\n企业制度分块后的完整父节点正文", token_count: 800, source_locators_json: [{ page_number: 1 }], source_block_ids: ["block-1"], content_types: ["paragraph"], language: "zh", quality_status: "passed", quality_summary_json: {}, attributes_json: { group_kind: "heading_section" }, embedding_status: "succeeded", index_status: "succeeded" }]);
+    }
+    if (url.endsWith("/documents/doc-1/versions/version-1/canonical")) return json({ document_id: "doc-1", document_version_id: "version-1", title: "企业制度", language: "zh", metadata: {}, root_node_id: "root", blocks: [{ id: "root", block_type: "document", parent_id: null, semantic_order: 0, heading_path: [], original_text: "", normalized_text: "", source_locators: [], attributes: {}, language: "zh", token_count: 0, quality_status: "unassessed", quality_flags: [] }, { id: "block-1", block_type: "paragraph", parent_id: "root", semantic_order: 1, heading_path: ["总则"], original_text: "  企业制度解析正文  ", normalized_text: "企业制度解析正文", source_locators: [{ page_number: 1 }], attributes: {}, language: "zh", token_count: 10, quality_status: "unassessed", quality_flags: [] }] });
     if (url.includes("/documents/doc-1/versions")) return json([{ id: "version-1", document_id: "doc-1", version_number: 1, original_filename: "企业制度.pdf", mime_type: "application/pdf", file_size: 2048, status: "ready", uploaded_at: "2026-08-17T01:00:00Z", ready_at: "2026-08-17T02:00:00Z", graph_status: "succeeded", graph_schema_version: "enterprise-core-v1", graph_projected_at: "2026-08-17T02:00:00Z" }]);
     if (url.includes("/documents/doc-1/quality")) return json([{ id: "qa-1", document_version_id: "version-1", status: "succeeded", decision: "passed", overall_score: 0.92, dimensions_json: [], issues_json: [], evaluator: "quality", engine_version: "1.0", started_at: "2026-08-17T01:00:00Z", finished_at: "2026-08-17T01:01:00Z", error: null }]);
-    if (url.includes("/documents?")) return json({ items: [documentItem], total: 1 });
+    if (url.endsWith("/documents/doc-1") && init?.method === "DELETE") {
+      isDocumentDeleted = true;
+      return json({ document_id: "doc-1", status: "deleted" });
+    }
+    if (url.includes("/documents?")) return json({
+      items: [{
+        ...documentItem,
+        status: isDocumentDeleted ? "deleted" : "active",
+        current_version_id: isDocumentDeleted ? null : documentItem.current_version_id,
+        deleted_at: isDocumentDeleted ? "2026-08-17T03:00:00Z" : null,
+      }],
+      total: 1,
+    });
     if (url.includes("/jobs/job-1/retry")) return json({ ...jobItem, status: "pending" });
     if (url.includes("/jobs?")) return json({ items: [jobItem], total: 1 });
     if (url.includes("/conversations/c1")) return json({ id: "c1", title: "测试问题", status: "active", created_at: "2026-08-17T01:00:00Z", updated_at: "2026-08-17T02:00:00Z", messages: [{ id: "m-user", role: "user", status: "completed", content: "测试问题", query_original: "测试问题", query_rewritten: null, created_at: "2026-08-17T01:00:00Z", citations: [] }, { id: "m-answer", role: "assistant", status: "completed", content: "这是答案 [S1]", query_original: "测试问题", query_rewritten: "测试问题", created_at: "2026-08-17T01:00:01Z", citations: [{ id: "cite-1", source_label: "S1", node_id: "node-1", document_name: "企业制度.pdf", heading_path: ["总则"], source_locators_json: [{ page_number: 1 }], excerpt: "引用原文" }] }] });
@@ -121,6 +146,16 @@ describe("stage 10 application", () => {
     const dialog = await screen.findByRole("dialog", { name: "文档详情" });
     expect(within(dialog).getByText(/v1 · 企业制度.pdf/)).toBeInTheDocument();
     expect(within(dialog).getByText("综合分")).toBeInTheDocument();
+    expect(within(dialog).getByText("图谱生成")).toBeInTheDocument();
+    expect(within(dialog).getByText("4")).toBeInTheDocument();
+    expect(within(dialog).getByText("处理诊断")).toBeInTheDocument();
+    expect(within(dialog).getByText("12")).toBeInTheDocument();
+    await user.click(within(dialog).getByRole("button", { name: "重新生成图谱" }));
+    expect(await screen.findByText("图谱抽取任务已进入队列")).toBeInTheDocument();
+    expect(fetch).toHaveBeenCalledWith(
+      expect.stringContaining("/documents/doc-1/graph/rebuild"),
+      expect.objectContaining({ method: "POST" }),
+    );
   });
 
   it("uploads and reprocesses documents from the management page", async () => {
@@ -141,6 +176,37 @@ describe("stage 10 application", () => {
     expect(await screen.findByText("文档已上传，处理任务已创建")).toBeInTheDocument();
   });
 
+  it("updates the open document detail after soft deletion", async () => {
+    const user = userEvent.setup();
+    renderApp("/documents");
+    await user.click((await screen.findByText("企业制度.pdf")).closest("button") as HTMLButtonElement);
+    const detail = await screen.findByRole("dialog", { name: "文档详情" });
+    await user.click(within(detail).getByRole("button", { name: "软删除" }));
+    expect(await screen.findByText("文档已软删除，可随时恢复")).toBeInTheDocument();
+    expect(await within(detail).findByText("已删除")).toBeInTheDocument();
+    expect(within(detail).getByRole("button", { name: "恢复文档" })).toBeInTheDocument();
+  });
+
+  it("debugs complete parse, cleaning, and chunking artifacts", async () => {
+    const user = userEvent.setup();
+    renderApp("/documents");
+    await user.click((await screen.findByText("企业制度.pdf")).closest("button") as HTMLButtonElement);
+    const detail = await screen.findByRole("dialog", { name: "文档详情" });
+    await user.click(within(detail).getByRole("button", { name: /打开处理调试器/ }));
+    const debuggerDialog = await screen.findByRole("dialog", { name: "文档处理调试器" });
+    expect(await within(debuggerDialog).findByText("解析得到的完整文本")).toBeInTheDocument();
+    expect(within(debuggerDialog).getAllByText("企业制度解析正文").length).toBeGreaterThan(0);
+
+    await user.click(within(debuggerDialog).getByRole("button", { name: /2\. 清洗/ }));
+    expect(await within(debuggerDialog).findByText("解析原文")).toBeInTheDocument();
+    expect(within(debuggerDialog).getByText("清洗结果")).toBeInTheDocument();
+    expect(within(debuggerDialog).getByText("企业制度清洗后完整正文")).toBeInTheDocument();
+
+    await user.click(within(debuggerDialog).getByRole("button", { name: /3\. 分块/ }));
+    expect(await within(debuggerDialog).findByText("送入图谱模型的完整输入")).toBeInTheDocument();
+    expect(within(debuggerDialog).getByText("企业制度分块后的完整父节点正文")).toBeInTheDocument();
+  });
+
   it("retries a failed processing job", async () => {
     const user = userEvent.setup();
     renderApp("/jobs");
@@ -153,10 +219,12 @@ describe("stage 10 application", () => {
     const user = userEvent.setup();
     renderApp("/chat");
     const input = await screen.findByPlaceholderText("询问知识库中的内容…");
+    expect(screen.getByRole("log")).toBeInTheDocument();
     await user.type(input, "测试问题");
-    await user.click(screen.getByRole("button", { name: "↑" }));
+    await user.click(screen.getByRole("button", { name: "发送消息" }));
     expect(await screen.findByText(/这是答案/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "复制回答" })).toBeInTheDocument();
+    await user.click(screen.getByText("1 个引用来源"));
     await user.click(await screen.findByRole("button", { name: /企业制度.pdf/ }));
     expect(await screen.findByText("来源详情")).toBeInTheDocument();
     expect(screen.getByText("引用原文")).toBeInTheDocument();

@@ -153,12 +153,23 @@ class QualityService:
             stage_run_id = stage_run.id
             document_id = version.document_id
             version_id = version.id
+            source_file_size = version.file_size
+            source_mime_type = version.mime_type
             cleaning_run_id = cleaning_run.id
             input_uri = cleaning_run.output_artifact_uri
             input_hash = cleaning_run.output_content_hash
 
         try:
             document = CanonicalDocument.model_validate(self.storage.read_json(input_uri))
+            document = document.model_copy(
+                update={
+                    "metadata": {
+                        **document.metadata,
+                        "source_file_size": source_file_size,
+                        "source_mime_type": source_mime_type,
+                    }
+                }
+            )
             result = self.engine.evaluate(document)
             report = QualityReport(
                 assessment_id=str(assessment_id),
@@ -379,6 +390,8 @@ def build_quality_engine(settings: Settings) -> QualityEngine:
         low_confidence_quarantine_ratio=settings.quality_low_confidence_quarantine_ratio,
         information_density_warning=settings.quality_information_density_warning,
         information_density_quarantine=settings.quality_information_density_quarantine,
+        sparse_extraction_min_bytes=settings.quality_sparse_extraction_min_bytes,
+        sparse_extraction_min_chars_per_mb=(settings.quality_sparse_extraction_min_chars_per_mb),
         reject_parse_threshold=settings.quality_reject_parse_threshold,
         reject_text_threshold=settings.quality_reject_text_threshold,
         quarantine_dimension_threshold=settings.quality_quarantine_dimension_threshold,

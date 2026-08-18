@@ -151,10 +151,160 @@ export interface GraphConflict {
   resolved_by: string | null;
 }
 
+export interface GraphExtractionRun {
+  id: string;
+  document_version_id: string;
+  schema_version: string;
+  extractor_name: string;
+  extractor_version: string;
+  model: string;
+  prompt_version: string;
+  input_hash: string;
+  status: string;
+  parent_count: number;
+  entity_count: number;
+  relation_count: number;
+  artifact_uri: string | null;
+  error: Record<string, unknown> | null;
+}
+
+export interface GraphRebuildResponse {
+  document_id: string;
+  document_version_id: string;
+  status: "queued";
+  task_id: string;
+}
+
+export interface CanonicalDocumentMetadata {
+  id: string;
+  document_version_id: string;
+  title: string | null;
+  language: string | null;
+  block_count: number;
+}
+
+export interface ChunkingRun {
+  id: string;
+  status: string;
+  parent_count: number | null;
+  child_count: number | null;
+  total_tokens: number | null;
+}
+
+export interface RetrievalNodePreview {
+  node_id: string;
+  node_level: "parent" | "child";
+  heading_path: string[];
+  content: string;
+  token_count: number;
+  source_locators_json: Array<Record<string, unknown>>;
+  quality_status: string;
+}
+
+export interface ParseRunItem {
+  id: string;
+  parser_name: string;
+  parser_version: string;
+  parser_mode: string;
+  parser_config: Record<string, unknown>;
+  status: string;
+  artifact_uri: string | null;
+  started_at: string;
+  finished_at: string | null;
+  error: Record<string, unknown> | null;
+}
+
+export interface CanonicalBlockItem {
+  id: string;
+  block_type: string;
+  parent_id: string | null;
+  semantic_order: number;
+  heading_path: string[];
+  original_text: string;
+  normalized_text: string;
+  source_locators: Array<Record<string, unknown>>;
+  attributes: Record<string, unknown>;
+  language: string | null;
+  token_count: number;
+  quality_status: string;
+  quality_flags: string[];
+}
+
+export interface CanonicalDocumentArtifact {
+  document_id: string;
+  document_version_id: string;
+  title: string | null;
+  language: string | null;
+  metadata: Record<string, unknown>;
+  root_node_id: string;
+  blocks: CanonicalBlockItem[];
+}
+
+export interface CleaningRunItem {
+  id: string;
+  pipeline_name: string;
+  pipeline_version: string;
+  config_version: string;
+  config_snapshot: Record<string, unknown>;
+  status: string;
+  input_block_count: number;
+  output_block_count: number | null;
+  changed_block_count: number | null;
+  removed_block_count: number | null;
+  issue_count: number | null;
+  operator_executions: Array<Record<string, unknown>>;
+  started_at: string;
+  finished_at: string | null;
+  error: Record<string, unknown> | null;
+}
+
+export interface CleaningReportArtifact {
+  input_block_count: number;
+  output_block_count: number;
+  changed_block_count: number;
+  removed_block_count: number;
+  operator_executions: Array<{
+    name: string;
+    version: string;
+    config: Record<string, unknown>;
+    changed_block_ids: string[];
+    removed_block_ids: string[];
+    issue_count: number;
+  }>;
+  issues: Array<{
+    code: string;
+    severity: string;
+    operator_name: string;
+    message: string;
+    block_ids: string[];
+    details: Record<string, unknown>;
+  }>;
+}
+
+export interface RetrievalNodeItem extends RetrievalNodePreview {
+  parent_node_id: string | null;
+  previous_node_id: string | null;
+  next_node_id: string | null;
+  title: string | null;
+  retrieval_text: string;
+  source_block_ids: string[];
+  content_types: string[];
+  language: string | null;
+  quality_summary_json: Record<string, unknown>;
+  attributes_json: Record<string, unknown>;
+  embedding_status: string;
+  index_status: string;
+}
+
 export interface DependencyStatus {
   database: Record<string, unknown>;
   redis: Record<string, unknown>;
   graph: Record<string, unknown>;
+  worker?: Record<string, unknown>;
+  queue?: Record<string, unknown>;
+  scheduler?: Record<string, unknown>;
+  langfuse?: Record<string, unknown>;
+  providers?: Record<string, unknown>;
 }
 
 export interface StreamEvent {
@@ -276,7 +426,142 @@ export function rebuildDocumentSearch(documentId: string) {
 }
 
 export function rebuildDocumentGraph(documentId: string) {
-  return request(`/documents/${documentId}/graph/rebuild`, { method: "POST" });
+  return request<GraphRebuildResponse>(`/documents/${documentId}/graph/rebuild`, {
+    method: "POST",
+  });
+}
+
+export function getDocumentGraphRuns(
+  documentId: string,
+  documentVersionId: string,
+  signal?: AbortSignal,
+) {
+  return request<GraphExtractionRun[]>(
+    `/documents/${documentId}/versions/${documentVersionId}/graph-runs`,
+    undefined,
+    signal,
+  );
+}
+
+export function getCanonicalDocumentMetadata(
+  documentId: string,
+  documentVersionId: string,
+  signal?: AbortSignal,
+) {
+  return request<CanonicalDocumentMetadata>(
+    `/documents/${documentId}/versions/${documentVersionId}/canonical/metadata`,
+    undefined,
+    signal,
+  );
+}
+
+export function getDocumentChunkingRuns(
+  documentId: string,
+  documentVersionId: string,
+  signal?: AbortSignal,
+) {
+  return request<ChunkingRun[]>(
+    `/documents/${documentId}/versions/${documentVersionId}/chunking-runs`,
+    undefined,
+    signal,
+  );
+}
+
+export function getDocumentParentNodePreviews(
+  documentId: string,
+  documentVersionId: string,
+  signal?: AbortSignal,
+) {
+  return request<RetrievalNodePreview[]>(
+    `/documents/${documentId}/versions/${documentVersionId}/retrieval-nodes?node_level=parent&limit=3`,
+    undefined,
+    signal,
+  );
+}
+
+export function getDocumentParseRuns(
+  documentId: string,
+  documentVersionId: string,
+  signal?: AbortSignal,
+) {
+  return request<ParseRunItem[]>(
+    `/documents/${documentId}/versions/${documentVersionId}/parse-runs`,
+    undefined,
+    signal,
+  );
+}
+
+export function getCanonicalDocument(
+  documentId: string,
+  documentVersionId: string,
+  signal?: AbortSignal,
+) {
+  return request<CanonicalDocumentArtifact>(
+    `/documents/${documentId}/versions/${documentVersionId}/canonical`,
+    undefined,
+    signal,
+  );
+}
+
+export function getDocumentCleaningRuns(
+  documentId: string,
+  documentVersionId: string,
+  signal?: AbortSignal,
+) {
+  return request<CleaningRunItem[]>(
+    `/documents/${documentId}/versions/${documentVersionId}/cleaning-runs`,
+    undefined,
+    signal,
+  );
+}
+
+export function getCleanedDocument(
+  documentId: string,
+  documentVersionId: string,
+  runId: string,
+  signal?: AbortSignal,
+) {
+  return request<CanonicalDocumentArtifact>(
+    `/documents/${documentId}/versions/${documentVersionId}/cleaning-runs/${runId}/document`,
+    undefined,
+    signal,
+  );
+}
+
+export function getCleaningReport(
+  documentId: string,
+  documentVersionId: string,
+  runId: string,
+  signal?: AbortSignal,
+) {
+  return request<CleaningReportArtifact>(
+    `/documents/${documentId}/versions/${documentVersionId}/cleaning-runs/${runId}/report`,
+    undefined,
+    signal,
+  );
+}
+
+export function getDocumentRetrievalNodes(
+  documentId: string,
+  documentVersionId: string,
+  options: {
+    nodeLevel?: "parent" | "child";
+    parentNodeId?: string;
+    limit?: number;
+    offset?: number;
+  },
+  signal?: AbortSignal,
+) {
+  const params = new URLSearchParams();
+  if (options.nodeLevel) params.set("node_level", options.nodeLevel);
+  if (options.parentNodeId) params.set("parent_node_id", options.parentNodeId);
+  params.set("limit", String(options.limit ?? 100));
+  params.set("offset", String(options.offset ?? 0));
+  return request<RetrievalNodeItem[]>(
+    `/documents/${documentId}/versions/${documentVersionId}/retrieval-nodes?${params}`,
+    undefined,
+    signal,
+  );
 }
 
 export function listJobs(signal?: AbortSignal) {

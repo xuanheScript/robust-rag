@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -159,6 +159,13 @@ class GraphExtractionRunRead(BaseModel):
     relation_count: int
     artifact_uri: str | None
     error: dict[str, object] | None
+
+
+class GraphRebuildResponse(BaseModel):
+    document_id: uuid.UUID
+    document_version_id: uuid.UUID
+    status: Literal["queued"] = "queued"
+    task_id: str
 
 
 class GraphConflictRead(BaseModel):

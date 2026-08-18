@@ -11,8 +11,13 @@ export function SystemPage() {
   const services = [
     { name: "PostgreSQL", role: "业务事实与审计", detail: dependencies.data?.database },
     { name: "Redis / Celery", role: "异步任务与恢复", detail: dependencies.data?.redis },
+    { name: "Celery Worker", role: "任务消费心跳", detail: dependencies.data?.worker },
+    { name: "Celery Beat", role: "恢复扫描与定时调度", detail: dependencies.data?.scheduler },
+    { name: "任务队列", role: "积压深度与告警阈值", detail: dependencies.data?.queue },
     { name: "OpenSearch", role: "BM25 与向量检索", detail: search.isSuccess ? { status: search.data.knn_available && search.data.icu_available ? "ok" : "warning", version: search.data.version, plugins: search.data.plugins } : { status: "unavailable" } },
     { name: "Neo4j Aura", role: "知识图谱查询投影", detail: dependencies.data?.graph },
+    { name: "Langfuse Cloud", role: "LLM / RAG Trace 与评测", detail: dependencies.data?.langfuse },
+    { name: "外部 Provider", role: "模型、Embedding 与解析配置", detail: dependencies.data?.providers },
   ];
   return (
     <div className="page-stack">
@@ -24,7 +29,7 @@ export function SystemPage() {
           return <article className="service-card" key={service.name}><header><span className="service-symbol large">{service.name.slice(0, 2).toUpperCase()}</span><StatusBadge value={status} /></header><h2>{service.name}</h2><p>{service.role}</p><dl>{Object.entries(service.detail ?? {}).filter(([key]) => key !== "status" && key !== "error").slice(0, 3).map(([key, value]) => <div key={key}><dt>{key.replaceAll("_", " ")}</dt><dd>{Array.isArray(value) ? value.join(", ") : String(value)}</dd></div>)}</dl></article>;
         })}
       </section>
-      <section className="panel config-note"><span>安全边界</span><div><h2>外部凭据不会发送到浏览器</h2><p>OpenSearch、Neo4j Aura、Voyage 和模型网关凭据均只从后端环境变量读取。管理端只接收经过约束的状态与领域数据。</p></div></section>
+      <section className="panel config-note"><span>安全边界</span><div><h2>外部凭据不会发送到浏览器</h2><p>OpenSearch、Neo4j Aura、Voyage、模型网关和 Langfuse 凭据均只从后端环境变量读取。Langfuse 默认仅接收脱敏元数据，完整文档与检索上下文不会上报。</p></div></section>
     </div>
   );
 }

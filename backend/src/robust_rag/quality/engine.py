@@ -35,6 +35,8 @@ class QualityConfig(BaseModel):
     low_confidence_quarantine_ratio: float = Field(default=0.50, ge=0, le=1)
     information_density_warning: float = Field(default=0.40, ge=0, le=1)
     information_density_quarantine: float = Field(default=0.20, ge=0, le=1)
+    sparse_extraction_min_bytes: int = Field(default=1_048_576, ge=1)
+    sparse_extraction_min_chars_per_mb: int = Field(default=100, ge=1)
     reject_parse_threshold: float = Field(default=0.05, ge=0, le=1)
     reject_text_threshold: float = Field(default=0.20, ge=0, le=1)
     quarantine_dimension_threshold: float = Field(default=0.50, ge=0, le=1)
@@ -74,7 +76,7 @@ class QualityPolicyEngine:
 
 class QualityEngine:
     name = "quality-engine"
-    version = "1.0.0"
+    version = "1.1.0"
 
     def __init__(
         self,

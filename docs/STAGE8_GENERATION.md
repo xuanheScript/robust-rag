@@ -1,7 +1,7 @@
-# 阶段 8：cc switch 与 RAG Generation
+# 阶段 8：Responses API 与 RAG Generation
 
 阶段 8 在阶段 7 的可解释检索结果上实现受来源约束的多轮问答，并把上游 Responses
-SSE 转换为 AI SDK UI Message Stream v1。浏览器只访问 FastAPI，不直接访问 cc switch。
+SSE 转换为 AI SDK UI Message Stream v1。浏览器只访问 FastAPI，不直接访问外部 LLM API。
 
 ## 调用链
 
@@ -12,15 +12,15 @@ AI SDK useChat
   → 多轮 Query Rewrite（失败时降级为当前问题）
   → 阶段 7 Hybrid + Rerank 与上下文组装
   → 无上下文：服务端确定性拒答
-  → 有上下文：Grounded Prompt → cc switch /v1/responses
+  → 有上下文：Grounded Prompt → 配置的 Responses API
   → Responses typed SSE → UI Message Stream v1
   → 持久化回答、引用、用量、延迟和错误
 ```
 
 ## Provider 与上游协议
 
-- `CCSwitchResponsesProvider` 固定使用准确模型 ID `gpt-5.6-luna`，支持非流式和流式
-  Responses 调用。
+- `ResponsesAPIProvider` 使用后端配置的 Base URL、API Key 与准确模型 ID，支持非流式和流式
+  Responses 调用；它固定请求 `<LLM_BASE_URL>/responses` 并使用 Bearer 鉴权。
 - 流式解析处理 `response.output_text.delta`、`response.refusal.delta`、
   `response.completed`、`response.failed`、`response.incomplete` 和 `error`。
 - Provider 对 HTTP、超时、连接、无文本、无完成事件和畸形 SSE 返回结构化错误，并标明
@@ -98,8 +98,9 @@ GET    /api/v1/messages/{message_id}/trace
 关键环境变量见 `.env.example`：
 
 ```text
-LLM_BASE_URL=http://127.0.0.1:15721/v1
-LLM_MODEL=gpt-5.6-luna
+LLM_BASE_URL=https://api.openai.com/v1
+LLM_API_KEY=<server-side-api-key>
+LLM_MODEL=gpt-5.4
 LLM_API_STYLE=responses
 LLM_REASONING_EFFORT=medium
 LLM_TIMEOUT_SECONDS=120
@@ -120,9 +121,9 @@ Grounded Prompt、引用持久化、无上下文拒答、多轮改写、故障�
 
 ```bash
 cd backend
-RUN_LIVE_CC_SWITCH_TESTS=1 uv run pytest -m integration_live \
-  tests/test_stage8_cc_switch_live.py
+RUN_LIVE_LLM_TESTS=1 uv run pytest -m integration_live \
+  tests/test_stage8_responses_api_live.py
 ```
 
-真实契约会验证准确模型映射、非流式文本、Responses SSE、Token Usage、多轮输入和 Structured
-Output。当前只完成了 cc switch `/health` 与 `/status` 的无费用检查；真实模型调用仍需显式启用。
+真实契约会验证准确模型映射、Bearer 鉴权后的非流式文本、Responses SSE、Token Usage、多轮输入和 Structured
+Output。真实模型调用必须显式启用，避免测试过程产生意外费用。

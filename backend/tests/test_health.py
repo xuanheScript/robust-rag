@@ -11,6 +11,7 @@ def test_live_health_and_request_id() -> None:
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
     assert response.headers["x-request-id"] == "test-request"
+    assert len(response.headers["x-trace-id"]) == 32
 
 
 def test_system_info_does_not_expose_secrets() -> None:
@@ -31,3 +32,16 @@ def test_ready_health_checks_database_and_redis(client: TestClient) -> None:
 
     assert response.status_code == 200
     assert response.json() == {"status": "ready", "database": "ok", "redis": "ok"}
+
+
+def test_dependency_health_includes_runtime_and_langfuse_status(client: TestClient) -> None:
+    response = client.get("/health/dependencies")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["database"]["status"] == "ok"
+    assert payload["redis"]["status"] == "ok"
+    assert payload["langfuse"]["enabled"] is True
+    assert "configured" in payload["langfuse"]
+    assert "secret_key" not in str(payload).lower()
+    assert payload["queue"]["status"] == "unknown"

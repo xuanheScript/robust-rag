@@ -233,6 +233,15 @@ def test_quality_engine_warns_for_limited_duplication() -> None:
     assert "DUPLICATION_DETECTED" in {issue.code for issue in result.issues}
 
 
+def test_quality_engine_quarantines_sparse_extraction_from_large_source() -> None:
+    document = quality_document().model_copy(update={"metadata": {"source_file_size": 5_869_778}})
+
+    result = QualityEngine().evaluate(document)
+
+    assert result.decision is QualityDecision.QUARANTINED
+    assert "SUSPICIOUSLY_SPARSE_EXTRACTION" in {issue.code for issue in result.issues}
+
+
 def test_small_text_corruption_warns_without_quarantine() -> None:
     document = quality_document()
     paragraph = document.blocks[-1]

@@ -1,7 +1,39 @@
-import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { BugIcon, CopyIcon, RefreshCwIcon, SparklesIcon } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 
+import {
+  Conversation,
+  ConversationContent,
+  ConversationEmptyState,
+  ConversationScrollButton,
+} from "@/components/ai-elements/conversation";
+import {
+  Message,
+  MessageAction,
+  MessageActions,
+  MessageContent,
+  MessageResponse,
+} from "@/components/ai-elements/message";
+import {
+  PromptInput,
+  PromptInputBody,
+  PromptInputFooter,
+  type PromptInputMessage,
+  PromptInputSubmit,
+  PromptInputTextarea,
+  PromptInputTools,
+} from "@/components/ai-elements/prompt-input";
+import {
+  Source,
+  Sources,
+  SourcesContent,
+  SourcesTrigger,
+} from "@/components/ai-elements/sources";
+import { Suggestion, Suggestions } from "@/components/ai-elements/suggestion";
+import { Loading, StatusBadge } from "@/components/ui";
+import { formatDate } from "@/lib/format";
 import {
   deleteConversation,
   getConversation,
@@ -11,9 +43,6 @@ import {
   type ChatMessage,
   type Citation,
 } from "@/lib/api";
-import { MessageResponse } from "@/components/ai-elements/message";
-import { Loading, StatusBadge } from "@/components/ui";
-import { formatDate } from "@/lib/format";
 
 export function ChatPage() {
   const { conversationId } = useParams();
@@ -115,9 +144,8 @@ export function ChatPage() {
     }
   }
 
-  function submit(event: FormEvent) {
-    event.preventDefault();
-    void send(input);
+  function submit(message: PromptInputMessage) {
+    void send(message.text);
   }
 
   async function copyMessage(message: ChatMessage) {
@@ -130,6 +158,7 @@ export function ChatPage() {
   }
 
   const lastQuestion = [...messages].reverse().find((message) => message.role === "user")?.content;
+  const lastAssistantId = [...messages].reverse().find((message) => message.role === "assistant")?.id;
   return (
     <div className="chat-layout">
       <aside className="conversation-sidebar">
@@ -149,20 +178,25 @@ export function ChatPage() {
             {conversationId ? <button className="icon-button" aria-label="删除对话" onClick={() => deletion.mutate(conversationId)}>×</button> : null}
           </div>
         </header>
-        <div className="message-feed">
+        <Conversation className="message-feed">
+          <ConversationContent className="message-feed-content">
           {conversation.isPending && conversationId ? <Loading label="正在加载对话" /> : messages.length === 0 ? (
-            <div className="chat-empty">
-              <span className="chat-orb">✦</span>
+            <ConversationEmptyState className="chat-empty">
+              <span className="chat-orb"><SparklesIcon aria-hidden="true" size={22} /></span>
               <h2>从可信资料中找到答案</h2>
               <p>回答会严格基于当前可检索文档，并提供可展开的来源引用。</p>
-              <div className="suggestions">
-                {["概括知识库中的核心主题", "有哪些重要实体及其关系？", "比较两份文档中的关键差异"].map((value) => <button key={value} onClick={() => void send(value)}>{value}<span>↗</span></button>)}
-              </div>
-            </div>
+              <Suggestions className="suggestions">
+                {["概括知识库中的核心主题", "有哪些重要实体及其关系？", "比较两份文档中的关键差异"].map((value) => (
+                  <Suggestion key={value} onClick={(suggestion) => void send(suggestion)} suggestion={value}>
+                    {value}<span>↗</span>
+                  </Suggestion>
+                ))}
+              </Suggestions>
+            </ConversationEmptyState>
           ) : messages.map((message) => (
-            <article className={`message message-${message.role}`} key={message.id}>
+            <Message className={`message message-${message.role}`} from={message.role} key={message.id}>
               <div className="message-avatar">{message.role === "assistant" ? "R" : "你"}</div>
-              <div className="message-body">
+              <MessageContent className="message-body">
                 <div className="message-meta"><strong>{message.role === "assistant" ? "Robust RAG" : "你"}</strong><span>{formatDate(message.created_at)}</span>{message.status === "streaming" ? <StatusBadge value="running" /> : null}</div>
                 {message.status === "streaming" && !message.content ? (
                   <div className="typing"><span /><span /><span /></div>
@@ -172,22 +206,60 @@ export function ChatPage() {
                   <p className="message-content">{message.content}</p>
                 )}
                 {message.role === "assistant" && message.content ? (
-                  <div className="message-actions">
-                    <button type="button" aria-label="复制回答" onClick={() => void copyMessage(message)}>{copiedMessageId === message.id ? "已复制" : "复制回答"}</button>
-                  </div>
+                  <MessageActions className="message-actions">
+                    <MessageAction label="复制回答" onClick={() => void copyMessage(message)}>
+                      <CopyIcon aria-hidden="true" size={13} />
+                      <span>{copiedMessageId === message.id ? "已复制" : "复制回答"}</span>
+                    </MessageAction>
+                    {message.id === lastAssistantId && lastQuestion && !isStreaming ? (
+                      <MessageAction label="重新生成" onClick={() => void send(lastQuestion)}>
+                        <RefreshCwIcon aria-hidden="true" size={13} />
+                        <span>重新生成</span>
+                      </MessageAction>
+                    ) : null}
+                    {debugEnabled && !message.id.startsWith("assistant-") ? (
+                      <MessageAction label="查看检索与模型 Trace" onClick={() => setTraceMessageId(message.id)}>
+                        <BugIcon aria-hidden="true" size={13} />
+                        <span>查看 Trace</span>
+                      </MessageAction>
+                    ) : null}
+                  </MessageActions>
                 ) : null}
-                {message.citations.length ? <div className="citation-row">{message.citations.map((source, index) => <button key={`${source.node_id}-${index}`} onClick={() => setActiveCitation(source)}><span>{source.source_label ?? source.label ?? `S${index + 1}`}</span>{source.document_name}</button>)}</div> : null}
-                {debugEnabled && message.role === "assistant" && !message.id.startsWith("assistant-") ? <button className="trace-button" onClick={() => setTraceMessageId(message.id)}>查看检索与模型 Trace</button> : null}
-              </div>
-            </article>
+                {message.citations.length ? (
+                  <Sources>
+                    <SourcesTrigger count={message.citations.length} />
+                    <SourcesContent>
+                      {message.citations.map((source, index) => (
+                        <Source
+                          key={`${source.node_id}-${index}`}
+                          label={source.source_label ?? source.label ?? `S${index + 1}`}
+                          onClick={() => setActiveCitation(source)}
+                          title={source.document_name}
+                        />
+                      ))}
+                    </SourcesContent>
+                  </Sources>
+                ) : null}
+              </MessageContent>
+            </Message>
           ))}
           {warning ? <div className="chat-warning">{warning}</div> : null}
-        </div>
-        <form className="composer" onSubmit={submit}>
-          <textarea rows={2} value={input} onChange={(event) => setInput(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} placeholder="询问知识库中的内容…" />
-          <div><span>Enter 发送 · Shift + Enter 换行</span>{isStreaming ? <button type="button" className="stop-button" onClick={() => controller.current?.abort()}>停止</button> : <button className="send-button" type="submit" disabled={!input.trim()}>↑</button>}</div>
-        </form>
-        {lastQuestion && !isStreaming ? <button className="regenerate" onClick={() => void send(lastQuestion)}>↻ 重新生成上一个回答</button> : null}
+          </ConversationContent>
+          <ConversationScrollButton />
+        </Conversation>
+        <PromptInput className="composer" onSubmit={submit}>
+          <PromptInputBody>
+            <PromptInputTextarea value={input} onChange={(event) => setInput(event.target.value)} />
+          </PromptInputBody>
+          <PromptInputFooter>
+            <PromptInputTools><span>Enter 发送 · Shift + Enter 换行</span></PromptInputTools>
+            <PromptInputSubmit
+              disabled={!isStreaming && !input.trim()}
+              onStop={() => controller.current?.abort()}
+              status={isStreaming ? "streaming" : "ready"}
+            />
+          </PromptInputFooter>
+        </PromptInput>
       </section>
       {activeCitation ? <aside className="source-drawer"><header><div><span>Source</span><h2>来源详情</h2></div><button className="icon-button" onClick={() => setActiveCitation(null)}>×</button></header><StatusBadge value="ready" /><h3>{activeCitation.document_name}</h3><p className="source-path">{activeCitation.heading_path.join(" / ") || "文档正文"}</p><blockquote>{activeCitation.excerpt}</blockquote><dl><dt>位置</dt><dd>{activeCitation.location || locatorText(activeCitation.source_locators_json ?? activeCitation.source_locators)}</dd><dt>Node ID</dt><dd className="mono">{activeCitation.node_id}</dd></dl></aside> : null}
       {traceMessageId ? <aside className="source-drawer debug-drawer"><header><div><span>Admin debug</span><h2>回答 Trace</h2></div><button className="icon-button" onClick={() => setTraceMessageId(null)}>×</button></header>{trace.isPending ? <Loading /> : trace.isError ? <div className="inline-error">Trace 读取失败</div> : <pre>{JSON.stringify(trace.data, null, 2)}</pre>}</aside> : null}

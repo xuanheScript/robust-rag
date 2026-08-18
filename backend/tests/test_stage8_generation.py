@@ -1,6 +1,8 @@
 import json
+import pickle
 import uuid
 from typing import cast
+from unittest.mock import Mock
 
 import httpx
 import pytest
@@ -14,13 +16,13 @@ from robust_rag.db.enums import MessageStatus, ModelInvocationStatus
 from robust_rag.db.models import Citation, Message, ModelInvocation, RetrievalTrace
 from robust_rag.generation.prompts import GROUNDED_INSTRUCTIONS
 from robust_rag.generation.provider import (
-    CCSwitchResponsesProvider,
     FakeLLMProvider,
     LLMProviderError,
     LLMRequest,
+    ResponsesAPIProvider,
 )
 from robust_rag.generation.schemas import ChatRequest
-from robust_rag.generation.service import ChatService, get_chat_service
+from robust_rag.generation.service import ChatService, build_llm_provider, get_chat_service
 from robust_rag.indexing.opensearch import MemoryOpenSearchAdapter
 from robust_rag.storage.local import LocalFileStorage
 from tests.test_stage7_retrieval import (
@@ -74,7 +76,18 @@ def _events(chunks: list[str]) -> list[dict[str, object]]:
     return events
 
 
-def test_cc_switch_responses_provider_non_stream_and_stream_contract() -> None:
+def _log_records(logger: Mock) -> list[dict[str, object]]:
+    return [
+        {
+            "event": call.args[0],
+            "level": call[0],
+            **call.kwargs,
+        }
+        for call in logger.mock_calls
+    ]
+
+
+def test_responses_api_provider_non_stream_and_stream_contract() -> None:
     requests: list[dict[str, object]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -108,11 +121,11 @@ def test_cc_switch_responses_provider_non_stream_and_stream_contract() -> None:
         )
 
     client = httpx.Client(
-        transport=httpx.MockTransport(handler), base_url="http://127.0.0.1:15721/v1/"
+        transport=httpx.MockTransport(handler), base_url="https://llm.example.test/v1/"
     )
-    provider = CCSwitchResponsesProvider(
-        base_url="http://127.0.0.1:15721/v1",
-        model="gpt-5.6-luna",
+    provider = ResponsesAPIProvider(
+        base_url="https://llm.example.test/v1",
+        model="test-responses-model",
         reasoning_effort="medium",
         api_key="secret",
         client=client,
@@ -135,7 +148,7 @@ def test_cc_switch_responses_provider_non_stream_and_stream_contract() -> None:
     ]
     assert streamed[-1].usage.total_tokens == 11
     assert requests[0] == {
-        "model": "gpt-5.6-luna",
+        "model": "test-responses-model",
         "instructions": "Grounded",
         "input": [{"role": "user", "content": "Question"}],
         "max_output_tokens": 200,
@@ -145,21 +158,23 @@ def test_cc_switch_responses_provider_non_stream_and_stream_contract() -> None:
     }
     assert requests[1]["stream"] is True
     assert client.headers["authorization"] == "Bearer secret"
+    assert provider.endpoint == "https://llm.example.test/v1/responses"
 
 
-def test_cc_switch_provider_exposes_retryable_http_and_stream_errors() -> None:
+def test_responses_api_provider_exposes_retryable_http_and_stream_errors() -> None:
     unavailable = httpx.Client(
         transport=httpx.MockTransport(
             lambda _request: httpx.Response(
                 503, json={"error": {"code": "route_unavailable", "message": "offline"}}
             )
         ),
-        base_url="http://cc/v1/",
+        base_url="https://llm.example.test/v1/",
     )
-    provider = CCSwitchResponsesProvider(
-        base_url="http://cc/v1",
-        model="gpt-5.6-luna",
+    provider = ResponsesAPIProvider(
+        base_url="https://llm.example.test/v1",
+        model="test-responses-model",
         reasoning_effort="none",
+        api_key="secret",
         client=unavailable,
     )
     request = LLMRequest(instructions="x", input=[], max_output_tokens=1)
@@ -184,10 +199,40 @@ def test_cc_switch_provider_exposes_retryable_http_and_stream_errors() -> None:
         list(provider.stream(request))
 
 
+def test_responses_api_provider_requires_api_key() -> None:
+    with pytest.raises(ValueError, match="LLM_API_KEY"):
+        ResponsesAPIProvider(
+            base_url="https://llm.example.test/v1",
+            model="test-responses-model",
+            reasoning_effort="none",
+            api_key=" ",
+        )
+
+    with pytest.raises(RuntimeError, match="LLM_API_KEY"):
+        build_llm_provider(Settings(_env_file=None))
+
+
+def test_llm_provider_error_is_pickle_safe_for_celery_workers() -> None:
+    original = LLMProviderError(
+        "LLM_FORBIDDEN",
+        "Access denied",
+        retryable=False,
+        status_code=403,
+    )
+
+    restored = pickle.loads(pickle.dumps(original))
+
+    assert restored.code == "LLM_FORBIDDEN"
+    assert restored.message == "Access denied"
+    assert restored.retryable is False
+    assert restored.status_code == 403
+
+
 def test_grounded_chat_stream_persists_citations_usage_and_trace(
     session_factory: sessionmaker[Session],
     storage: LocalFileStorage,
     client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _, _, search_adapter = _ready_search_fixture(session_factory, storage)
     provider = FakeLLMProvider(
@@ -196,7 +241,10 @@ def test_grounded_chat_stream_persists_citations_usage_and_trace(
     )
     service = _chat_service(session_factory, search_adapter, provider)
     prepared = service.prepare(_request("Policy"))
+    logger = Mock()
+    monkeypatch.setattr("robust_rag.generation.service._logger", logger)
     chunks = list(service.stream(prepared))
+    logs = _log_records(logger)
     events = _events(chunks)
 
     assert chunks[-1] == "data: [DONE]\n\n"
@@ -209,6 +257,14 @@ def test_grounded_chat_stream_persists_citations_usage_and_trace(
     assert any(event["type"] == "data-usage" for event in events)
     assert provider.stream_requests[0].instructions == GROUNDED_INSTRUCTIONS
     assert "<S1 " in str(provider.stream_requests[0].input[0]["content"])
+    started_log = next(log for log in logs if log["event"] == "llm_request_started")
+    succeeded_log = next(log for log in logs if log["event"] == "llm_request_succeeded")
+    assert started_log["purpose"] == "rag_generation"
+    assert started_log["invocation_id"] == str(prepared.invocation_id)
+    assert succeeded_log["input_tokens"] == 10
+    assert succeeded_log["output_tokens"] == 5
+    assert "question" not in started_log
+    assert "input" not in started_log
 
     with session_factory() as db:
         assistant = db.get(Message, prepared.assistant_message_id)
@@ -281,6 +337,7 @@ def test_no_context_refuses_without_calling_model_and_conversation_can_be_delete
 def test_multiturn_rewrite_is_saved_and_generation_failure_is_explainable(
     session_factory: sessionmaker[Session],
     storage: LocalFileStorage,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _, _, search_adapter = _ready_search_fixture(session_factory, storage)
     provider = FakeLLMProvider(
@@ -301,9 +358,18 @@ def test_multiturn_rewrite_is_saved_and_generation_failure_is_explainable(
         assert trace.rewrite_snapshot["history_message_count"] == 2
         assert trace.rewrite_snapshot["prompt_version"] == "stage8-conversation-rewrite-v1"
 
-    provider.failure = LLMProviderError("LLM_UNAVAILABLE", "cc switch offline", retryable=True)
+    provider.failure = LLMProviderError(
+        "LLM_UNAVAILABLE",
+        "LLM API offline",
+        retryable=True,
+        status_code=503,
+    )
+    service.settings = service.settings.model_copy(update={"llm_max_retries": 1})
     failed = service.prepare(_request("Policy"))
+    logger = Mock()
+    monkeypatch.setattr("robust_rag.generation.service._logger", logger)
     chunks = list(service.stream(failed))
+    logs = _log_records(logger)
     events = _events(chunks)
     assert any(event["type"] == "error" for event in events)
     warning = next(event for event in events if event["type"] == "data-warning")
@@ -316,3 +382,20 @@ def test_multiturn_rewrite_is_saved_and_generation_failure_is_explainable(
         assert invocation.status is ModelInvocationStatus.FAILED
         assert invocation.error is not None
         assert invocation.error["code"] == "LLM_UNAVAILABLE"
+
+    log_events = [log["event"] for log in logs]
+    assert log_events == [
+        "llm_request_started",
+        "llm_request_retry",
+        "llm_request_failed",
+    ]
+    retry_log = logs[1]
+    failure_log = logs[2]
+    assert retry_log["attempt"] == 1
+    assert retry_log["next_attempt"] == 2
+    assert failure_log["attempts"] == 2
+    assert failure_log["status_code"] == 503
+    assert failure_log["error_code"] == "LLM_UNAVAILABLE"
+    assert failure_log["partial_response"] is False
+    assert "question" not in failure_log
+    assert "input" not in failure_log

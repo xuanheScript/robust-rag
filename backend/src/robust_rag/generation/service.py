@@ -12,9 +12,11 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import lru_cache
 
+import structlog
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
+from robust_rag.core.observability import current_trace_id, observe
 from robust_rag.core.settings import Settings, get_settings
 from robust_rag.db.enums import (
     ConversationStatus,
@@ -33,16 +35,18 @@ from robust_rag.db.models import (
 from robust_rag.db.session import SessionLocal
 from robust_rag.generation.prompts import grounded_request, rewrite_request
 from robust_rag.generation.provider import (
-    CCSwitchResponsesProvider,
     LLMProvider,
     LLMProviderError,
     LLMRequest,
     LLMUsage,
+    ResponsesAPIProvider,
 )
 from robust_rag.generation.schemas import ChatRequest, ChatSource
 from robust_rag.retrieval.query import QueryError, QueryRewriteResult, normalize_query
 from robust_rag.retrieval.schemas import RetrievalSearchRequest, RetrievalSearchResponse
 from robust_rag.retrieval.service import RetrievalError, RetrievalService, get_retrieval_service
+
+_logger = structlog.get_logger(__name__)
 
 
 class ChatError(Exception):
@@ -239,90 +243,177 @@ class ChatService:
         finish_reason: str | None = None
         retry_count = 0
         started = time.perf_counter()
+        first_token_ms: float | None = None
         emitted_text = False
-        try:
-            for retry_count in range(self.settings.llm_max_retries + 1):
-                try:
-                    for event in self.provider.stream(prepared.generation_request):
-                        if event.type == "text_delta":
-                            emitted_text = True
-                            answer_parts.append(event.delta)
-                            yield _sse({"type": "text-delta", "id": text_id, "delta": event.delta})
-                        else:
-                            usage = event.usage
-                            response_id = event.response_id
-                            finish_reason = event.finish_reason
-                    break
-                except LLMProviderError as exc:
-                    if (
-                        emitted_text
-                        or not exc.retryable
-                        or retry_count >= self.settings.llm_max_retries
-                    ):
-                        raise
-                    self._sleep(retry_count)
-            answer = "".join(answer_parts).strip()
-            if not answer:
-                raise LLMProviderError(
-                    "LLM_EMPTY_RESPONSE",
-                    "Generation service returned no text",
-                    retryable=False,
+        log_context = self._llm_log_context(
+            purpose="rag_generation",
+            invocation_id=prepared.invocation_id,
+        )
+        _logger.info(
+            "llm_request_started",
+            **log_context,
+            max_attempts=self.settings.llm_max_retries + 1,
+            max_output_tokens=prepared.generation_request.max_output_tokens,
+        )
+        with observe(
+            "llm.rag_generation",
+            as_type="generation",
+            input={"question": prepared.question},
+            metadata={
+                "conversation_id": str(prepared.conversation_id),
+                "message_id": str(prepared.assistant_message_id),
+                "retrieval_trace_id": str(prepared.retrieval.trace_id),
+                "model_invocation_id": str(prepared.invocation_id),
+                "context_node_count": len(prepared.sources),
+                "prompt_version": self.settings.generation_prompt_version,
+            },
+            version=self.settings.generation_prompt_version,
+            model=self.provider.model,
+            model_parameters={"max_output_tokens": self.settings.llm_max_output_tokens},
+        ) as generation:
+            try:
+                for retry_count in range(self.settings.llm_max_retries + 1):
+                    try:
+                        for event in self.provider.stream(prepared.generation_request):
+                            if event.type == "text_delta":
+                                if first_token_ms is None:
+                                    first_token_ms = round(
+                                        (time.perf_counter() - started) * 1000, 3
+                                    )
+                                emitted_text = True
+                                answer_parts.append(event.delta)
+                                yield _sse(
+                                    {"type": "text-delta", "id": text_id, "delta": event.delta}
+                                )
+                            else:
+                                usage = event.usage
+                                response_id = event.response_id
+                                finish_reason = event.finish_reason
+                        break
+                    except LLMProviderError as exc:
+                        if (
+                            emitted_text
+                            or not exc.retryable
+                            or retry_count >= self.settings.llm_max_retries
+                        ):
+                            raise
+                        _logger.warning(
+                            "llm_request_retry",
+                            **log_context,
+                            attempt=retry_count + 1,
+                            next_attempt=retry_count + 2,
+                            max_attempts=self.settings.llm_max_retries + 1,
+                            error_code=exc.code,
+                            error_message=exc.message,
+                            status_code=exc.status_code,
+                            retryable=exc.retryable,
+                            elapsed_ms=round((time.perf_counter() - started) * 1000, 3),
+                        )
+                        self._sleep(retry_count)
+                answer = "".join(answer_parts).strip()
+                if not answer:
+                    raise LLMProviderError(
+                        "LLM_EMPTY_RESPONSE",
+                        "Generation service returned no text",
+                        retryable=False,
+                    )
+                latency_ms = round((time.perf_counter() - started) * 1000, 3)
+                yield _sse({"type": "text-end", "id": text_id})
+                citation_count = self._complete_answer(
+                    prepared,
+                    answer=answer,
+                    usage=usage,
+                    response_id=response_id,
+                    finish_reason=finish_reason,
+                    retry_count=retry_count,
+                    latency_ms=latency_ms,
+                    first_token_ms=first_token_ms,
                 )
-            latency_ms = round((time.perf_counter() - started) * 1000, 3)
-            yield _sse({"type": "text-end", "id": text_id})
-            citation_count = self._complete_answer(
-                prepared,
-                answer=answer,
-                usage=usage,
-                response_id=response_id,
-                finish_reason=finish_reason,
-                retry_count=retry_count,
-                latency_ms=latency_ms,
-            )
-            yield _sse(
-                {
-                    "type": "data-usage",
-                    "data": {
-                        **usage.snapshot(),
-                        "model": self.provider.model,
-                        "retry_count": retry_count,
+                generation.update(
+                    output=answer,
+                    metadata={
                         "latency_ms": latency_ms,
+                        "first_token_ms": first_token_ms,
+                        "retry_count": retry_count,
                         "citation_count": citation_count,
+                        "finish_reason": finish_reason,
                     },
+                    usage_details=_usage_details(usage),
+                    cost_details=_cost_details(self._estimated_cost(usage)),
+                )
+                _logger.info(
+                    "llm_request_succeeded",
+                    **log_context,
+                    attempts=retry_count + 1,
+                    latency_ms=latency_ms,
+                    first_token_ms=first_token_ms,
+                    input_tokens=usage.input_tokens,
+                    output_tokens=usage.output_tokens,
+                    total_tokens=usage.total_tokens,
+                    finish_reason=finish_reason,
+                    citation_count=citation_count,
+                )
+                yield _sse(
+                    {
+                        "type": "data-usage",
+                        "data": {
+                            **usage.snapshot(),
+                            "model": self.provider.model,
+                            "retry_count": retry_count,
+                            "first_token_ms": first_token_ms,
+                            "latency_ms": latency_ms,
+                            "citation_count": citation_count,
+                        },
+                    }
+                )
+                yield _sse({"type": "finish"})
+                yield "data: [DONE]\n\n"
+            except LLMProviderError as exc:
+                latency_ms = round((time.perf_counter() - started) * 1000, 3)
+                error = {
+                    "code": exc.code,
+                    "message": exc.message,
+                    "retryable": exc.retryable,
+                    "status_code": exc.status_code,
                 }
-            )
-            yield _sse({"type": "finish"})
-            yield "data: [DONE]\n\n"
-        except LLMProviderError as exc:
-            latency_ms = round((time.perf_counter() - started) * 1000, 3)
-            error = {
-                "code": exc.code,
-                "message": exc.message,
-                "retryable": exc.retryable,
-                "status_code": exc.status_code,
-            }
-            self._fail_generation(
-                prepared,
-                partial_text="".join(answer_parts),
-                error=error,
-                retry_count=retry_count,
-                latency_ms=latency_ms,
-            )
-            yield _sse({"type": "text-end", "id": text_id})
-            safe_message = "Generation service is temporarily unavailable. Please try again."
-            yield _sse(
-                {
-                    "type": "data-warning",
-                    "data": {
-                        "code": exc.code,
-                        "message": safe_message,
-                        "retryable": exc.retryable,
-                    },
-                }
-            )
-            yield _sse({"type": "error", "errorText": safe_message})
-            yield _sse({"type": "finish"})
-            yield "data: [DONE]\n\n"
+                generation.update(
+                    level="ERROR",
+                    status_message=exc.code,
+                    metadata={"latency_ms": latency_ms, "retry_count": retry_count},
+                )
+                self._fail_generation(
+                    prepared,
+                    partial_text="".join(answer_parts),
+                    error=error,
+                    retry_count=retry_count,
+                    latency_ms=latency_ms,
+                )
+                _logger.error(
+                    "llm_request_failed",
+                    **log_context,
+                    attempts=retry_count + 1,
+                    latency_ms=latency_ms,
+                    error_code=exc.code,
+                    error_message=exc.message,
+                    status_code=exc.status_code,
+                    retryable=exc.retryable,
+                    partial_response=emitted_text,
+                )
+                yield _sse({"type": "text-end", "id": text_id})
+                safe_message = "Generation service is temporarily unavailable. Please try again."
+                yield _sse(
+                    {
+                        "type": "data-warning",
+                        "data": {
+                            "code": exc.code,
+                            "message": safe_message,
+                            "retryable": exc.retryable,
+                        },
+                    }
+                )
+                yield _sse({"type": "error", "errorText": safe_message})
+                yield _sse({"type": "finish"})
+                yield "data: [DONE]\n\n"
 
     def _create_message_pair(
         self, conversation_id: uuid.UUID | None, question: str
@@ -407,68 +498,131 @@ class ChatService:
         )
         started = time.perf_counter()
         retry_count = 0
-        try:
-            for retry_count in range(self.settings.llm_max_retries + 1):
-                try:
-                    response = self.provider.generate(request)
-                    break
-                except LLMProviderError as exc:
-                    if not exc.retryable or retry_count >= self.settings.llm_max_retries:
-                        raise
-                    self._sleep(retry_count)
-            rewritten = normalize_query(
-                response.text.strip().strip("\"'"),
-                max_chars=self.settings.retrieval_query_max_chars,
-            )
-            latency_ms = round((time.perf_counter() - started) * 1000, 3)
-            self._complete_invocation(
-                invocation_id,
-                usage=response.usage,
-                response_id=response.response_id,
-                finish_reason=response.finish_reason,
-                retry_count=retry_count,
-                latency_ms=latency_ms,
-            )
-            return (
-                QueryRewriteResult(
-                    query=rewritten,
-                    strategy="conversation-aware",
-                    implementation="llm-query-rewriter",
-                    version="1.0.0",
-                    changed=rewritten != question,
-                    metadata={
-                        "history_message_count": len(history),
-                        "prompt_version": self.settings.query_rewrite_prompt_version,
-                        "invocation_id": str(invocation_id),
-                    },
-                ),
-                None,
-            )
-        except (LLMProviderError, QueryError) as exc:
-            latency_ms = round((time.perf_counter() - started) * 1000, 3)
-            code = exc.code
-            message = exc.message
-            self._fail_invocation(
-                invocation_id,
-                {"code": code, "message": message},
-                retry_count=retry_count,
-                latency_ms=latency_ms,
-            )
-            return (
-                QueryRewriteResult(
-                    query=question,
-                    strategy="conversation-aware-fallback",
-                    implementation="llm-query-rewriter",
-                    version="1.0.0",
-                    changed=False,
-                    metadata={
-                        "history_message_count": len(history),
-                        "prompt_version": self.settings.query_rewrite_prompt_version,
-                        "fallback_reason": code,
-                    },
-                ),
-                code,
-            )
+        log_context = self._llm_log_context(
+            purpose="query_rewrite",
+            invocation_id=invocation_id,
+        )
+        _logger.info(
+            "llm_request_started",
+            **log_context,
+            max_attempts=self.settings.llm_max_retries + 1,
+            max_output_tokens=request.max_output_tokens,
+        )
+        with observe(
+            "llm.query_rewrite",
+            as_type="generation",
+            input={"question": question, "history_message_count": len(history)},
+            metadata={"model_invocation_id": str(invocation_id)},
+            version=self.settings.query_rewrite_prompt_version,
+            model=self.provider.model,
+            model_parameters={"max_output_tokens": self.settings.query_rewrite_max_output_tokens},
+        ) as generation:
+            try:
+                for retry_count in range(self.settings.llm_max_retries + 1):
+                    try:
+                        response = self.provider.generate(request)
+                        break
+                    except LLMProviderError as exc:
+                        if not exc.retryable or retry_count >= self.settings.llm_max_retries:
+                            raise
+                        _logger.warning(
+                            "llm_request_retry",
+                            **log_context,
+                            attempt=retry_count + 1,
+                            next_attempt=retry_count + 2,
+                            max_attempts=self.settings.llm_max_retries + 1,
+                            error_code=exc.code,
+                            error_message=exc.message,
+                            status_code=exc.status_code,
+                            retryable=exc.retryable,
+                            elapsed_ms=round((time.perf_counter() - started) * 1000, 3),
+                        )
+                        self._sleep(retry_count)
+                rewritten = normalize_query(
+                    response.text.strip().strip("\"'"),
+                    max_chars=self.settings.retrieval_query_max_chars,
+                )
+                latency_ms = round((time.perf_counter() - started) * 1000, 3)
+                self._complete_invocation(
+                    invocation_id,
+                    usage=response.usage,
+                    response_id=response.response_id,
+                    finish_reason=response.finish_reason,
+                    retry_count=retry_count,
+                    latency_ms=latency_ms,
+                )
+                generation.update(
+                    output=rewritten,
+                    metadata={"latency_ms": latency_ms, "retry_count": retry_count},
+                    usage_details=_usage_details(response.usage),
+                    cost_details=_cost_details(self._estimated_cost(response.usage)),
+                )
+                _logger.info(
+                    "llm_request_succeeded",
+                    **log_context,
+                    attempts=retry_count + 1,
+                    latency_ms=latency_ms,
+                    input_tokens=response.usage.input_tokens,
+                    output_tokens=response.usage.output_tokens,
+                    total_tokens=response.usage.total_tokens,
+                    finish_reason=response.finish_reason,
+                )
+                return (
+                    QueryRewriteResult(
+                        query=rewritten,
+                        strategy="conversation-aware",
+                        implementation="llm-query-rewriter",
+                        version="1.0.0",
+                        changed=rewritten != question,
+                        metadata={
+                            "history_message_count": len(history),
+                            "prompt_version": self.settings.query_rewrite_prompt_version,
+                            "invocation_id": str(invocation_id),
+                        },
+                    ),
+                    None,
+                )
+            except (LLMProviderError, QueryError) as exc:
+                latency_ms = round((time.perf_counter() - started) * 1000, 3)
+                code = exc.code
+                message = exc.message
+                generation.update(
+                    level="WARNING",
+                    status_message=code,
+                    metadata={"latency_ms": latency_ms, "retry_count": retry_count},
+                )
+                self._fail_invocation(
+                    invocation_id,
+                    {"code": code, "message": message},
+                    retry_count=retry_count,
+                    latency_ms=latency_ms,
+                )
+                _logger.warning(
+                    "llm_request_failed",
+                    **log_context,
+                    attempts=retry_count + 1,
+                    latency_ms=latency_ms,
+                    error_code=code,
+                    error_message=message,
+                    status_code=(exc.status_code if isinstance(exc, LLMProviderError) else None),
+                    retryable=(exc.retryable if isinstance(exc, LLMProviderError) else False),
+                    fallback=True,
+                )
+                return (
+                    QueryRewriteResult(
+                        query=question,
+                        strategy="conversation-aware-fallback",
+                        implementation="llm-query-rewriter",
+                        version="1.0.0",
+                        changed=False,
+                        metadata={
+                            "history_message_count": len(history),
+                            "prompt_version": self.settings.query_rewrite_prompt_version,
+                            "fallback_reason": code,
+                        },
+                    ),
+                    code,
+                )
 
     def _load_sources(self, retrieval: RetrievalSearchResponse) -> list[ChatSource]:
         node_ids = [value.node_id for value in retrieval.context_nodes]
@@ -518,6 +672,7 @@ class ChatService:
                 endpoint=self.provider.endpoint,
                 prompt_version=prompt_version,
                 status=ModelInvocationStatus.RUNNING,
+                trace_id=current_trace_id(),
                 request_snapshot=request_snapshot,
             )
             db.add(invocation)
@@ -563,6 +718,7 @@ class ChatService:
         finish_reason: str | None,
         retry_count: int,
         latency_ms: float,
+        first_token_ms: float | None,
     ) -> int:
         referenced = _referenced_labels(answer, prepared.sources)
         estimated_cost = self._estimated_cost(usage)
@@ -608,10 +764,11 @@ class ChatService:
                     invocation.latency_ms = latency_ms
                     invocation.estimated_cost_usd = estimated_cost
                     invocation.retry_count = retry_count
-                    invocation.trace_id = response_id
                     invocation.response_snapshot = {
+                        "response_id": response_id,
                         "finish_reason": finish_reason,
                         "citation_count": len(referenced),
+                        "first_token_ms": first_token_ms,
                     }
                     invocation.finished_at = datetime.now(UTC)
         return len(referenced)
@@ -635,8 +792,10 @@ class ChatService:
                 invocation.latency_ms = latency_ms
                 invocation.estimated_cost_usd = self._estimated_cost(usage)
                 invocation.retry_count = retry_count
-                invocation.trace_id = response_id
-                invocation.response_snapshot = {"finish_reason": finish_reason}
+                invocation.response_snapshot = {
+                    "response_id": response_id,
+                    "finish_reason": finish_reason,
+                }
                 invocation.finished_at = datetime.now(UTC)
 
     def _fail_generation(
@@ -704,15 +863,32 @@ class ChatService:
         delay *= 0.5 + self.jitter()
         self.sleeper(delay)
 
+    def _llm_log_context(
+        self,
+        *,
+        purpose: str,
+        invocation_id: uuid.UUID | None,
+    ) -> dict[str, object]:
+        return {
+            "purpose": purpose,
+            "provider": self.provider.provider,
+            "model": self.provider.model,
+            "endpoint": self.provider.endpoint,
+            "invocation_id": str(invocation_id) if invocation_id else None,
+            "trace_id": current_trace_id(),
+        }
+
 
 def build_llm_provider(settings: Settings) -> LLMProvider:
     if settings.llm_api_style != "responses":
         raise RuntimeError("Stage 8 supports only the configured Responses API style")
-    return CCSwitchResponsesProvider(
+    if settings.llm_api_key is None:
+        raise RuntimeError("LLM_API_KEY is required for direct Responses API access")
+    return ResponsesAPIProvider(
         base_url=settings.llm_base_url,
         model=settings.llm_model,
         reasoning_effort=settings.llm_reasoning_effort,
-        api_key=settings.llm_api_key.get_secret_value() if settings.llm_api_key else None,
+        api_key=settings.llm_api_key.get_secret_value(),
         timeout_seconds=settings.llm_timeout_seconds,
     )
 
@@ -744,3 +920,19 @@ def _refusal_text(query: str) -> str:
 
 def _sse(event: dict[str, object]) -> str:
     return f"data: {json.dumps(event, ensure_ascii=False, separators=(',', ':'))}\n\n"
+
+
+def _usage_details(usage: LLMUsage) -> dict[str, int]:
+    return {
+        key: value
+        for key, value in {
+            "input": usage.input_tokens,
+            "output": usage.output_tokens,
+            "total": usage.total_tokens,
+        }.items()
+        if value is not None
+    }
+
+
+def _cost_details(estimated_cost_usd: float | None) -> dict[str, float] | None:
+    return {"total": estimated_cost_usd} if estimated_cost_usd is not None else None

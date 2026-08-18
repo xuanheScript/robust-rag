@@ -45,8 +45,8 @@ DINGO_RULE_NAMES=RuleAbnormalChar,RuleAbnormalHtml,RuleContentNull
 ```dotenv
 DINGO_LLM_ENABLED=true
 DINGO_LLM_API_KEY=your-key
-LLM_BASE_URL=http://127.0.0.1:15721/v1
-LLM_MODEL=gpt-5.6-luna
+LLM_BASE_URL=https://api.openai.com/v1
+LLM_MODEL=gpt-5.4
 ```
 
 调用失败会形成失败的 QualityAssessment 和 StageRun，保存错误码、可重试标记和消息，不会伪装成质量拒绝。可以通过现有 `POST /api/v1/jobs/{job_id}/retry` 重新执行。
@@ -93,4 +93,4 @@ POST /api/v1/documents/{document_id}/quality/re-evaluate
 make check
 ```
 
-常规测试使用内置 FakeDingoAdapter，不访问 Dingo、cc switch 或其他外部服务。Dingo 官方 SDK 的状态、分数和 Token Usage 转换由无网络契约测试覆盖。
+常规测试使用内置 FakeDingoAdapter，不访问 Dingo、外部 LLM API 或其他外部服务。Dingo 官方 SDK 的状态、分数和 Token Usage 转换由无网络契约测试覆盖。

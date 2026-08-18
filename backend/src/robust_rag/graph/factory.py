@@ -6,9 +6,9 @@ from functools import lru_cache
 
 from robust_rag.core.settings import Settings, get_settings
 from robust_rag.db.session import SessionLocal
-from robust_rag.generation.provider import CCSwitchResponsesProvider
+from robust_rag.generation.provider import ResponsesAPIProvider
 from robust_rag.graph.cypher import CypherValidator
-from robust_rag.graph.llama_index import CCSwitchLlamaLLM, LlamaIndexGraphExtractor
+from robust_rag.graph.llama_index import LlamaIndexGraphExtractor, ResponsesLlamaLLM
 from robust_rag.graph.query import GraphQueryGateway
 from robust_rag.graph.schema import get_graph_schema
 from robust_rag.graph.service import GraphExtractionService, GraphProjectionLifecycleService
@@ -25,12 +25,12 @@ def graph_is_configured(settings: Settings) -> bool:
     )
 
 
-def _provider(settings: Settings) -> CCSwitchResponsesProvider:
-    return CCSwitchResponsesProvider(
+def _provider(settings: Settings) -> ResponsesAPIProvider:
+    if settings.llm_api_key is None:
+        raise RuntimeError("LLM_API_KEY is required for graph extraction and graph queries")
+    return ResponsesAPIProvider(
         base_url=settings.llm_base_url,
-        api_key=(
-            settings.llm_api_key.get_secret_value() if settings.llm_api_key is not None else None
-        ),
+        api_key=settings.llm_api_key.get_secret_value(),
         model=settings.llm_model,
         reasoning_effort=settings.llm_reasoning_effort,
         timeout_seconds=settings.llm_timeout_seconds,
@@ -59,7 +59,7 @@ def get_graph_query_gateway() -> GraphQueryGateway | None:
     settings = get_settings()
     if not graph_is_configured(settings) or not settings.graph_query_enabled:
         return None
-    llm = CCSwitchLlamaLLM(_provider(settings), max_output_tokens=1000)
+    llm = ResponsesLlamaLLM(_provider(settings), max_output_tokens=1000)
     return GraphQueryGateway(
         session_factory=SessionLocal,
         store=get_graph_store(),
@@ -80,7 +80,7 @@ def get_graph_extraction_service() -> GraphExtractionService:
     if not graph_is_configured(settings):
         raise RuntimeError("Knowledge graph extraction is not configured")
     schema = get_graph_schema(settings.graph_schema_version)
-    llm = CCSwitchLlamaLLM(
+    llm = ResponsesLlamaLLM(
         _provider(settings), max_output_tokens=max(settings.llm_max_output_tokens, 4000)
     )
     extractor = LlamaIndexGraphExtractor(

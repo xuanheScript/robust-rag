@@ -136,6 +136,18 @@ class ModelInvocationStatus(StrEnum):
     FAILED = "failed"
 
 
+class EvaluationRunStatus(StrEnum):
+    PENDING = "pending"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+
+
+class EvaluationSampleStatus(StrEnum):
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+
+
 class GraphRunStatus(StrEnum):
     RUNNING = "running"
     SUCCEEDED = "succeeded"

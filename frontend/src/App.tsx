@@ -1,8 +1,6 @@
-import { useQuery } from "@tanstack/react-query";
 import { lazy, Suspense } from "react";
-import { NavLink, Navigate, Outlet, Route, Routes } from "react-router-dom";
+import { NavLink, Navigate, Outlet, Route, Routes, useLocation } from "react-router-dom";
 
-import { getSystemInfo } from "@/lib/api";
 import { DashboardPage } from "@/pages/DashboardPage";
 import { DocumentsPage } from "@/pages/DocumentsPage";
 import { GraphPage } from "@/pages/GraphPage";
@@ -25,12 +23,8 @@ const navigation = [
 ];
 
 function AppLayout() {
-  const systemInfo = useQuery({
-    queryKey: ["system-info"],
-    queryFn: ({ signal }) => getSystemInfo(signal),
-    retry: 1,
-    refetchInterval: 30_000,
-  });
+  const location = useLocation();
+  const isChatRoute = location.pathname === "/chat" || location.pathname.startsWith("/chat/");
   return (
     <div className="app-frame">
       <aside className="sidebar">
@@ -53,15 +47,8 @@ function AppLayout() {
             </NavLink>
           ))}
         </nav>
-        <div className="sidebar-status">
-          <span className={systemInfo.isSuccess ? "health-dot healthy" : "health-dot"} />
-          <div>
-            <strong>{systemInfo.isSuccess ? "服务已连接" : "正在检查服务"}</strong>
-            <small>{systemInfo.data ? `v${systemInfo.data.version}` : "本机管理端"}</small>
-          </div>
-        </div>
       </aside>
-      <main className="workspace">
+      <main className={isChatRoute ? "workspace workspace-chat" : "workspace"}>
         <Outlet />
       </main>
     </div>

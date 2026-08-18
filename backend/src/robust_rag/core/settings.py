@@ -53,6 +53,15 @@ class Settings(BaseSettings):
         ge=0,
         validation_alias="JOB_RECOVERY_AGE_SECONDS",
     )
+    celery_health_timeout_seconds: float = Field(
+        default=1.0, gt=0, le=10, validation_alias="CELERY_HEALTH_TIMEOUT_SECONDS"
+    )
+    celery_queue_warning_depth: int = Field(
+        default=100, ge=1, validation_alias="CELERY_QUEUE_WARNING_DEPTH"
+    )
+    celery_heartbeat_ttl_seconds: int = Field(
+        default=120, ge=30, validation_alias="CELERY_HEARTBEAT_TTL_SECONDS"
+    )
 
     mineru_base_url: str = Field(
         default="https://mineru.net/api/v4", validation_alias="MINERU_BASE_URL"
@@ -127,6 +136,16 @@ class Settings(BaseSettings):
         ge=0,
         le=1,
         validation_alias="QUALITY_INFORMATION_DENSITY_QUARANTINE",
+    )
+    quality_sparse_extraction_min_bytes: int = Field(
+        default=1_048_576,
+        ge=1,
+        validation_alias="QUALITY_SPARSE_EXTRACTION_MIN_BYTES",
+    )
+    quality_sparse_extraction_min_chars_per_mb: int = Field(
+        default=100,
+        ge=1,
+        validation_alias="QUALITY_SPARSE_EXTRACTION_MIN_CHARS_PER_MB",
     )
     quality_reject_parse_threshold: float = Field(
         default=0.05, ge=0, le=1, validation_alias="QUALITY_REJECT_PARSE_THRESHOLD"
@@ -345,9 +364,9 @@ class Settings(BaseSettings):
         default=1, ge=0, le=2, validation_alias="RETRIEVAL_CONTEXT_NEIGHBOR_LIMIT"
     )
 
-    llm_base_url: str = Field(default="http://127.0.0.1:15721/v1", validation_alias="LLM_BASE_URL")
+    llm_base_url: str = Field(default="https://api.openai.com/v1", validation_alias="LLM_BASE_URL")
     llm_api_key: SecretStr | None = Field(default=None, validation_alias="LLM_API_KEY")
-    llm_model: str = Field(default="gpt-5.6-luna", validation_alias="LLM_MODEL")
+    llm_model: str = Field(default="gpt-5.4", validation_alias="LLM_MODEL")
     llm_api_style: Literal["responses", "chat_completions"] = Field(
         default="responses", validation_alias="LLM_API_STYLE"
     )
@@ -383,6 +402,37 @@ class Settings(BaseSettings):
         default=500, ge=50, le=5000, validation_alias="CITATION_EXCERPT_MAX_CHARS"
     )
 
+    evaluation_dataset_root: Path = Field(
+        default=Path("../evals/datasets"), validation_alias="EVALUATION_DATASET_ROOT"
+    )
+    evaluation_report_root: Path = Field(
+        default=Path("../evals/reports"), validation_alias="EVALUATION_REPORT_ROOT"
+    )
+
+    langfuse_enabled: bool = Field(default=True, validation_alias="LANGFUSE_ENABLED")
+    langfuse_public_key: SecretStr | None = Field(
+        default=None, validation_alias="LANGFUSE_PUBLIC_KEY"
+    )
+    langfuse_secret_key: SecretStr | None = Field(
+        default=None, validation_alias="LANGFUSE_SECRET_KEY"
+    )
+    langfuse_base_url: str = Field(
+        default="https://cloud.langfuse.com", validation_alias="LANGFUSE_BASE_URL"
+    )
+    langfuse_sample_rate: float = Field(
+        default=1.0, ge=0, le=1, validation_alias="LANGFUSE_SAMPLE_RATE"
+    )
+    langfuse_capture_content: bool = Field(
+        default=False, validation_alias="LANGFUSE_CAPTURE_CONTENT"
+    )
+    langfuse_timeout_seconds: int = Field(
+        default=3, ge=1, le=30, validation_alias="LANGFUSE_TIMEOUT_SECONDS"
+    )
+    langfuse_flush_at: int = Field(default=20, ge=1, validation_alias="LANGFUSE_FLUSH_AT")
+    langfuse_flush_interval_seconds: float = Field(
+        default=5.0, gt=0, validation_alias="LANGFUSE_FLUSH_INTERVAL_SECONDS"
+    )
+
     @field_validator(
         "mineru_token",
         "dingo_llm_api_key",
@@ -396,6 +446,8 @@ class Settings(BaseSettings):
         "opensearch_ca_cert",
         "llm_price_per_million_input_tokens",
         "llm_price_per_million_output_tokens",
+        "langfuse_public_key",
+        "langfuse_secret_key",
         mode="before",
     )
     @classmethod

@@ -3,15 +3,22 @@
 import uuid
 from typing import Annotated
 
+import structlog
 from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from robust_rag.core.errors import AppError
 from robust_rag.core.settings import get_settings
-from robust_rag.db.enums import GraphConflictStatus
+from robust_rag.db.enums import (
+    DocumentStatus,
+    GraphConflictStatus,
+    GraphProjectionStatus,
+    VersionStatus,
+)
 from robust_rag.db.models import (
     Document,
+    DocumentVersion,
     GraphConflictRecord,
     GraphEntityRecord,
     GraphExtractionRun,
@@ -19,7 +26,7 @@ from robust_rag.db.models import (
 )
 from robust_rag.db.session import get_db
 from robust_rag.graph.admin import GraphAdminError, GraphAdminService
-from robust_rag.graph.factory import get_graph_extraction_service, graph_is_configured
+from robust_rag.graph.factory import graph_is_configured
 from robust_rag.graph.schema import get_graph_schema
 from robust_rag.graph.schemas import (
     GraphConflictRead,
@@ -33,11 +40,20 @@ from robust_rag.graph.schemas import (
     GraphFactCreate,
     GraphFactRead,
     GraphFactUpdate,
+    GraphRebuildResponse,
     GraphReviewRequest,
+)
+from robust_rag.services.dispatcher import (
+    GraphExtractionDispatcher,
+    get_graph_extraction_dispatcher,
 )
 
 router = APIRouter(tags=["knowledge-graph"])
 DatabaseSession = Annotated[Session, Depends(get_db)]
+GraphDispatcherDependency = Annotated[
+    GraphExtractionDispatcher, Depends(get_graph_extraction_dispatcher)
+]
+logger = structlog.get_logger(__name__)
 
 
 def _service(db: Session) -> GraphAdminService:
@@ -246,10 +262,18 @@ def list_graph_runs(
     )
 
 
-@router.post("/documents/{document_id}/graph/rebuild")
-def rebuild_document_graph(document_id: uuid.UUID, db: DatabaseSession) -> dict[str, object]:
-    document = db.get(Document, document_id)
-    if document is None:
+@router.post(
+    "/documents/{document_id}/graph/rebuild",
+    response_model=GraphRebuildResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def rebuild_document_graph(
+    document_id: uuid.UUID,
+    db: DatabaseSession,
+    dispatcher: GraphDispatcherDependency,
+) -> GraphRebuildResponse:
+    document = db.scalar(select(Document).where(Document.id == document_id).with_for_update())
+    if document is None or document.status is DocumentStatus.DELETED:
         raise AppError(code="DOCUMENT_NOT_FOUND", message="Document was not found", status_code=404)
     settings = get_settings()
     if not graph_is_configured(settings):
@@ -258,5 +282,62 @@ def rebuild_document_graph(document_id: uuid.UUID, db: DatabaseSession) -> dict[
             message="Neo4j graph projection is not configured",
             status_code=409,
         )
-    counts = get_graph_extraction_service().rebuild()
-    return {"document_id": str(document_id), "status": "succeeded", **counts}
+    if document.current_version_id is None:
+        raise AppError(
+            code="DOCUMENT_VERSION_NOT_READY",
+            message="The document has no current version to extract",
+            status_code=409,
+        )
+    version = db.get(DocumentVersion, document.current_version_id)
+    if version is None or version.status is not VersionStatus.READY:
+        raise AppError(
+            code="DOCUMENT_VERSION_NOT_READY",
+            message="The current document version is not ready for graph extraction",
+            status_code=409,
+        )
+    if version.graph_status in {
+        GraphProjectionStatus.PENDING,
+        GraphProjectionStatus.RUNNING,
+    }:
+        raise AppError(
+            code="GRAPH_EXTRACTION_IN_PROGRESS",
+            message="Graph extraction is already pending or running for this document",
+            status_code=409,
+            details={"graph_status": version.graph_status.value},
+        )
+
+    previous_status = version.graph_status
+    version.graph_status = GraphProjectionStatus.PENDING
+    db.commit()
+    try:
+        task_id = dispatcher.dispatch(version.id, force=True)
+    except Exception as exc:
+        db.rollback()
+        version = db.get(DocumentVersion, document.current_version_id)
+        if version is not None:
+            version.graph_status = previous_status
+            db.commit()
+        logger.exception(
+            "graph_rebuild_dispatch_failed",
+            document_id=str(document_id),
+            document_version_id=str(document.current_version_id),
+            error_type=type(exc).__name__,
+        )
+        raise AppError(
+            code="GRAPH_REBUILD_DISPATCH_FAILED",
+            message="Graph extraction could not be queued",
+            status_code=503,
+        ) from exc
+
+    logger.info(
+        "graph_rebuild_queued",
+        document_id=str(document_id),
+        document_version_id=str(version.id),
+        task_id=task_id,
+        force=True,
+    )
+    return GraphRebuildResponse(
+        document_id=document_id,
+        document_version_id=version.id,
+        task_id=task_id,
+    )

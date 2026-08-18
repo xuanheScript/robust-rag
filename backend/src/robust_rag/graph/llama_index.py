@@ -1,4 +1,4 @@
-"""LlamaIndex adapters that keep cc switch and the query gateway in control."""
+"""LlamaIndex adapters that keep the configured LLM and query gateway in control."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from robust_rag.graph.schemas import ExtractedEntity, ExtractedTriplet
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
 
-class CCSwitchLlamaLLM(CustomLLM):
+class ResponsesLlamaLLM(CustomLLM):
     """Expose the existing Responses provider as a LlamaIndex LLM."""
 
     _provider: LLMProvider = PrivateAttr()

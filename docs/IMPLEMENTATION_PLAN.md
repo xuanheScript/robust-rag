@@ -2,8 +2,8 @@
 
 > 文档状态：已确认，可作为实施基线
 > 项目类型：中英双语通用企业知识库 RAG
-> 当前阶段：阶段 10 已完成，准备进入阶段 11
-> 最后更新：2026-08-17
+> 当前阶段：阶段 12 实施中
+> 最后更新：2026-08-18
 
 ## 1. 文档目的
 
@@ -99,8 +99,8 @@
 | 图数据库 | Neo4j AuraDB Free |
 | 图谱问答 | 受控 `TextToCypherRetriever`，失败时回退 OpenSearch |
 | Reranker | Voyage `rerank-2.5` |
-| 生成模型 | cc switch + `gpt-5.6-luna` |
-| cc switch | `http://127.0.0.1:15721/v1` |
+| 生成模型 | 可配置的 OpenAI Responses-compatible API 与模型 |
+| LLM 接入 | 后端通过 `LLM_BASE_URL`、`LLM_API_KEY`、`LLM_MODEL` 直连服务端 API |
 | RAG 评测 | 确定性 IR 指标 + Ragas |
 | 前端 | Vite、React 19、TypeScript |
 | UI | Tailwind CSS 4、shadcn/ui、AI Elements |
@@ -133,8 +133,8 @@ flowchart LR
     API --> CYPHER["TextToCypher Query Gateway"]
     CYPHER --> NEO4J
     API --> VOYAGE
-    API --> CCS["cc switch :15721"]
-    CCS --> LLM["GPT-5.6 Luna Provider"]
+    API --> LLMAPI["Responses-compatible LLM API"]
+    LLMAPI --> LLM["Configured Model"]
     API --> PG
     EVAL["Ragas / Golden Dataset"] --> API
     EVAL --> PG
@@ -782,7 +782,7 @@ SchemaValidator
 - Dingo 规则：所有文档与所有 Child/Parent。
 - Dingo LLM：所有文档。
 - Chunk Dingo LLM：异常项、警告项和可配置抽样。
-- 初始 Dingo LLM：通过 cc switch 调用 `gpt-5.6-luna`。
+- 初始 Dingo LLM：通过后端配置的 LLM API 调用指定模型；Dingo 使用独立密钥配置，不依赖本地代理。
 
 ### 12.4 质量维度
 
@@ -1027,7 +1027,7 @@ document_updated_at: date
 - 不确定但可能有价值的候选关系保存在抽取产物中，不直接扩展线上 Schema。
 - Schema 变更必须创建新版本，完成重抽取、对比评测和投影切换后再启用。
 
-抽取输入以 Parent 为主要语义单元，必要时携带标题路径、相邻 Child 和表头上下文。不得把整份长文档无边界地交给抽取模型。抽取使用 cc switch 的 `gpt-5.6-luna`，并记录模型、Prompt、Schema、输入哈希、Token、耗时和原始结果位置。
+抽取输入以 Parent 为主要语义单元，必要时携带标题路径、相邻 Child 和表头上下文。不得把整份长文档无边界地交给抽取模型。抽取使用后端配置的 Responses-compatible LLM API 与模型，并记录 Provider、模型、Prompt、Schema、输入哈希、Token、耗时和原始结果位置。
 
 ### 16.3 图谱投影与来源证据
 
@@ -1196,48 +1196,42 @@ Query Normalize / Rewrite
 
 ---
 
-## 18. LLM 与 cc switch
+## 18. LLM 直连 Responses API
 
 ### 18.1 配置
 
 ```text
-LLM_BASE_URL=http://127.0.0.1:15721/v1
-LLM_MODEL=gpt-5.6-luna
+LLM_BASE_URL=https://api.openai.com/v1
+LLM_API_KEY=<server-side-api-key>
+LLM_MODEL=<responses-compatible-model-id>
 LLM_API_STYLE=responses
 LLM_REASONING_EFFORT=medium
 ```
 
-必须使用准确模型 ID `gpt-5.6-luna`，不能使用会指向其他层级的 `gpt-5.6` 别名。
+`LLM_BASE_URL` 填 API 版本根地址而不是完整 `/responses` 地址，Provider 固定向其下的 `/responses` 发起请求。`LLM_API_KEY` 必须存在且仅保存在后端环境变量中；请求使用 `Authorization: Bearer <API Key>`。`LLM_MODEL` 必须填写目标供应商实际支持的准确模型 ID，业务代码不得写死模型别名。
 
 ### 18.2 实施前契约测试
 
-cc switch 已确认以下本地路由存在：
+每个目标供应商都必须通过最小真实调用验证：
 
-- `/health`
-- `/status`
-- `/v1/chat/completions`
-- `/v1/responses`
-- `/v1/messages`
-
-但 `/v1/models` 当前返回空列表，因此实现前必须通过最小真实调用验证：
-
-- `gpt-5.6-luna` 模型映射。
+- Base URL、Bearer 鉴权和准确模型 ID。
 - 非流式文本。
 - SSE 流式输出。
 - Structured Output。
 - 多轮输入。
 - 错误格式、超时和 Token Usage。
 
+系统只承诺 OpenAI Responses API 契约，不再探测或依赖本地路由代理的健康端点、路由接管、模型映射或客户端身份模拟能力。若供应商只支持 Chat Completions，必须新增独立 Provider，不能在 Responses Provider 内静默转换协议。
+
 ### 18.3 Provider 抽象
 
 ```text
 LLMProvider
-  ├── CCSwitchResponsesProvider
-  ├── OpenAICompatibleProvider
+  ├── ResponsesAPIProvider
   └── FakeLLMProvider
 ```
 
-浏览器不得直接调用 cc switch。调用链固定为 Browser → FastAPI → cc switch → 上游 Provider。
+浏览器不得直接调用外部 LLM。调用链固定为 Browser → FastAPI / Celery Worker → Responses-compatible LLM API。生成、Query Rewrite、图谱抽取、Text-to-Cypher 和 Ragas Judge 复用同一套后端 LLM 配置与凭据边界。
 
 ### 18.4 Grounded RAG
 
@@ -1326,7 +1320,7 @@ text-start / text-delta / text-end
 - 当日新增和平均处理时间。
 - 最近失败任务。
 - Dingo 问题类型分布。
-- PostgreSQL、Redis、OpenSearch、Neo4j AuraDB、cc switch 和外部服务状态。
+- PostgreSQL、Redis、OpenSearch、Neo4j AuraDB、LLM API、Langfuse Cloud 和外部服务状态。
 
 ### 20.4 知识图谱管理
 
@@ -1526,7 +1520,7 @@ tags
 
 ### 24.4 Judge
 
-- 初期可使用 `gpt-5.6-luna`。
+- 初期使用 `LLM_MODEL` 配置的 Responses-compatible 模型，模型变更必须记录版本并重跑回归评测。
 - 正式发布前对关键样本使用更强或独立 Judge 抽样复核。
 - 保存 Judge 模型、Prompt、版本和原始理由。
 - LLM Judge 不能替代确定性 IR 指标和人工审查。
@@ -1593,11 +1587,26 @@ error_code
 
 - 普通日志不保存完整文档正文、完整 Prompt 和密钥。
 - 调试内容通过显式开关启用并标明风险。
-- 生产化前增加日志保留和脱敏策略。
+- 生产化前增加日志、Trace 和评测数据的保留、删除与脱敏策略。
+- 发送到 Langfuse Cloud 前执行本地字段白名单和脱敏；默认不得发送完整文档正文、完整检索上下文、密钥、Authorization Header、Cookie 或连接串。
+- Trace 中默认保留模型、Provider、耗时、Token、成本、状态、错误类别、内部资源 ID、配置版本和脱敏后的输入输出摘要；如需上传完整 Prompt 或回答，必须通过独立显式开关启用并标明数据外发风险。
 
 ### 25.5 外部可观测性
 
-第一阶段不强制部署 Langfuse、Prometheus Server 或 Grafana，但领域事件、指标和 Trace 接口应方便未来接入 OpenTelemetry 和专用 LLM Observability。
+阶段 12 接入 Langfuse Cloud，并默认启用。Langfuse 用于 LLM/RAG Trace、Generation、Token、成本、延迟和评测分数的查询与可视化；PostgreSQL 继续作为任务状态、领域事实、审计记录和正式评测报告的事实来源，Langfuse 不承担任务恢复和业务一致性职责。
+
+接入原则：
+
+- 使用 OpenTelemetry 兼容的 Trace/Span 语义并封装独立 Adapter，避免业务代码绑定单一平台。
+- 一次 Chat Turn、一次评测样本或一次需要模型参与的异步处理作为 Trace；查询改写、BM25、Dense、图检索、融合、Rerank、上下文组装、模型生成和 Ragas Judge 作为子 Span 或 Generation。
+- `trace_id` 在 HTTP、Celery 和评测流程间传播，并与 `request_id`、`task_id`、`chat_id`、`document_version_id`、`EvaluationRun.id` 和 `ModelInvocation.id` 关联。
+- 阶段 11 的确定性指标和 Ragas 指标写入 Langfuse Score，黄金集、样本结果和正式 JSON/Markdown 报告仍保存在现有版本化数据集与 PostgreSQL 中。
+- 默认 `LANGFUSE_ENABLED=true`、`LANGFUSE_SAMPLE_RATE=1.0`、`LANGFUSE_CAPTURE_CONTENT=false` 和 `LANGFUSE_BASE_URL=https://cloud.langfuse.com`；部署时通过 `LANGFUSE_PUBLIC_KEY`、`LANGFUSE_SECRET_KEY` 注入凭据，并允许按组织的数据驻留要求切换官方 Cloud 区域。
+- SDK 使用后台批量发送、有限队列、短超时和有限重试；Langfuse 凭据缺失、限流、超时或不可用时记录明确告警并丢弃外部 Trace，不得阻塞 Chat、入库、任务恢复或评测报告落库。
+- 应用关闭和 Worker 退出时在有限时限内 Flush；不得为了等待 Trace 上传无限阻塞进程退出。
+- 管理后台展示 Langfuse 配置、最近成功上报时间和降级状态，但不得展示 Secret Key；可从本地 `trace_id` 跳转到对应 Langfuse Trace。
+- 第一阶段不启用 Langfuse Prompt Management，Prompt 继续随代码和配置版本化，避免形成双重事实来源。
+- Prometheus Server 和 Grafana 仍不是第一阶段强制依赖；Langfuse 不替代 PostgreSQL、Redis、Celery、OpenSearch、Neo4j 和主机资源的健康指标与告警。
 
 ---
 
@@ -1607,11 +1616,11 @@ error_code
 
 - FastAPI 默认监听 `127.0.0.1`。
 - Vite 开发服务器默认仅本机访问。
-- cc switch 保持 `127.0.0.1:15721`。
 - Redis 和 PostgreSQL 不暴露到局域网。
 - Aiven、Voyage 和模型密钥只在后端环境变量中。
 - AuraDB 凭据只在后端环境变量中。
-- 浏览器不得直接访问外部模型、Aiven、AuraDB 或 cc switch。
+- Langfuse Public Key、Secret Key 和 Base URL 只在后端环境变量中，Secret Key 不得发送到浏览器、日志、数据库或 Trace。
+- 浏览器不得直接访问外部模型、Aiven、AuraDB 或 Langfuse 数据写入 API。
 - 上传文件名必须清理，防止路径穿越。
 - 验证 MIME、扩展名和内容签名。
 - 限制文件大小、并发上传和解压资源。
@@ -1621,7 +1630,7 @@ error_code
 - AuraDB Free 使用普通后端凭据，不把独立只读账号作为首版阻塞项；生产化时再评估数据库级读写隔离。
 - 将来允许局域网或公网访问前必须先增加认证、授权、CSRF/CORS 和审计策略。
 
-Presidio 第一阶段不启用，但保留 PrivacyScanner 接口和外部模型发送策略配置。真实企业文档接入前必须确认是否允许发送至 Voyage 和 cc switch 上游 Provider。
+Presidio 第一阶段不启用，但保留 PrivacyScanner 接口和外部服务发送策略配置。真实企业文档接入前必须确认是否允许将相应数据发送至 Voyage、配置的 LLM Provider 和 Langfuse Cloud；若不允许发送原始内容，必须保持 Langfuse 内容字段关闭，仅上报脱敏元数据、指标和内部 ID。
 
 ---
 
@@ -1662,6 +1671,7 @@ RETRIEVAL_*
 QUALITY_*
 EVALUATION_*
 LOGGING_*
+LANGFUSE_*
 ```
 
 算法配置必须带版本并保存快照，确保历史结果可复现。
@@ -1764,7 +1774,7 @@ robust-rag/
 - MinerU Adapter。
 - Dingo Adapter。
 - Voyage Adapter。
-- cc switch Adapter。
+- Responses API Provider。
 - OpenSearch Alias 切换和删除传播。
 - AuraDB 连接、PropertyGraphIndex 投影和重建。
 - SchemaLLMPathExtractor 的结构化抽取契约。
@@ -1989,11 +1999,11 @@ eval-golden
 - 在线补全只接受 PostgreSQL 中当前 READY、ACTIVE 且已成功索引的 Child，避免 OpenSearch 残留旧版本进入上下文。
 - 65 个后端测试通过，整体覆盖率 83% 以上；迁移离线编译通过，真实 Aiven/Voyage 联调等待凭据。
 
-### 阶段 8：cc switch 与 RAG Generation（已完成）
+### 阶段 8：Responses API 与 RAG Generation（已完成，2026-08-18 改为直连）
 
 任务：
 
-- 完成 `gpt-5.6-luna` 契约测试。
+- 完成可配置 Responses API 的契约测试。
 - 实现 Responses Provider 和 Fake Provider。
 - 实现 Grounded Prompt、拒答、引用和多轮 Query Rewrite。
 - 实现 AI SDK UI Message Stream。
@@ -2003,12 +2013,12 @@ eval-golden
 - 流式回答稳定。
 - 无上下文问题明确拒答。
 - 引用可回到原始来源位置。
-- cc switch 不可用时错误可解释。
+- LLM API 鉴权失败、限流或不可用时错误可解释。
 
 完成记录（2026-08-17）：
 
-- 已实现可替换的 `LLMProvider`、`CCSwitchResponsesProvider` 和零费用
-  `FakeLLMProvider`；准确模型 ID 固定为 `gpt-5.6-luna`，业务层不依赖 cc switch 原始响应。
+- 已实现可替换的 `LLMProvider`、`ResponsesAPIProvider` 和零费用
+  `FakeLLMProvider`；Base URL、API Key 与准确模型 ID 均由后端环境变量配置，业务层不依赖供应商原始响应。
 - 已实现 OpenAI Responses 非流式与 typed SSE 契约，覆盖文本/拒答增量、完成、用量、HTTP、
   超时、连接、畸形流和未完成流错误，并限制只在首个文本增量前重试。
 - 已实现版本化 Grounded Prompt、文档指令隔离、无上下文确定性中英文拒答、`[S1]` 引用解析
@@ -2020,8 +2030,7 @@ eval-golden
 - 已新增 Conversation、Message、Citation、ModelInvocation、Alembic `20260817_0008` 迁移、
   会话历史 API 和消息 Trace API；模型调用保存用途、Provider、模型、Prompt、Token、重试、耗时、
   可选成本与结构化错误。
-- 70 个后端测试通过，整体覆盖率 84% 以上；真实 cc switch `/health` 与 `/status` 无费用检查通过。
-  真实 `gpt-5.6-luna` 文本、SSE、多轮、Usage 和 Structured Output 契约测试已提供为显式
+- 70 个后端测试通过，整体覆盖率 84% 以上；真实 LLM API 的文本、SSE、多轮、Usage 和 Structured Output 契约测试已提供为显式
   `integration_live` 测试，默认跳过以避免隐式产生外部费用。
 
 ### 阶段 9：知识图谱构建与检索（已完成）
@@ -2048,7 +2057,7 @@ eval-golden
 实现记录（2026-08-17）：
 
 - 已新增版本化 `enterprise-core-v1` Schema、规范化规则、UUIDv5 稳定实体/事实键和多来源证据模型。
-- 已接入 LlamaIndex `PropertyGraphIndex`、`SchemaLLMPathExtractor(strict=True)`、cc switch Structured Output 适配器与独立 `graph.extract` Celery 任务。
+- 已接入 LlamaIndex `PropertyGraphIndex`、`SchemaLLMPathExtractor(strict=True)`、Responses API Structured Output 适配器与独立 `graph.extract` Celery 任务。
 - 已新增 Neo4j 约束、索引、健康检查、版本隐藏、清理与 PostgreSQL 全量重建能力；图谱状态与文档 `READY` 分离。
 - 已实现受控 `TextToCypherRetriever` 网关、词法/结构 Validator、来源字段要求、`EXPLAIN`、复杂度/超时/行数限制及 OpenSearch 回退。
 - 已将图谱 Source Node 接入 RRF、统一 Rerank、上下文、引用和 Retrieval Trace，并新增图谱搜索、邻域、人工记录、审核与重建 API。
@@ -2082,7 +2091,7 @@ eval-golden
 - 后端 98 项测试通过、1 项真实外部集成测试默认跳过，覆盖率 83.17%；前端 ESLint、TypeScript、生产构建和 15 项测试通过，语句覆盖率 94.66%。
 - 已完成桌面和 390×844 窄屏浏览器检查，无控制台错误和横向溢出；详细说明见 `docs/STAGE10_ADMIN_UI.md`。
 
-### 阶段 11：Ragas 与黄金集
+### 阶段 11：Ragas 与黄金集（已完成）
 
 任务：
 
@@ -2098,14 +2107,27 @@ eval-golden
 - 任一检索配置可以生成可比较报告。
 - 报告包含模型、参数、数据集版本、成本和失败样本。
 
+完成记录（2026-08-17）：
+
+- 已建立 `golden-dataset/1.0` Schema 和 `enterprise-golden-v1` 首批 50 条中英双语种子样本，覆盖事实、跨语言、精确编号、表格、跨文档、2～3 跳图谱、回退、安全拒绝、无答案、歧义和版本问题。
+- 已实现 HitRate/Recall/Precision@5/10、MRR、nDCG@10、父文档召回、引用定位、拒答、实体关系 P/R/F1、图谱路径命中及 Text-to-Cypher 语法、Schema、执行和安全拒绝指标。
+- 已实现同问题 OpenSearch 基线与图谱增强配对，统计图谱增益/退化，并支持以历史运行作为基线执行可配置阈值回归。
+- 已接入锁定版本 Ragas 0.2.15 的六项指标，Judge 使用配置的 LLM API、Embedding 复用生产 Voyage Adapter；默认测试和检索评测不产生外部费用。
+- 已新增 EvaluationRun、EvaluationSampleResult、三个评测 API，以及同时输出 JSON/Markdown 的可比较报告；Alembic `20260817_0011` 已应用，本机 PostgreSQL 已核验为最新 Head。
+- 103 个后端测试通过、1 个真实外部集成测试默认跳过，整体覆盖率 82.75%；Ruff、Mypy、Ragas 真实导入/六指标接口契约及 PostgreSQL 离线迁移均通过。
+- 详细数据集维护、运行、回归门槛与费用边界见 `docs/STAGE11_EVALUATION.md`。
+
 ### 阶段 12：可观测性、异常恢复与安全加固
 
 任务：
 
 - 完成结构化日志、健康检查、耗时和成本统计。
+- 接入并默认启用 Langfuse Cloud，建立 Chat、检索、图谱、模型调用和阶段 11 评测的端到端 Trace/Span/Generation/Score。
+- 配置 Langfuse 本地脱敏、100% 默认采样、异步批量发送、有限超时/重试/Flush 和失败降级；补充管理后台上报状态与 Trace 跳转。
+- 为 PostgreSQL、Redis、Celery Worker/Beat、队列积压、OpenSearch、Neo4j、外部模型和 Langfuse 增加可判定的健康与降级状态。
 - 压测任务恢复、外部限流、超时和网络失败。
 - 压测 AuraDB 故障、异常 Cypher、超时、图谱重建和版本切换。
-- 验证上传安全、路径安全、HTML 安全和日志密钥保护。
+- 验证上传安全、路径安全、HTML 安全，以及日志和 Langfuse Trace 的密钥/敏感内容保护。
 - 完成操作手册和故障处理手册。
 
 验收：
@@ -2113,6 +2135,22 @@ eval-golden
 - 依赖异常不会造成静默数据不一致。
 - 管理后台可以定位文档停在哪个阶段。
 - 关键任务可以安全重试。
+- 一次 Chat、异步模型处理或评测可以通过同一 `trace_id` 定位完整调用链，并查看各阶段耗时、Token、成本、错误和降级状态。
+- 阶段 11 的确定性指标与 Ragas 指标可以关联到 Langfuse Trace，同时本地正式报告不依赖 Langfuse 可用性。
+- 默认配置启用 Langfuse Cloud；有效凭据下 Trace 能成功上报，凭据缺失、限流、超时和服务中断均不会阻塞核心流程，并产生可定位告警。
+- 默认上报内容不包含完整文档、完整检索上下文、密钥、认证信息和连接串；脱敏与内容开关有自动化测试。
+- Langfuse 故障恢复后新 Trace 可继续上报，应用和 Worker 可以在有限时间内安全退出。
+
+实施进展（2026-08-18）：
+
+- 已接入 Langfuse Python SDK 4.14.4，默认启用、100% 采样并关闭完整内容采集；凭据缺失或 Cloud 故障时降级，不影响业务事务和本地审计。
+- 已实现 HTTP/Celery Trace ID 传播，以及 BM25、Embedding、Dense、图检索、Rerank、查询改写、流式生成和阶段 11 评测的 Span/Generation/Score。
+- 已实现统一日志/Trace 敏感字段脱敏、模型首 Token 耗时、Token/成本与应用 Trace 关联；Provider Response ID 不再冒充 Trace ID。
+- 已增加 Worker/Beat 心跳、队列深度、Langfuse 与 Provider 配置状态，并在管理后台系统页展示非敏感状态。
+- Celery 已启用 Late Ack、Worker Lost 重投和单任务预取；恢复扫描增加数据库行锁与 `skip_locked`。
+- 已新增并应用 Alembic `20260818_0012`，修复阶段 11 评测字段声明差异；本机 PostgreSQL 的模型与迁移一致性检查通过。
+- 已新增阶段 12 操作与故障处理手册 `docs/STAGE12_OBSERVABILITY.md`。
+- 本机尚未配置 Langfuse Cloud 凭据，因此真实 Cloud Trace 上报、内容复核和 Cloud 故障演练仍待凭据完成后验收。
 
 ### 阶段 13：最终验收
 
@@ -2141,17 +2179,17 @@ eval-golden
 
 - Aiven OpenSearch 准确版本及原生 RRF 支持。
 - Aiven ICU、k-NN 插件状态与证书连接。
-- cc switch 对 `gpt-5.6-luna` 的实际 Model Mapping。
-- cc switch Responses 流式与 Structured Output 兼容性。
+- 目标 LLM API 对配置模型的实际映射、Bearer 鉴权与错误契约。
+- 目标 LLM API 的 Responses 流式与 Structured Output 兼容性。
 - MinerU 精准解析 API 的 Token、签名上传、轮询、格式范围、文件限制和结果 Zip 契约。
 - Dingo 与当前 Python 依赖树的兼容性。
-- Dingo LLM 是否可直接使用 cc switch OpenAI-compatible Endpoint。
-- Ragas Judge 使用 cc switch 时的兼容性。
+- Dingo LLM 是否可使用目标供应商的 OpenAI-compatible Endpoint。
+- Ragas Judge 使用目标 LLM API 时的兼容性。
 - AI Elements 在 Vite、React 19、Tailwind 4 下的组件兼容性。
 - Voyage 速率限制、批量限制和失败重试行为。
 - AuraDB Free 的实际容量、连接限制、Cypher 版本、约束/索引能力和备份导出方式。
 - LlamaIndex、Neo4j Driver 与当前 Python 依赖树的兼容性。
-- `SchemaLLMPathExtractor` 通过 cc switch 使用 `gpt-5.6-luna` 的 Structured Output 契约。
+- `SchemaLLMPathExtractor` 通过配置的 LLM API 使用 Structured Output 的契约。
 - `PropertyGraphIndex` 对现有 Retrieval Node ID、来源元数据和幂等写入的适配方式。
 - `TextToCypherRetriever` 的 Schema 注入、Validator 钩子、输出字段限制和错误行为。
 - 可用于 Cypher 结构校验和复杂度控制的解析方案；不得以正则作为唯一安全边界。
@@ -2169,7 +2207,7 @@ eval-golden
 | 中文 BM25 分词不佳 | 精确召回下降 | ICU、多字段、企业词汇测试、黄金集调权 |
 | Chunk 脱离上下文 | Dense 命中但无法回答 | 标题路径、父子分块、Parent 扩展、表头传播 |
 | 外部模型不稳定或限流 | 入库和 Chat 失败 | 重试、熔断、幂等、批次状态、可替换 Provider |
-| cc switch 仅适合本机代理 | 难以直接生产部署 | Provider 抽象，生产化时替换为稳定 Gateway |
+| 目标供应商对 Responses API 兼容不完整 | 生成、流式或图谱结构化抽取失败 | Provider 契约测试、显式错误、禁止静默协议转换并保留可替换抽象 |
 | OpenSearch 版本不支持期望 RRF | 融合实现差异 | 实施前验证，必要时应用层 RRF，后续迁移 |
 | 图谱 Schema 过宽或频繁变化 | 抽取噪声高、重建成本上升 | 小而稳定的版本化 Schema、`strict=True`、真实样本评测后扩展 |
 | 实体别名和中英名称未正确归一化 | 重复节点、关系断裂 | 稳定实体键、别名表、候选合并和人工审核 |
@@ -2180,6 +2218,7 @@ eval-golden
 | 同一模型生成并自评 | 评测偏差 | 确定性指标、人工样本、独立 Judge 抽查 |
 | Redis/Celery 长任务重复投递 | 重复计费或重复索引 | 阶段拆分、幂等、Visibility Timeout、批次状态 |
 | 真实企业数据发送第三方 | 合规风险 | 外部发送策略、未来 PrivacyScanner、接入前确认 |
+| Langfuse Cloud 上报敏感内容或不可用 | 数据外泄或可观测链路影响业务 | 默认字段白名单、本地脱敏、内容开关、异步有限队列、短超时、失败降级和本地事实来源 |
 | 无认证服务被局域网访问 | 数据与密钥暴露 | 全部本机监听，不允许前端直连外部服务 |
 
 ---
@@ -2199,9 +2238,10 @@ eval-golden
 - 受控 TextToCypherRetriever 通过危险语句、Schema 越界、无界路径、LIMIT、超时和回退测试。
 - 多跳回答能够展示关系路径并引用原始文档片段。
 - Voyage Embedding 与 Reranker 的调用、成本和错误可追踪。
-- GPT-5.6 Luna 通过 cc switch 稳定流式回答。
+- 配置的 Responses-compatible 模型通过后端直连 API 稳定流式回答。
 - 回答严格基于上下文并提供可定位引用。
 - Ragas 和确定性 IR 指标可以重复运行并生成报告。
+- Langfuse Cloud 默认启用，LLM/RAG 调用链和评测分数可追踪，敏感内容默认不上报，Langfuse 故障不影响核心业务与本地审计。
 - 管理后台支持失败重试、隔离放行、重新处理、软删除和恢复。
 - 管理后台支持图谱搜索、局部可视化、来源查看和人工修正，且自动重建不会静默覆盖人工事实。
 - 单元、集成和 E2E 核心流程通过。

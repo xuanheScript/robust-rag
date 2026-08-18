@@ -27,11 +27,19 @@ dependencies = [
   "uvicorn[standard]>=0.35,<1",
   "llama-index-core>=0.14.23,<0.15",
   "llama-index-graph-stores-neo4j>=0.7,<0.8",
+  "langfuse>=4.14,<5",
   "neo4j>=5.16,<6",
 ]
 
 [project.optional-dependencies]
 dingo = ["dingo-python==2.5.0"]
+eval = [
+  "langchain>=0.3.14,<0.4",
+  "langchain-community>=0.3.14,<0.4",
+  "langchain-core>=0.3.29,<0.4",
+  "langchain-openai>=0.3,<0.4",
+  "ragas==0.2.15",
+]
 
 [dependency-groups]
 dev = [

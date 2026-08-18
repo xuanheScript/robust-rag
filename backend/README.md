@@ -23,4 +23,4 @@ PDF、DOC/DOCX、PPT/PPTX、HTML/HTM 使用 MinerU 云端精准 API，需要在 
 
 阶段 7 提供 BM25、Dense、Hybrid 和 Hybrid+Rerank 四种检索模式，以应用层 RRF 和多样性控制融合候选，使用 Voyage `rerank-2.5` 可降级重排，并按 Token 预算恢复 Parent/相邻 Child。每次检索持久化完整 Retrieval Trace；详见 `docs/STAGE7_RETRIEVAL.md`。
 
-阶段 8 提供有来源回答、SSE、多轮会话与模型调用审计；阶段 9 提供版本化知识图谱、Neo4j 可重建投影、受控 Text-to-Cypher、OpenSearch 回退和人工审核领域 API；阶段 10 补齐文档生命周期、图谱合并/拆分/纠错/冲突处理以及管理端所需 API。详见 `docs/STAGE8_GENERATION.md`、`docs/STAGE9_KNOWLEDGE_GRAPH.md` 与 `docs/STAGE10_ADMIN_UI.md`。
+阶段 8 通过后端配置的 Responses-compatible API（`LLM_BASE_URL`、`LLM_API_KEY`、`LLM_MODEL`）提供有来源回答、SSE、多轮会话与模型调用审计；阶段 9 提供版本化知识图谱、Neo4j 可重建投影、受控 Text-to-Cypher、OpenSearch 回退和人工审核领域 API；阶段 10 补齐文档生命周期、图谱合并/拆分/纠错/冲突处理以及管理端所需 API；阶段 11 提供版本化黄金集、确定性/图谱指标、Ragas 和可比较回归报告；阶段 12 接入默认启用、可失败降级的 Langfuse Cloud Trace，并补充 Worker/Beat/队列健康、可靠投递和统一敏感字段脱敏。详见 `docs/STAGE8_GENERATION.md`、`docs/STAGE9_KNOWLEDGE_GRAPH.md`、`docs/STAGE10_ADMIN_UI.md`、`docs/STAGE11_EVALUATION.md` 与 `docs/STAGE12_OBSERVABILITY.md`。

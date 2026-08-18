@@ -1,13 +1,24 @@
 """Durable ingestion orchestration tasks."""
 
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from typing import TypedDict
 
+import structlog
+from celery import current_task
 from sqlalchemy import select
 
 from robust_rag.chunking.service import get_chunking_service
 from robust_rag.cleaning.service import get_cleaning_service
+from robust_rag.core.observability import (
+    Observation,
+    bind_trace_id,
+    observe,
+    reset_trace_id,
+    trace_id_from_seed,
+)
 from robust_rag.core.settings import get_settings
 from robust_rag.db.enums import JobStatus, StageName, StageRunStatus
 from robust_rag.db.models import IngestionJob, StageRun
@@ -20,6 +31,8 @@ from robust_rag.parsing.service import get_parsing_service
 from robust_rag.quality.service import get_quality_service
 from robust_rag.workers.celery_app import celery_app
 
+logger = structlog.get_logger(__name__)
+
 
 class AdvanceResult(TypedDict):
     job_id: str
@@ -28,16 +41,36 @@ class AdvanceResult(TypedDict):
 
 
 @celery_app.task(name="graph.extract")  # type: ignore[untyped-decorator]
-def extract_graph(document_version_id: str) -> dict[str, str]:
+def extract_graph(document_version_id: str, *, force: bool = False) -> dict[str, str]:
     """Build the optional graph projection without changing ingestion readiness."""
 
-    status = get_graph_extraction_service().execute(uuid.UUID(document_version_id))
-    return {"document_version_id": document_version_id, "status": status}
+    with _task_context(
+        "graph.extract",
+        trace_seed=f"graph:{document_version_id}",
+        metadata={"document_version_id": document_version_id, "force": force},
+    ) as observation:
+        status = get_graph_extraction_service().execute(uuid.UUID(document_version_id), force=force)
+        result = {"document_version_id": document_version_id, "status": status}
+        observation.update(output=result)
+        return result
 
 
 @celery_app.task(name="ingestion.advance")  # type: ignore[untyped-decorator]
 def advance_ingestion(job_id: str) -> AdvanceResult:
     """Advance a job idempotently as far as implemented stages allow."""
+
+    with _task_context(
+        "ingestion.advance",
+        trace_seed=f"ingestion:{job_id}",
+        metadata={"job_id": job_id},
+    ) as observation:
+        result = _advance_ingestion(job_id)
+        observation.update(output=result, metadata={"stage": result["current_stage"]})
+        return result
+
+
+def _advance_ingestion(job_id: str) -> AdvanceResult:
+    """Execute the durable ingestion transition inside a traced task boundary."""
 
     parsed_job_id = uuid.UUID(job_id)
     with SessionLocal.begin() as db:
@@ -88,23 +121,67 @@ def advance_ingestion(job_id: str) -> AdvanceResult:
 def recover_pending_jobs() -> dict[str, int]:
     """Requeue stale non-terminal jobs from PostgreSQL after worker or broker loss."""
 
-    settings = get_settings()
-    cutoff = datetime.now(UTC) - timedelta(seconds=settings.job_recovery_age_seconds)
-    with SessionLocal.begin() as db:
-        jobs = list(
-            db.scalars(
-                select(IngestionJob).where(
-                    IngestionJob.status.in_([JobStatus.PENDING, JobStatus.RUNNING]),
-                    IngestionJob.updated_at <= cutoff,
+    with _task_context("ingestion.recover_pending", trace_seed="ingestion:recovery") as observation:
+        settings = get_settings()
+        cutoff = datetime.now(UTC) - timedelta(seconds=settings.job_recovery_age_seconds)
+        with SessionLocal.begin() as db:
+            jobs = list(
+                db.scalars(
+                    select(IngestionJob)
+                    .where(
+                        IngestionJob.status.in_([JobStatus.PENDING, JobStatus.RUNNING]),
+                        IngestionJob.updated_at <= cutoff,
+                    )
+                    .with_for_update(skip_locked=True)
                 )
             )
+            for job in jobs:
+                result = advance_ingestion.delay(str(job.id))
+                job.celery_task_id = str(result.id)
+                job.status = JobStatus.PENDING
+                job.updated_at = datetime.now(UTC)
+        result_payload = {"requeued": len(jobs)}
+        observation.update(output=result_payload, metadata={"cutoff": cutoff.isoformat()})
+        return result_payload
+
+
+@contextmanager
+def _task_context(
+    name: str,
+    *,
+    trace_seed: str,
+    metadata: dict[str, object] | None = None,
+) -> Iterator[Observation]:
+    trace_id = trace_id_from_seed(trace_seed)
+    task_id = str(getattr(getattr(current_task, "request", None), "id", "") or "direct")
+    token = bind_trace_id(trace_id)
+    structlog.contextvars.clear_contextvars()
+    structlog.contextvars.bind_contextvars(trace_id=trace_id, task_id=task_id)
+    started = datetime.now(UTC)
+    logger.info("worker_task_started", task=name, **(metadata or {}))
+    try:
+        with observe(
+            name,
+            trace_id=trace_id,
+            metadata={"task_id": task_id, **(metadata or {})},
+        ) as obs:
+            yield obs
+        logger.info(
+            "worker_task_completed",
+            task=name,
+            duration_ms=round((datetime.now(UTC) - started).total_seconds() * 1000, 3),
         )
-        for job in jobs:
-            result = advance_ingestion.delay(str(job.id))
-            job.celery_task_id = str(result.id)
-            job.status = JobStatus.PENDING
-            job.updated_at = datetime.now(UTC)
-    return {"requeued": len(jobs)}
+    except BaseException as exc:
+        logger.exception(
+            "worker_task_failed",
+            task=name,
+            error_type=type(exc).__name__,
+            duration_ms=round((datetime.now(UTC) - started).total_seconds() * 1000, 3),
+        )
+        raise
+    finally:
+        structlog.contextvars.clear_contextvars()
+        reset_trace_id(token)
 
 
 def _complete_upload_stage(job: IngestionJob) -> None:
