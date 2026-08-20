@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+from collections import Counter
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from typing import Literal, Protocol
@@ -107,6 +108,115 @@ class LLMStreamEvent:
     usage: LLMUsage = field(default_factory=LLMUsage)
     finish_reason: str | None = None
     tool_calls: tuple[LLMToolCall, ...] = ()
+
+
+@dataclass
+class _StreamTimingDiagnostics:
+    started: float
+    response_headers_ms: float | None = None
+    first_sse_event_ms: float | None = None
+    first_sse_event_type: str | None = None
+    first_reasoning_event_ms: float | None = None
+    first_tool_event_ms: float | None = None
+    first_text_delta_ms: float | None = None
+    response_completed_ms: float | None = None
+    done_ms: float | None = None
+    downstream_yield_wait_ms: float = 0
+    json_parse_ms: float = 0
+    event_counts: Counter[str] = field(default_factory=Counter)
+    http_events_ms: dict[str, float] = field(default_factory=dict)
+
+    def elapsed_ms(self) -> float:
+        return round((time.perf_counter() - self.started) * 1000, 3)
+
+    def http_trace(self, event_name: str, _info: dict[str, object]) -> None:
+        self.http_events_ms.setdefault(event_name, self.elapsed_ms())
+
+    def observe_sse(self, event_type: str) -> None:
+        elapsed_ms = self.elapsed_ms()
+        self.event_counts[event_type] += 1
+        if self.first_sse_event_ms is None:
+            self.first_sse_event_ms = elapsed_ms
+            self.first_sse_event_type = event_type
+        if event_type.startswith("response.reasoning") and self.first_reasoning_event_ms is None:
+            self.first_reasoning_event_ms = elapsed_ms
+        if "function_call" in event_type and self.first_tool_event_ms is None:
+            self.first_tool_event_ms = elapsed_ms
+        if event_type == "response.completed":
+            self.response_completed_ms = elapsed_ms
+
+    def observe_text_delta(self) -> bool:
+        if self.first_text_delta_ms is not None:
+            return False
+        self.first_text_delta_ms = self.elapsed_ms()
+        return True
+
+    def add_downstream_wait(self, started: float) -> None:
+        self.downstream_yield_wait_ms += (time.perf_counter() - started) * 1000
+
+    def snapshot(self) -> dict[str, object]:
+        total_ms = self.elapsed_ms()
+        return {
+            "total_latency_ms": total_ms,
+            "response_headers_ms": self.response_headers_ms,
+            "first_sse_event_ms": self.first_sse_event_ms,
+            "first_sse_event_type": self.first_sse_event_type,
+            "first_reasoning_event_ms": self.first_reasoning_event_ms,
+            "first_tool_event_ms": self.first_tool_event_ms,
+            "first_text_delta_ms": self.first_text_delta_ms,
+            "response_completed_ms": self.response_completed_ms,
+            "done_ms": self.done_ms,
+            "downstream_yield_wait_ms": round(self.downstream_yield_wait_ms, 3),
+            "provider_active_ms": round(max(0, total_ms - self.downstream_yield_wait_ms), 3),
+            "json_parse_ms": round(self.json_parse_ms, 3),
+            "sse_event_count": sum(self.event_counts.values()),
+            "reasoning_event_count": sum(
+                count
+                for event_type, count in self.event_counts.items()
+                if event_type.startswith("response.reasoning")
+            ),
+            "tool_event_count": sum(
+                count
+                for event_type, count in self.event_counts.items()
+                if "function_call" in event_type
+            ),
+            "text_event_count": sum(
+                count
+                for event_type, count in self.event_counts.items()
+                if event_type in {"response.output_text.delta", "response.refusal.delta"}
+            ),
+            "sse_event_types": sorted(self.event_counts),
+            **self._http_phase_snapshot(),
+        }
+
+    def _http_phase_snapshot(self) -> dict[str, object]:
+        return {
+            "connection_reused": (
+                not self._has_http_event("connect_tcp.started") if self.http_events_ms else None
+            ),
+            "request_send_started_ms": self._http_event("send_request_headers.started"),
+            "request_headers_sent_ms": self._http_event("send_request_headers.complete"),
+            "request_body_sent_ms": self._http_event("send_request_body.complete"),
+            "connect_tcp_ms": self._http_duration("connect_tcp"),
+            "tls_ms": self._http_duration("start_tls"),
+            "upstream_headers_wait_ms": self._http_duration("receive_response_headers"),
+        }
+
+    def _has_http_event(self, suffix: str) -> bool:
+        return any(name.endswith(suffix) for name in self.http_events_ms)
+
+    def _http_event(self, suffix: str) -> float | None:
+        return next(
+            (elapsed for name, elapsed in self.http_events_ms.items() if name.endswith(suffix)),
+            None,
+        )
+
+    def _http_duration(self, phase: str) -> float | None:
+        started = self._http_event(f"{phase}.started")
+        completed = self._http_event(f"{phase}.complete")
+        if started is None or completed is None:
+            return None
+        return round(max(0, completed - started), 3)
 
 
 class LLMProvider(Protocol):
@@ -288,10 +398,41 @@ class ResponsesAPIProvider:
         return result
 
     def stream(self, request: LLMRequest) -> Iterator[LLMStreamEvent]:
+        diagnostics = _StreamTimingDiagnostics(started=time.perf_counter())
+        effective_reasoning = request.reasoning_effort or self.reasoning_effort
+        log_context = {
+            "provider": self.provider,
+            "model": self.model,
+            "endpoint": self.endpoint,
+            "timeout_seconds": self.timeout_seconds,
+            "requested_reasoning_effort": request.reasoning_effort,
+            "effective_reasoning_effort": effective_reasoning,
+            "reasoning_parameter_sent": effective_reasoning != "none",
+            **_request_diagnostics(request),
+        }
+        logger.info("llm_provider_stream_started", **log_context)
+        response_status: int | None = None
+        upstream_request_id: str | None = None
+        response_id: str | None = None
+        usage_diagnostics: dict[str, object] = {}
         try:
             with self.client.stream(
-                "POST", "responses", json=self._payload(request, stream=True)
+                "POST",
+                "responses",
+                json=self._payload(request, stream=True),
+                extensions={"trace": diagnostics.http_trace},
             ) as response:
+                diagnostics.response_headers_ms = diagnostics.elapsed_ms()
+                response_status = response.status_code
+                upstream_request_id = _upstream_request_id(response)
+                logger.info(
+                    "llm_provider_response_headers_received",
+                    **log_context,
+                    **diagnostics.snapshot(),
+                    http_status=response.status_code,
+                    content_type=response.headers.get("content-type"),
+                    upstream_request_id=upstream_request_id,
+                )
                 if response.status_code >= 400:
                     response.read()
                     raise _http_error(response)
@@ -299,39 +440,101 @@ class ResponsesAPIProvider:
                 emitted_text = False
                 for raw_data in _iter_sse_data(response.iter_lines()):
                     if raw_data == "[DONE]":
+                        diagnostics.done_ms = diagnostics.elapsed_ms()
                         break
+                    parse_started = time.perf_counter()
                     try:
                         event = json.loads(raw_data)
                     except json.JSONDecodeError as exc:
+                        diagnostics.json_parse_ms += (time.perf_counter() - parse_started) * 1000
                         raise LLMProviderError(
                             "LLM_INVALID_STREAM",
                             "Generation service returned malformed stream data",
                             retryable=False,
                             status_code=response.status_code,
                         ) from exc
+                    diagnostics.json_parse_ms += (time.perf_counter() - parse_started) * 1000
                     if not isinstance(event, dict):
+                        diagnostics.observe_sse("non_object")
                         continue
-                    event_type = event.get("type")
+                    raw_event_type = event.get("type")
+                    event_type = raw_event_type if isinstance(raw_event_type, str) else "unknown"
+                    first_sse = diagnostics.first_sse_event_ms is None
+                    first_reasoning = (
+                        event_type.startswith("response.reasoning")
+                        and diagnostics.first_reasoning_event_ms is None
+                    )
+                    first_tool = (
+                        "function_call" in event_type and diagnostics.first_tool_event_ms is None
+                    )
+                    diagnostics.observe_sse(event_type)
+                    if first_sse:
+                        logger.info(
+                            "llm_provider_first_sse_event",
+                            **log_context,
+                            **diagnostics.snapshot(),
+                            http_status=response.status_code,
+                            upstream_request_id=upstream_request_id,
+                            sse_event_type=event_type,
+                        )
+                    if first_reasoning:
+                        logger.info(
+                            "llm_provider_first_reasoning_event",
+                            **log_context,
+                            first_reasoning_event_ms=diagnostics.first_reasoning_event_ms,
+                            upstream_request_id=upstream_request_id,
+                        )
+                    if first_tool:
+                        logger.info(
+                            "llm_provider_first_tool_event",
+                            **log_context,
+                            first_tool_event_ms=diagnostics.first_tool_event_ms,
+                            upstream_request_id=upstream_request_id,
+                            sse_event_type=event_type,
+                        )
                     if event_type in {"response.output_text.delta", "response.refusal.delta"}:
                         delta = event.get("delta")
                         if isinstance(delta, str) and delta:
                             emitted_text = True
+                            if diagnostics.observe_text_delta():
+                                logger.info(
+                                    "llm_provider_first_text_delta",
+                                    **log_context,
+                                    first_text_delta_ms=diagnostics.first_text_delta_ms,
+                                    upstream_request_id=upstream_request_id,
+                                )
+                            downstream_started = time.perf_counter()
                             yield LLMStreamEvent(type="text_delta", delta=delta)
+                            diagnostics.add_downstream_wait(downstream_started)
                     elif event_type == "response.completed":
                         completed = True
                         result = event.get("response")
                         result_payload = result if isinstance(result, dict) else event
+                        response_id = _optional_string(result_payload.get("id"))
+                        usage_diagnostics = _stream_usage_diagnostics(result_payload.get("usage"))
                         final_text = _extract_output_text(result_payload)
                         if final_text and not emitted_text:
                             emitted_text = True
+                            if diagnostics.observe_text_delta():
+                                logger.info(
+                                    "llm_provider_first_text_delta",
+                                    **log_context,
+                                    first_text_delta_ms=diagnostics.first_text_delta_ms,
+                                    upstream_request_id=upstream_request_id,
+                                    emitted_from_completed_event=True,
+                                )
+                            downstream_started = time.perf_counter()
                             yield LLMStreamEvent(type="text_delta", delta=final_text)
+                            diagnostics.add_downstream_wait(downstream_started)
+                        downstream_started = time.perf_counter()
                         yield LLMStreamEvent(
                             type="completed",
-                            response_id=_optional_string(result_payload.get("id")),
+                            response_id=response_id,
                             usage=_usage(result_payload.get("usage")),
                             finish_reason=_finish_reason(result_payload),
                             tool_calls=_extract_tool_calls(result_payload),
                         )
+                        diagnostics.add_downstream_wait(downstream_started)
                     elif event_type in {"error", "response.failed", "response.incomplete"}:
                         raise _stream_error(event)
                 if not completed:
@@ -341,10 +544,41 @@ class ResponsesAPIProvider:
                         retryable=True,
                         status_code=response.status_code,
                     )
-        except LLMProviderError:
+                logger.info(
+                    "llm_provider_stream_completed",
+                    **log_context,
+                    **diagnostics.snapshot(),
+                    **usage_diagnostics,
+                    http_status=response.status_code,
+                    upstream_request_id=upstream_request_id,
+                    response_id=response_id,
+                )
+        except LLMProviderError as exc:
+            logger.error(
+                "llm_provider_stream_failed",
+                **log_context,
+                **diagnostics.snapshot(),
+                http_status=response_status,
+                upstream_request_id=upstream_request_id,
+                error_code=exc.code,
+                status_code=exc.status_code,
+                retryable=exc.retryable,
+            )
             raise
         except httpx.HTTPError as exc:
-            raise _transport_error(exc) from exc
+            error = _transport_error(exc)
+            logger.error(
+                "llm_provider_stream_failed",
+                **log_context,
+                **diagnostics.snapshot(),
+                http_status=response_status,
+                upstream_request_id=upstream_request_id,
+                error_code=error.code,
+                status_code=error.status_code,
+                retryable=error.retryable,
+                transport_error_type=type(exc).__name__,
+            )
+            raise error from exc
 
     def _payload(self, request: LLMRequest, *, stream: bool) -> dict[str, object]:
         payload: dict[str, object] = {
@@ -481,7 +715,18 @@ def _request_diagnostics(request: LLMRequest) -> dict[str, object]:
 
 
 def _http_response_diagnostics(response: httpx.Response, started: float) -> dict[str, object]:
-    upstream_request_id = next(
+    return {
+        "http_status": response.status_code,
+        "latency_ms": _elapsed_ms(started),
+        "content_type": response.headers.get("content-type"),
+        "upstream_request_id": _upstream_request_id(response),
+        "response_bytes": len(response.content),
+        "response_sha256": hashlib.sha256(response.content).hexdigest(),
+    }
+
+
+def _upstream_request_id(response: httpx.Response) -> str | None:
+    return next(
         (
             response.headers.get(name)
             for name in ("x-request-id", "request-id", "x-correlation-id", "cf-ray")
@@ -489,13 +734,27 @@ def _http_response_diagnostics(response: httpx.Response, started: float) -> dict
         ),
         None,
     )
+
+
+def _stream_usage_diagnostics(value: object) -> dict[str, object]:
+    if not isinstance(value, dict):
+        return {}
+    input_details = value.get("input_tokens_details")
+    output_details = value.get("output_tokens_details")
     return {
-        "http_status": response.status_code,
-        "latency_ms": _elapsed_ms(started),
-        "content_type": response.headers.get("content-type"),
-        "upstream_request_id": upstream_request_id,
-        "response_bytes": len(response.content),
-        "response_sha256": hashlib.sha256(response.content).hexdigest(),
+        "input_tokens": _optional_int(value.get("input_tokens")),
+        "output_tokens": _optional_int(value.get("output_tokens")),
+        "total_tokens": _optional_int(value.get("total_tokens")),
+        "cached_input_tokens": (
+            _optional_int(input_details.get("cached_tokens"))
+            if isinstance(input_details, dict)
+            else None
+        ),
+        "reasoning_tokens": (
+            _optional_int(output_details.get("reasoning_tokens"))
+            if isinstance(output_details, dict)
+            else None
+        ),
     }
 
 

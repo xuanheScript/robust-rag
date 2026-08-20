@@ -162,6 +162,81 @@ def test_responses_api_provider_non_stream_and_stream_contract() -> None:
     assert provider.endpoint == "https://llm.example.test/v1/responses"
 
 
+def test_responses_api_stream_logs_safe_phase_timings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream", "x-request-id": "upstream-1"},
+                text=(
+                    'data: {"type":"response.created"}\n\n'
+                    'data: {"type":"response.reasoning_text.delta","delta":"private"}\n\n'
+                    'data: {"type":"response.output_text.delta","delta":"answer"}\n\n'
+                    "data: "
+                    '{"type":"response.completed","response":{"id":"resp_1",'
+                    '"status":"completed","usage":{"input_tokens":9,'
+                    '"output_tokens":4,"total_tokens":13,'
+                    '"input_tokens_details":{"cached_tokens":3},'
+                    '"output_tokens_details":{"reasoning_tokens":2}}}}\n\n'
+                    "data: [DONE]\n\n"
+                ),
+            )
+        ),
+        base_url="https://llm.example.test/v1/",
+    )
+    provider = ResponsesAPIProvider(
+        base_url="https://llm.example.test/v1",
+        model="test-responses-model",
+        reasoning_effort="medium",
+        api_key="secret",
+        client=client,
+    )
+    local_logger = Mock()
+    monkeypatch.setattr("robust_rag.generation.provider.logger", local_logger)
+
+    events = list(
+        provider.stream(
+            LLMRequest(
+                instructions="private instructions",
+                input=[{"role": "user", "content": "private question"}],
+                max_output_tokens=100,
+                metadata={"purpose": "timing-test"},
+            )
+        )
+    )
+
+    assert [event.type for event in events] == ["text_delta", "completed"]
+    records = _log_records(local_logger)
+    assert [record["event"] for record in records] == [
+        "llm_provider_stream_started",
+        "llm_provider_response_headers_received",
+        "llm_provider_first_sse_event",
+        "llm_provider_first_reasoning_event",
+        "llm_provider_first_text_delta",
+        "llm_provider_stream_completed",
+    ]
+    completed = records[-1]
+    assert completed["upstream_request_id"] == "upstream-1"
+    assert completed["response_headers_ms"] is not None
+    assert completed["first_reasoning_event_ms"] is not None
+    assert completed["first_text_delta_ms"] is not None
+    assert completed["response_completed_ms"] is not None
+    assert completed["sse_event_count"] == 4
+    assert completed["reasoning_event_count"] == 1
+    assert completed["text_event_count"] == 1
+    assert completed["input_tokens"] == 9
+    assert completed["cached_input_tokens"] == 3
+    assert completed["reasoning_tokens"] == 2
+    assert completed["connection_reused"] is None
+    logged_values = repr(records)
+    assert "private instructions" not in logged_values
+    assert "private question" not in logged_values
+    assert "private" not in logged_values
+    assert "secret" not in logged_values
+
+
 def test_responses_api_provider_tool_call_contract() -> None:
     captured: dict[str, object] = {}
 
