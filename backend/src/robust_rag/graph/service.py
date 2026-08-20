@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import uuid
 from collections.abc import Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Protocol
 
@@ -14,6 +14,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from robust_rag.db.enums import (
+    GraphBuildRequestStatus,
     GraphOrigin,
     GraphProjectionStatus,
     GraphReviewStatus,
@@ -23,6 +24,7 @@ from robust_rag.db.enums import (
 )
 from robust_rag.db.models import (
     DocumentVersion,
+    GraphBuildRequest,
     GraphConflictRecord,
     GraphEntityRecord,
     GraphExtractionRun,
@@ -32,7 +34,13 @@ from robust_rag.db.models import (
 )
 from robust_rag.generation.provider import LLMProviderError
 from robust_rag.graph.schema import GraphSchema
-from robust_rag.graph.schemas import ExtractedEntity, ExtractedTriplet, GraphExtractionArtifact
+from robust_rag.graph.schemas import (
+    ExtractedEntity,
+    ExtractedTriplet,
+    GraphExtractionArtifact,
+    GraphExtractionBatch,
+    GraphParentOutcome,
+)
 from robust_rag.graph.store import GraphStoreAdapter
 from robust_rag.storage.base import FileStorage
 
@@ -43,7 +51,32 @@ class GraphExtractor(Protocol):
     name: str
     version: str
 
-    def extract(self, sources: Sequence[tuple[str, str]]) -> dict[str, list[ExtractedTriplet]]: ...
+    def extract(
+        self, sources: Sequence[tuple[str, str]]
+    ) -> GraphExtractionBatch | dict[str, list[ExtractedTriplet]]: ...
+
+
+class GraphExtractionQualityError(RuntimeError):
+    code = "GRAPH_PARENT_FAILURE_THRESHOLD_EXCEEDED"
+
+    def __init__(self, *, failed: int, total: int, maximum_ratio: float) -> None:
+        self.failed = failed
+        self.total = total
+        self.maximum_ratio = maximum_ratio
+        super().__init__(
+            f"{failed} of {total} parent nodes failed graph extraction; "
+            f"maximum allowed ratio is {maximum_ratio:.3f}"
+        )
+
+
+class GraphExtractionEmptyResultError(RuntimeError):
+    code = "GRAPH_ALL_CANDIDATES_REJECTED"
+
+    def __init__(self, candidate_count: int) -> None:
+        self.candidate_count = candidate_count
+        super().__init__(
+            f"All {candidate_count} model-generated graph triplets were rejected by the schema"
+        )
 
 
 class GraphExtractionService:
@@ -57,6 +90,9 @@ class GraphExtractionService:
         schema: GraphSchema,
         model: str,
         prompt_version: str,
+        max_failed_parent_ratio: float = 0.2,
+        stale_after_seconds: int = 900,
+        config_snapshot: dict[str, object] | None = None,
     ) -> None:
         self.session_factory = session_factory
         self.extractor = extractor
@@ -65,10 +101,21 @@ class GraphExtractionService:
         self.schema = schema
         self.model = model
         self.prompt_version = prompt_version
+        self.max_failed_parent_ratio = max_failed_parent_ratio
+        self.stale_after_seconds = stale_after_seconds
+        self.config_snapshot = config_snapshot or {}
 
-    def execute(self, version_id: uuid.UUID, *, force: bool = False) -> str:
+    def execute(
+        self,
+        version_id: uuid.UUID,
+        *,
+        force: bool = False,
+        build_request_id: uuid.UUID | None = None,
+    ) -> str:
         with self.session_factory() as db:
-            version = db.get(DocumentVersion, version_id)
+            version = db.scalar(
+                select(DocumentVersion).where(DocumentVersion.id == version_id).with_for_update()
+            )
             if version is None:
                 logger.warning(
                     "graph_extraction_version_not_found", document_version_id=str(version_id)
@@ -97,24 +144,71 @@ class GraphExtractionService:
                 )
                 return "no_parent_nodes"
             input_hash = _input_hash(nodes, self.schema.digest())
-            existing = db.scalar(
-                select(GraphExtractionRun).where(
-                    GraphExtractionRun.document_version_id == version_id,
-                    GraphExtractionRun.schema_version == self.schema.version,
-                    GraphExtractionRun.extractor_version == self.extractor.version,
-                    GraphExtractionRun.input_hash == input_hash,
+            matching_runs = list(
+                db.scalars(
+                    select(GraphExtractionRun)
+                    .where(
+                        GraphExtractionRun.document_version_id == version_id,
+                        GraphExtractionRun.schema_version == self.schema.version,
+                        GraphExtractionRun.extractor_version == self.extractor.version,
+                        GraphExtractionRun.input_hash == input_hash,
+                    )
+                    .order_by(GraphExtractionRun.attempt.desc())
                 )
             )
-            if existing is not None and existing.status is GraphRunStatus.SUCCEEDED and not force:
+            now = datetime.now(UTC)
+            for candidate in matching_runs:
+                if candidate.status is GraphRunStatus.RUNNING and is_graph_run_stale(
+                    candidate, self.stale_after_seconds, now=now
+                ):
+                    candidate.status = GraphRunStatus.FAILED
+                    candidate.error = {
+                        "type": "GraphRunStaleError",
+                        "code": "GRAPH_RUN_STALE",
+                        "message": ("Graph extraction did not finish before the stale-run timeout"),
+                    }
+                    candidate.finished_at = now
+                    logger.warning(
+                        "graph_extraction_stale_run_recovered",
+                        document_version_id=str(version_id),
+                        run_id=str(candidate.id),
+                        attempt=candidate.attempt,
+                        stale_after_seconds=self.stale_after_seconds,
+                    )
+            current_runs = [
+                value
+                for value in matching_runs
+                if value.model == self.model and value.prompt_version == self.prompt_version
+            ]
+            active = next(
+                (value for value in current_runs if value.status is GraphRunStatus.RUNNING), None
+            )
+            if active is not None:
+                version.graph_status = GraphProjectionStatus.RUNNING
+                db.commit()
                 logger.info(
                     "graph_extraction_skipped",
                     document_id=str(version.document_id),
                     document_version_id=str(version_id),
-                    run_id=str(existing.id),
+                    run_id=str(active.id),
+                    reason="matching_run_already_running",
+                )
+                return "running"
+            succeeded = next(
+                (value for value in current_runs if value.status is GraphRunStatus.SUCCEEDED), None
+            )
+            if succeeded is not None and not force:
+                db.commit()
+                logger.info(
+                    "graph_extraction_skipped",
+                    document_id=str(version.document_id),
+                    document_version_id=str(version_id),
+                    run_id=str(succeeded.id),
                     reason="matching_run_already_succeeded",
                 )
                 return "succeeded"
-            run = existing or GraphExtractionRun(
+            run = GraphExtractionRun(
+                build_request_id=build_request_id,
                 document_version_id=version_id,
                 schema_version=self.schema.version,
                 extractor_name=self.extractor.name,
@@ -122,6 +216,7 @@ class GraphExtractionService:
                 model=self.model,
                 prompt_version=self.prompt_version,
                 input_hash=input_hash,
+                attempt=max((value.attempt for value in matching_runs), default=0) + 1,
                 parent_count=len(nodes),
                 config_snapshot={
                     "schema_digest": self.schema.digest(),
@@ -129,18 +224,10 @@ class GraphExtractionService:
                     "source_level": "parent",
                     "parent_token_count": sum(node.token_count for node in nodes),
                     "parent_character_count": sum(len(node.content) for node in nodes),
+                    **self.config_snapshot,
                 },
             )
-            if existing is None:
-                db.add(run)
-            else:
-                run.status = GraphRunStatus.RUNNING
-                run.error = None
-                run.started_at = datetime.now(UTC)
-                run.finished_at = None
-                run.entity_count = 0
-                run.relation_count = 0
-                run.artifact_uri = None
+            db.add(run)
             version.graph_status = GraphProjectionStatus.RUNNING
             db.commit()
             run_id = run.id
@@ -158,12 +245,42 @@ class GraphExtractionService:
             parent_token_count=sum(node.token_count for node in nodes),
             parent_character_count=sum(len(node.content) for node in nodes),
             force=force,
+            attempt=run.attempt,
         )
 
         try:
-            extracted = self.extractor.extract(
+            extraction_result = self.extractor.extract(
                 [(str(node.id), _extraction_text(node)) for node in nodes]
             )
+            extracted, outcomes = _normalize_extraction_result(extraction_result, nodes)
+            usage = _graph_usage_snapshot(outcomes, len(nodes))
+            with self.session_factory.begin() as db:
+                stored_run = db.get(GraphExtractionRun, run_id)
+                if stored_run is not None:
+                    stored_run.usage_json = usage
+            succeeded_count = sum(value.status == "succeeded" for value in outcomes)
+            failed_count = sum(value.status == "failed" for value in outcomes)
+            failed_count += max(0, len(nodes) - succeeded_count - failed_count)
+            failure_ratio = failed_count / len(nodes)
+            logger.info(
+                "graph_extraction_parent_batch_completed",
+                document_id=str(document_id),
+                document_version_id=str(version_id),
+                run_id=str(run_id),
+                **{key: value for key, value in usage.items() if key != "parent_outcomes"},
+            )
+            if failed_count and (
+                failure_ratio > self.max_failed_parent_ratio or succeeded_count == 0
+            ):
+                raise GraphExtractionQualityError(
+                    failed=failed_count,
+                    total=len(nodes),
+                    maximum_ratio=self.max_failed_parent_ratio,
+                )
+            candidate_count = sum(value.candidate_triplet_count for value in outcomes)
+            accepted_count = sum(value.accepted_triplet_count for value in outcomes)
+            if candidate_count > 0 and accepted_count == 0:
+                raise GraphExtractionEmptyResultError(candidate_count)
             artifact, entities, facts, evidences = self._persist(
                 run_id=run_id,
                 version_id=version_id,
@@ -192,6 +309,7 @@ class GraphExtractionService:
                     stored_run.finished_at = datetime.now(UTC)
                 if stored_version is not None:
                     stored_version.graph_status = GraphProjectionStatus.SUCCEEDED
+                    stored_version.graph_active = True
                     stored_version.graph_schema_version = self.schema.version
                     stored_version.graph_projected_at = datetime.now(UTC)
             logger.info(
@@ -204,7 +322,7 @@ class GraphExtractionService:
                 evidence_count=len(evidences),
             )
             return "succeeded"
-        except Exception as exc:
+        except BaseException as exc:
             error = _graph_error_snapshot(exc)
             with self.session_factory.begin() as db:
                 stored_run = db.get(GraphExtractionRun, run_id)
@@ -236,7 +354,7 @@ class GraphExtractionService:
                     select(DocumentVersion.id).where(
                         DocumentVersion.document_id == document_id,
                         DocumentVersion.id != version_id,
-                        DocumentVersion.graph_status == GraphProjectionStatus.SUCCEEDED,
+                        DocumentVersion.graph_active.is_(True),
                     )
                 )
             )
@@ -260,6 +378,7 @@ class GraphExtractionService:
                 select(DocumentVersion).where(DocumentVersion.id.in_(old_version_ids))
             ):
                 old_version.graph_status = GraphProjectionStatus.STALE
+                old_version.graph_active = False
             db.flush()
             for fact_id in affected_fact_ids:
                 fact = db.get(GraphFactRecord, fact_id)
@@ -292,6 +411,10 @@ class GraphExtractionService:
         node_map = {str(node.id): node for node in nodes}
         rejected: list[dict[str, object]] = []
         accepted: dict[str, list[ExtractedTriplet]] = {}
+        entity_cache: dict[tuple[str, str], GraphEntityRecord] = {}
+        fact_cache: dict[uuid.UUID, GraphFactRecord] = {}
+        evidence_cache: dict[tuple[uuid.UUID, uuid.UUID, uuid.UUID], GraphFactEvidence] = {}
+        conflict_cache: set[uuid.UUID] = set()
         with self.session_factory.begin() as db:
             for source_id, triplets in extracted.items():
                 source = node_map.get(source_id)
@@ -312,34 +435,45 @@ class GraphExtractionService:
                             }
                         )
                         continue
-                    subject = self._upsert_entity(db, triplet.subject)
-                    object_ = self._upsert_entity(db, triplet.object)
-                    fact = self._upsert_fact(db, run_id, subject, triplet, object_)
-                    evidence = db.scalar(
-                        select(GraphFactEvidence).where(
-                            GraphFactEvidence.fact_id == fact.id,
-                            GraphFactEvidence.document_version_id == version_id,
-                            GraphFactEvidence.source_node_id == source.id,
-                        )
+                    subject = self._upsert_entity(db, triplet.subject, entity_cache)
+                    object_ = self._upsert_entity(db, triplet.object, entity_cache)
+                    fact = self._upsert_fact(
+                        db,
+                        run_id,
+                        subject,
+                        triplet,
+                        object_,
+                        fact_cache,
+                        conflict_cache,
                     )
+                    evidence_key = (fact.id, version_id, source.id)
+                    evidence = evidence_cache.get(evidence_key)
                     if evidence is None:
-                        db.add(
-                            GraphFactEvidence(
-                                fact_id=fact.id,
-                                extraction_run_id=run_id,
-                                document_id=source.document_id,
-                                document_version_id=version_id,
-                                source_node_id=source.id,
-                                source_locators_json=source.source_locators_json,
-                                excerpt=source.content[:2000],
-                                active=True,
+                        evidence = db.scalar(
+                            select(GraphFactEvidence).where(
+                                GraphFactEvidence.fact_id == fact.id,
+                                GraphFactEvidence.document_version_id == version_id,
+                                GraphFactEvidence.source_node_id == source.id,
                             )
                         )
+                    if evidence is None:
+                        evidence = GraphFactEvidence(
+                            fact_id=fact.id,
+                            extraction_run_id=run_id,
+                            document_id=source.document_id,
+                            document_version_id=version_id,
+                            source_node_id=source.id,
+                            source_locators_json=source.source_locators_json,
+                            excerpt=source.content[:2000],
+                            active=True,
+                        )
+                        db.add(evidence)
                     else:
                         evidence.active = True
                         evidence.extraction_run_id = run_id
                         evidence.source_locators_json = source.source_locators_json
                         evidence.excerpt = source.content[:2000]
+                    evidence_cache[evidence_key] = evidence
                     accepted.setdefault(source_id, []).append(triplet)
 
             db.flush()
@@ -356,17 +490,25 @@ class GraphExtractionService:
             evidences,
         )
 
-    def _upsert_entity(self, db: Session, extracted: ExtractedEntity) -> GraphEntityRecord:
+    def _upsert_entity(
+        self,
+        db: Session,
+        extracted: ExtractedEntity,
+        cache: dict[tuple[str, str], GraphEntityRecord],
+    ) -> GraphEntityRecord:
         entity_type = extracted.entity_type
         name = extracted.name
         normalized = self.schema.canonical_name(name)
-        entity = db.scalar(
-            select(GraphEntityRecord).where(
-                GraphEntityRecord.schema_version == self.schema.version,
-                GraphEntityRecord.entity_type == entity_type,
-                GraphEntityRecord.normalized_name == normalized,
+        cache_key = (entity_type, normalized)
+        entity = cache.get(cache_key)
+        if entity is None:
+            entity = db.scalar(
+                select(GraphEntityRecord).where(
+                    GraphEntityRecord.schema_version == self.schema.version,
+                    GraphEntityRecord.entity_type == entity_type,
+                    GraphEntityRecord.normalized_name == normalized,
+                )
             )
-        )
         if entity is None:
             locked = list(
                 db.scalars(
@@ -409,6 +551,7 @@ class GraphExtractionService:
                 dict.fromkeys([*entity.aliases_json, name, *extracted.aliases])
             )
             entity.properties_json = {**entity.properties_json, **properties}
+        cache[cache_key] = entity
         return entity
 
     def _upsert_fact(
@@ -418,9 +561,13 @@ class GraphExtractionService:
         subject: GraphEntityRecord,
         triplet: ExtractedTriplet,
         object_: GraphEntityRecord,
+        cache: dict[uuid.UUID, GraphFactRecord],
+        conflict_cache: set[uuid.UUID],
     ) -> GraphFactRecord:
         fact_id = self.schema.fact_id(subject.id, triplet.predicate, object_.id)
-        fact = db.get(GraphFactRecord, fact_id)
+        fact = cache.get(fact_id)
+        if fact is None:
+            fact = db.get(GraphFactRecord, fact_id)
         properties = {
             key: value
             for key, value in triplet.properties.items()
@@ -443,13 +590,15 @@ class GraphExtractionService:
                 fact.review_status is GraphReviewStatus.REJECTED
                 or fact.properties_json != properties
             ):
-                conflict = db.scalar(
-                    select(GraphConflictRecord).where(
-                        GraphConflictRecord.extraction_run_id == run_id,
-                        GraphConflictRecord.target_type == "fact",
-                        GraphConflictRecord.target_id == fact.id,
+                conflict = None
+                if fact.id not in conflict_cache:
+                    conflict = db.scalar(
+                        select(GraphConflictRecord).where(
+                            GraphConflictRecord.extraction_run_id == run_id,
+                            GraphConflictRecord.target_type == "fact",
+                            GraphConflictRecord.target_id == fact.id,
+                        )
                     )
-                )
                 if conflict is None:
                     db.add(
                         GraphConflictRecord(
@@ -470,6 +619,7 @@ class GraphExtractionService:
                             },
                         )
                     )
+                conflict_cache.add(fact.id)
         else:
             fact.properties_json = {**fact.properties_json, **properties}
             fact.confidence = (
@@ -478,6 +628,7 @@ class GraphExtractionService:
                 else None
             )
             fact.active = fact.review_status is not GraphReviewStatus.REJECTED
+        cache[fact_id] = fact
         return fact
 
     def rebuild(self) -> dict[str, int]:
@@ -487,7 +638,7 @@ class GraphExtractionService:
         return {"entities": len(entities), "facts": len(facts), "evidences": len(evidences)}
 
 
-def _graph_error_snapshot(exc: Exception) -> dict[str, object]:
+def _graph_error_snapshot(exc: BaseException) -> dict[str, object]:
     error: dict[str, object] = {
         "type": type(exc).__name__,
         "message": str(exc)[:1000],
@@ -500,7 +651,68 @@ def _graph_error_snapshot(exc: Exception) -> dict[str, object]:
                 "status_code": exc.status_code,
             }
         )
+    elif isinstance(exc, GraphExtractionQualityError):
+        error.update(
+            {
+                "code": exc.code,
+                "failed_parent_count": exc.failed,
+                "parent_count": exc.total,
+                "max_failed_parent_ratio": exc.maximum_ratio,
+            }
+        )
+    elif isinstance(exc, GraphExtractionEmptyResultError):
+        error.update({"code": exc.code, "candidate_triplet_count": exc.candidate_count})
     return error
+
+
+def is_graph_run_stale(
+    run: GraphExtractionRun, stale_after_seconds: int, *, now: datetime | None = None
+) -> bool:
+    current = now or datetime.now(UTC)
+    started = run.started_at
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=UTC)
+    return started <= current - timedelta(seconds=stale_after_seconds)
+
+
+def _normalize_extraction_result(
+    result: GraphExtractionBatch | dict[str, list[ExtractedTriplet]],
+    nodes: list[RetrievalNode],
+) -> tuple[dict[str, list[ExtractedTriplet]], list[GraphParentOutcome]]:
+    if isinstance(result, GraphExtractionBatch):
+        outcomes = result.parent_outcomes
+        if outcomes:
+            return result.triplets_by_source, outcomes
+        extracted = result.triplets_by_source
+    else:
+        extracted = result
+    return extracted, [
+        GraphParentOutcome(source_node_id=str(node.id), status="succeeded", latency_ms=0)
+        for node in nodes
+    ]
+
+
+def _graph_usage_snapshot(
+    outcomes: list[GraphParentOutcome], parent_count: int
+) -> dict[str, object]:
+    succeeded = sum(value.status == "succeeded" for value in outcomes)
+    failed = sum(value.status == "failed" for value in outcomes)
+    accounted = succeeded + failed
+    if accounted < parent_count:
+        failed += parent_count - accounted
+    return {
+        "parent_count": parent_count,
+        "succeeded_parent_count": succeeded,
+        "failed_parent_count": failed,
+        "failed_parent_ratio": round(failed / parent_count, 6) if parent_count else 0.0,
+        "input_tokens": sum(value.input_tokens or 0 for value in outcomes),
+        "output_tokens": sum(value.output_tokens or 0 for value in outcomes),
+        "total_tokens": sum(value.total_tokens or 0 for value in outcomes),
+        "total_latency_ms": round(sum(value.latency_ms for value in outcomes), 3),
+        "candidate_triplet_count": sum(value.candidate_triplet_count for value in outcomes),
+        "accepted_triplet_count": sum(value.accepted_triplet_count for value in outcomes),
+        "parent_outcomes": [value.snapshot() for value in outcomes],
+    }
 
 
 def _input_hash(nodes: list[RetrievalNode], schema_digest: str) -> str:
@@ -633,13 +845,30 @@ class GraphProjectionLifecycleService:
                     select(DocumentVersion.id).where(DocumentVersion.document_id == document_id)
                 )
             )
-        for version_id in version_ids:
-            self.graph_store.hide_version(str(version_id))
+        evidence_count = sum(
+            self.invalidate_version(version_id, status=GraphProjectionStatus.HIDDEN)
+            for version_id in version_ids
+        )
+        return {"graph_versions": len(version_ids), "graph_evidences": evidence_count}
+
+    def invalidate_version(
+        self,
+        version_id: uuid.UUID,
+        *,
+        status: GraphProjectionStatus = GraphProjectionStatus.STALE,
+    ) -> int:
+        """Hide one projection and cancel queued/running paid work without rebuilding it."""
+
+        self.graph_store.hide_version(str(version_id))
+        now = datetime.now(UTC)
         with self.session_factory.begin() as db:
+            version = db.get(DocumentVersion, version_id)
+            if version is None:
+                return 0
             evidences = list(
                 db.scalars(
                     select(GraphFactEvidence).where(
-                        GraphFactEvidence.document_id == document_id,
+                        GraphFactEvidence.document_version_id == version_id,
                         GraphFactEvidence.active.is_(True),
                     )
                 )
@@ -647,11 +876,27 @@ class GraphProjectionLifecycleService:
             affected = {value.fact_id for value in evidences}
             for evidence in evidences:
                 evidence.active = False
-            for version in db.scalars(
-                select(DocumentVersion).where(DocumentVersion.id.in_(version_ids))
+            for request in db.scalars(
+                select(GraphBuildRequest).where(
+                    GraphBuildRequest.document_version_id == version_id,
+                    GraphBuildRequest.status.in_(
+                        [GraphBuildRequestStatus.PENDING, GraphBuildRequestStatus.RUNNING]
+                    ),
+                )
             ):
-                if version.graph_status is GraphProjectionStatus.SUCCEEDED:
-                    version.graph_status = GraphProjectionStatus.STALE
+                request.status = GraphBuildRequestStatus.CANCELLED
+                request.finished_at = now
+                request.error = {
+                    "code": "GRAPH_BUILD_TARGET_INVALIDATED",
+                    "message": (
+                        "The document version changed visibility while graph generation was pending"
+                    ),
+                }
+            had_projection = bool(
+                version.graph_active or evidences or version.graph_projected_at is not None
+            )
+            version.graph_active = False
+            version.graph_status = status if had_projection else GraphProjectionStatus.NOT_REQUESTED
             db.flush()
             for fact_id in affected:
                 fact = db.get(GraphFactRecord, fact_id)
@@ -666,7 +911,7 @@ class GraphProjectionLifecycleService:
                     .limit(1)
                 )
                 fact.active = other_evidence is not None
-        return {"graph_versions": len(version_ids), "graph_evidences": len(evidences)}
+            return len(evidences)
 
     def restore_version(self, version_id: uuid.UUID) -> dict[str, int]:
         with self.session_factory.begin() as db:
@@ -680,6 +925,8 @@ class GraphProjectionLifecycleService:
                     )
                 )
             )
+            if version.graph_status is not GraphProjectionStatus.HIDDEN or not evidences:
+                return {"graph_entities": 0, "graph_facts": 0, "graph_evidences": 0}
             for evidence in evidences:
                 evidence.active = True
                 fact = db.get(GraphFactRecord, evidence.fact_id)
@@ -695,6 +942,7 @@ class GraphProjectionLifecycleService:
             version = db.get(DocumentVersion, version_id)
             if version is not None:
                 version.graph_status = GraphProjectionStatus.SUCCEEDED
+                version.graph_active = True
                 version.graph_projected_at = datetime.now(UTC)
         return {
             "graph_entities": len(entities),

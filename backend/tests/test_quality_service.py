@@ -201,6 +201,13 @@ def test_quarantine_blocks_pipeline_and_manual_release_is_audited(
     assert response.json()["job"]["current_stage"] == "chunking"
     assert dispatcher.dispatched[-1] == job_id
 
+    duplicate = client.post(
+        f"/api/v1/documents/{document_id}/release",
+        json={"actor": "local-reviewer", "reason": "Submitted twice"},
+    )
+    assert duplicate.status_code == 409
+    assert duplicate.json()["error"]["code"] == "QUALITY_ALREADY_REVIEWED"
+
     with session_factory() as db:
         job = db.get(IngestionJob, job_id)
         assert job is not None

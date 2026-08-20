@@ -7,9 +7,12 @@ import re
 import time
 import uuid
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import lru_cache
-from typing import Protocol
+from typing import Protocol, cast
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
@@ -33,6 +36,12 @@ from robust_rag.indexing.opensearch import (
     OpenSearchAdapter,
     OpenSearchAdapterError,
     SearchHit,
+)
+from robust_rag.indexing.rate_limit import (
+    NoopVoyageRateLimiter,
+    RateLimiterUnavailable,
+    VoyageRateLimiter,
+    build_voyage_rate_limiter,
 )
 from robust_rag.indexing.service import get_opensearch_adapter
 from robust_rag.retrieval.context import assemble_context
@@ -73,6 +82,24 @@ class GraphRetriever(Protocol):
     ) -> GraphQueryResult: ...
 
 
+@dataclass(frozen=True)
+class Bm25StageResult:
+    hits: list[SearchHit]
+    retries: int
+    latency_ms: float
+
+
+@dataclass(frozen=True)
+class DenseStageResult:
+    hits: list[SearchHit]
+    embedding: EmbeddingResponse
+    embedding_retries: int
+    dense_retries: int
+    embedding_latency_ms: float
+    dense_latency_ms: float
+    latency_ms: float
+
+
 class RetrievalService:
     def __init__(
         self,
@@ -84,6 +111,7 @@ class RetrievalService:
         query_rewriter: QueryRewriter,
         settings: Settings,
         graph_retriever: GraphRetriever | None = None,
+        embedding_rate_limiter: VoyageRateLimiter | None = None,
         sleeper: Callable[[float], None] = time.sleep,
         jitter: Callable[[], float] = random.random,
     ) -> None:
@@ -94,6 +122,7 @@ class RetrievalService:
         self.query_rewriter = query_rewriter
         self.settings = settings
         self.graph_retriever = graph_retriever
+        self.embedding_rate_limiter = embedding_rate_limiter or NoopVoyageRateLimiter()
         self.sleeper = sleeper
         self.jitter = jitter
 
@@ -125,6 +154,7 @@ class RetrievalService:
         request: RetrievalSearchRequest,
         *,
         rewrite_override: QueryRewriteResult | None = None,
+        use_graph: bool | None = None,
     ) -> RetrievalSearchResponse:
         total_started = time.perf_counter()
         normalized = normalize_query(
@@ -135,8 +165,16 @@ class RetrievalService:
             request.context_budget_tokens or self.settings.retrieval_context_max_tokens,
             self.settings.retrieval_context_max_tokens,
         )
+        graph_requested = self.settings.graph_query_enabled if use_graph is None else use_graph
+        graph_enabled = graph_requested and self.graph_retriever is not None
         trace_id = self._create_trace(
-            request, normalized, rewrite.query, rewrite.snapshot(), budget
+            request,
+            normalized,
+            rewrite.query,
+            rewrite.snapshot(),
+            budget,
+            graph_requested=graph_requested,
+            graph_enabled=graph_enabled,
         )
         latency: dict[str, object] = {}
         usage: dict[str, object] = {}
@@ -149,58 +187,82 @@ class RetrievalService:
         trace_status = RetrievalTraceStatus.SUCCEEDED
 
         try:
-            if request.mode in {
+            needs_bm25 = request.mode in {
                 RetrievalMode.BM25,
                 RetrievalMode.HYBRID,
                 RetrievalMode.HYBRID_RERANK,
-            }:
-                started = time.perf_counter()
-                with observe(
-                    "retrieval.bm25",
-                    as_type="retriever",
-                    input={"query": rewrite.query},
-                    metadata={"retrieval_trace_id": str(trace_id)},
-                ) as span:
-                    bm25_hits, bm25_retries = self._search_with_retry(
-                        lambda: self.search_adapter.search_bm25_hits(
-                            self.settings.opensearch_chunks_read_alias,
-                            rewrite.query,
-                            self.settings.retrieval_bm25_top_k,
-                        )
-                    )
-                    span.update(
-                        output={"hit_count": len(bm25_hits)},
-                        metadata={"retry_count": bm25_retries},
-                    )
-                usage["bm25_retries"] = bm25_retries
-                latency["bm25"] = _elapsed_ms(started)
-
-            if request.mode in {
+            }
+            needs_dense = request.mode in {
                 RetrievalMode.DENSE,
                 RetrievalMode.HYBRID,
                 RetrievalMode.HYBRID_RERANK,
-            }:
-                started = time.perf_counter()
+            }
+            bm25_result: Bm25StageResult | None = None
+            dense_result: DenseStageResult | None = None
+
+            if needs_bm25 and needs_dense:
+                fanout_started = time.perf_counter()
                 with observe(
-                    "retrieval.query_embedding",
-                    as_type="embedding",
-                    input={"query": rewrite.query},
-                    metadata={"retrieval_trace_id": str(trace_id)},
-                    model=self.embedding_adapter.model,
-                ) as span:
-                    embedding, embedding_retries = self._embed_query_with_retry(rewrite.query)
-                    span.update(
-                        output={"vector_count": len(embedding.vectors)},
-                        metadata={"retry_count": embedding_retries},
-                        usage_details=(
-                            {"total": embedding.total_tokens}
-                            if embedding.total_tokens is not None
-                            else None
+                    "retrieval.lexical_dense_fanout",
+                    input={
+                        "query": rewrite.query,
+                        "bm25_top_k": self.settings.retrieval_bm25_top_k,
+                        "dense_top_k": self.settings.retrieval_dense_top_k,
+                    },
+                    metadata={"retrieval_trace_id": str(trace_id), "parallel": True},
+                ) as fanout_span:
+                    dense_context = copy_context()
+                    with ThreadPoolExecutor(
+                        max_workers=1,
+                        thread_name_prefix="retrieval-dense",
+                    ) as executor:
+                        dense_future = executor.submit(
+                            dense_context.run,
+                            self._run_dense_stage,
+                            rewrite.query,
+                            trace_id,
+                        )
+                        bm25_result = self._run_bm25_stage(rewrite.query, trace_id)
+                        dense_result = dense_future.result()
+                    fanout_latency_ms = _elapsed_ms(fanout_started)
+                    estimated_savings_ms = round(
+                        max(
+                            bm25_result.latency_ms + dense_result.latency_ms - fanout_latency_ms,
+                            0,
                         ),
+                        3,
                     )
-                latency["query_embedding"] = _elapsed_ms(started)
+                    fanout_span.update(
+                        output={
+                            "bm25_hit_count": len(bm25_result.hits),
+                            "dense_hit_count": len(dense_result.hits),
+                        },
+                        metadata={
+                            "latency_ms": fanout_latency_ms,
+                            "estimated_savings_ms": estimated_savings_ms,
+                        },
+                    )
+                latency["lexical_dense_fanout"] = fanout_latency_ms
+                latency["parallel_savings_estimate"] = estimated_savings_ms
+            elif needs_bm25:
+                bm25_result = self._run_bm25_stage(rewrite.query, trace_id)
+            elif needs_dense:
+                dense_result = self._run_dense_stage(rewrite.query, trace_id)
+
+            if bm25_result is not None:
+                bm25_hits = bm25_result.hits
+                usage["bm25_retries"] = bm25_result.retries
+                latency["bm25"] = bm25_result.latency_ms
+
+            if dense_result is not None:
+                dense_hits = dense_result.hits
+                embedding = dense_result.embedding
                 usage["query_embedding_tokens"] = embedding.total_tokens
-                usage["query_embedding_retries"] = embedding_retries
+                usage["query_embedding_retries"] = dense_result.embedding_retries
+                usage["dense_retries"] = dense_result.dense_retries
+                latency["query_embedding"] = dense_result.embedding_latency_ms
+                latency["dense"] = dense_result.dense_latency_ms
+                latency["dense_pipeline"] = dense_result.latency_ms
                 if (
                     embedding.total_tokens is not None
                     and self.settings.voyage_embedding_price_per_million_tokens is not None
@@ -210,31 +272,11 @@ class RetrievalService:
                         * self.settings.voyage_embedding_price_per_million_tokens
                         / 1_000_000
                     )
-                started = time.perf_counter()
-                with observe(
-                    "retrieval.dense",
-                    as_type="retriever",
-                    metadata={"retrieval_trace_id": str(trace_id)},
-                ) as span:
-                    dense_hits, dense_retries = self._search_with_retry(
-                        lambda: self.search_adapter.search_dense_hits(
-                            self.settings.opensearch_chunks_read_alias,
-                            embedding.vectors[0],
-                            self.settings.retrieval_dense_top_k,
-                        )
-                    )
-                    span.update(
-                        output={"hit_count": len(dense_hits)},
-                        metadata={"retry_count": dense_retries},
-                    )
-                usage["dense_retries"] = dense_retries
-                latency["dense"] = _elapsed_ms(started)
 
-            if (
-                self.graph_retriever is not None
-                and self.settings.graph_query_enabled
-                and request.mode in {RetrievalMode.HYBRID, RetrievalMode.HYBRID_RERANK}
-            ):
+            if graph_enabled and request.mode in {
+                RetrievalMode.HYBRID,
+                RetrievalMode.HYBRID_RERANK,
+            }:
                 started = time.perf_counter()
                 with observe(
                     "retrieval.graph",
@@ -242,13 +284,19 @@ class RetrievalService:
                     input={"query": rewrite.query},
                     metadata={"retrieval_trace_id": str(trace_id)},
                 ) as span:
+                    assert self.graph_retriever is not None
                     graph_result = self.graph_retriever.search(
                         request.query, rewritten_question=rewrite.query
                     )
                     span.update(
                         output={"hit_count": len(graph_result.hits)},
-                        metadata={"fallback_reason": graph_result.fallback_reason},
+                        metadata={
+                            "fallback_reason": graph_result.fallback_reason,
+                            "graph_query_trace_id": str(graph_result.trace_id),
+                            "hit_count": len(graph_result.hits),
+                        },
                         level="WARNING" if graph_result.fallback_reason else "DEFAULT",
+                        status_message=graph_result.fallback_reason,
                     )
                 graph_hits = graph_result.hits
                 graph_query_trace_id = graph_result.trace_id
@@ -285,7 +333,10 @@ class RetrievalService:
                         "retrieval.rerank",
                         as_type="retriever",
                         input={"query": rewrite.query, "candidate_count": len(diversified)},
-                        metadata={"retrieval_trace_id": str(trace_id)},
+                        metadata={
+                            "retrieval_trace_id": str(trace_id),
+                            "model": self.rerank_adapter.model,
+                        },
                         model=self.rerank_adapter.model,
                     ) as span:
                         response, rerank_retries = self._rerank_with_retry(
@@ -294,8 +345,16 @@ class RetrievalService:
                         )
                         reranked = self._apply_rerank(diversified, response)
                         span.update(
-                            output={"result_count": len(reranked)},
-                            metadata={"retry_count": rerank_retries},
+                            output={
+                                "result_count": len(reranked),
+                                "top_results": [
+                                    candidate.snapshot() for candidate in reranked[:10]
+                                ],
+                            },
+                            metadata={
+                                "retry_count": rerank_retries,
+                                "total_tokens": response.total_tokens,
+                            },
                             usage_details=(
                                 {"total": response.total_tokens}
                                 if response.total_tokens is not None
@@ -404,7 +463,107 @@ class RetrievalService:
             graph_fallback_reason=graph_fallback_reason,
             usage=usage,
             latency_ms=latency,
-            debug=stage_values if request.debug else None,
+            debug=cast(dict[str, object], stage_values) if request.debug else None,
+        )
+
+    def _run_bm25_stage(self, query: str, trace_id: uuid.UUID) -> Bm25StageResult:
+        started = time.perf_counter()
+        with observe(
+            "retrieval.bm25",
+            as_type="retriever",
+            input={"query": query, "top_k": self.settings.retrieval_bm25_top_k},
+            metadata={"retrieval_trace_id": str(trace_id)},
+        ) as span:
+            hits, retries = self._search_with_retry(
+                lambda: self.search_adapter.search_bm25_hits(
+                    self.settings.opensearch_chunks_read_alias,
+                    query,
+                    self.settings.retrieval_bm25_top_k,
+                )
+            )
+            latency_ms = _elapsed_ms(started)
+            span.update(
+                output={
+                    "hit_count": len(hits),
+                    "top_hits": [_hit_snapshot(hit) for hit in hits[:10]],
+                },
+                metadata={"retry_count": retries, "latency_ms": latency_ms},
+            )
+        return Bm25StageResult(hits=hits, retries=retries, latency_ms=latency_ms)
+
+    def _run_dense_stage(self, query: str, trace_id: uuid.UUID) -> DenseStageResult:
+        pipeline_started = time.perf_counter()
+        with observe(
+            "retrieval.dense_pipeline",
+            input={"query": query, "top_k": self.settings.retrieval_dense_top_k},
+            metadata={"retrieval_trace_id": str(trace_id)},
+        ) as pipeline_span:
+            embedding_started = time.perf_counter()
+            with observe(
+                "retrieval.query_embedding",
+                as_type="embedding",
+                input={"query": query},
+                metadata={"retrieval_trace_id": str(trace_id)},
+                model=self.embedding_adapter.model,
+            ) as embedding_span:
+                embedding, embedding_retries = self._embed_query_with_retry(query)
+                embedding_latency_ms = _elapsed_ms(embedding_started)
+                embedding_span.update(
+                    output={
+                        "vector_count": len(embedding.vectors),
+                        "dimension": len(embedding.vectors[0]) if embedding.vectors else 0,
+                    },
+                    metadata={
+                        "retry_count": embedding_retries,
+                        "latency_ms": embedding_latency_ms,
+                    },
+                    usage_details=(
+                        {"total": embedding.total_tokens}
+                        if embedding.total_tokens is not None
+                        else None
+                    ),
+                )
+
+            dense_started = time.perf_counter()
+            with observe(
+                "retrieval.dense",
+                as_type="retriever",
+                input={"query": query, "top_k": self.settings.retrieval_dense_top_k},
+                metadata={"retrieval_trace_id": str(trace_id)},
+            ) as dense_span:
+                hits, dense_retries = self._search_with_retry(
+                    lambda: self.search_adapter.search_dense_hits(
+                        self.settings.opensearch_chunks_read_alias,
+                        embedding.vectors[0],
+                        self.settings.retrieval_dense_top_k,
+                    )
+                )
+                dense_latency_ms = _elapsed_ms(dense_started)
+                dense_span.update(
+                    output={
+                        "hit_count": len(hits),
+                        "top_hits": [_hit_snapshot(hit) for hit in hits[:10]],
+                    },
+                    metadata={"retry_count": dense_retries, "latency_ms": dense_latency_ms},
+                )
+
+            pipeline_latency_ms = _elapsed_ms(pipeline_started)
+            pipeline_span.update(
+                output={"hit_count": len(hits)},
+                metadata={
+                    "latency_ms": pipeline_latency_ms,
+                    "embedding_latency_ms": embedding_latency_ms,
+                    "dense_latency_ms": dense_latency_ms,
+                },
+            )
+        return DenseStageResult(
+            hits=hits,
+            embedding=embedding,
+            embedding_retries=embedding_retries,
+            dense_retries=dense_retries,
+            embedding_latency_ms=embedding_latency_ms,
+            dense_latency_ms=dense_latency_ms,
+            latency_ms=pipeline_latency_ms,
         )
 
     def _create_trace(
@@ -414,6 +573,9 @@ class RetrievalService:
         rewritten: str,
         rewrite_snapshot: dict[str, object],
         budget: int,
+        *,
+        graph_requested: bool,
+        graph_enabled: bool,
     ) -> uuid.UUID:
         with self.session_factory.begin() as db:
             trace = RetrievalTrace(
@@ -432,6 +594,8 @@ class RetrievalService:
                     ),
                     "request_context_budget_tokens": request.context_budget_tokens,
                     "effective_context_budget_tokens": budget,
+                    "graph_requested": graph_requested,
+                    "graph_enabled_for_request": graph_enabled,
                 },
                 rewrite_snapshot=rewrite_snapshot,
                 embedding_provider=(
@@ -557,17 +721,34 @@ class RetrievalService:
         }
 
     def _embed_query_with_retry(self, query: str) -> tuple[EmbeddingResponse, int]:
+        estimated_tokens = max((len(query) + 3) // 4, 1)
         for retry_count in range(self.settings.voyage_embedding_max_retries + 1):
+            try:
+                wait_seconds = self.embedding_rate_limiter.reserve(estimated_tokens)
+            except (RateLimiterUnavailable, ValueError) as exc:
+                raise EmbeddingAdapterError(
+                    "VOYAGE_RATE_LIMITER_ERROR",
+                    str(exc),
+                    retryable=True,
+                ) from exc
+            if wait_seconds > 0:
+                self.sleeper(wait_seconds)
             try:
                 return self.embedding_adapter.embed([query], input_type="query"), retry_count
             except EmbeddingAdapterError as exc:
                 if not exc.retryable or retry_count >= self.settings.voyage_embedding_max_retries:
                     raise
-                self._sleep_backoff(
-                    retry_count,
-                    self.settings.voyage_embedding_retry_base_seconds,
-                    self.settings.voyage_embedding_retry_max_seconds,
-                )
+                if exc.status_code == 429:
+                    self.sleeper(
+                        exc.retry_after_seconds
+                        or self.settings.voyage_embedding_rate_limit_fallback_seconds
+                    )
+                else:
+                    self._sleep_backoff(
+                        retry_count,
+                        self.settings.voyage_embedding_retry_base_seconds,
+                        self.settings.voyage_embedding_retry_max_seconds,
+                    )
         raise AssertionError("retry loop must return or raise")
 
     def _rerank_with_retry(self, query: str, documents: list[str]) -> tuple[RerankResponse, int]:
@@ -711,6 +892,7 @@ def get_retrieval_service() -> RetrievalService:
         query_rewriter=IdentityQueryRewriter(),
         settings=settings,
         graph_retriever=get_graph_query_gateway(),
+        embedding_rate_limiter=build_voyage_rate_limiter(settings),
     )
 
 

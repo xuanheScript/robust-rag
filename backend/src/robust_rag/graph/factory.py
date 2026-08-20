@@ -25,15 +25,20 @@ def graph_is_configured(settings: Settings) -> bool:
     )
 
 
-def _provider(settings: Settings) -> ResponsesAPIProvider:
+def _provider(
+    settings: Settings,
+    *,
+    timeout_seconds: float | None = None,
+    reasoning_effort: str | None = None,
+) -> ResponsesAPIProvider:
     if settings.llm_api_key is None:
         raise RuntimeError("LLM_API_KEY is required for graph extraction and graph queries")
     return ResponsesAPIProvider(
         base_url=settings.llm_base_url,
         api_key=settings.llm_api_key.get_secret_value(),
         model=settings.llm_model,
-        reasoning_effort=settings.llm_reasoning_effort,
-        timeout_seconds=settings.llm_timeout_seconds,
+        reasoning_effort=reasoning_effort or settings.llm_reasoning_effort,
+        timeout_seconds=timeout_seconds or settings.llm_timeout_seconds,
     )
 
 
@@ -59,7 +64,13 @@ def get_graph_query_gateway() -> GraphQueryGateway | None:
     settings = get_settings()
     if not graph_is_configured(settings) or not settings.graph_query_enabled:
         return None
-    llm = ResponsesLlamaLLM(_provider(settings), max_output_tokens=1000)
+    llm = ResponsesLlamaLLM(
+        _provider(
+            settings,
+            timeout_seconds=settings.graph_text_to_cypher_timeout_seconds,
+        ),
+        max_output_tokens=1000,
+    )
     return GraphQueryGateway(
         session_factory=SessionLocal,
         store=get_graph_store(),
@@ -81,7 +92,11 @@ def get_graph_extraction_service() -> GraphExtractionService:
         raise RuntimeError("Knowledge graph extraction is not configured")
     schema = get_graph_schema(settings.graph_schema_version)
     llm = ResponsesLlamaLLM(
-        _provider(settings), max_output_tokens=max(settings.llm_max_output_tokens, 4000)
+        _provider(settings, reasoning_effort=settings.graph_llm_reasoning_effort),
+        max_output_tokens=settings.graph_llm_max_output_tokens,
+        max_retries=settings.graph_llm_max_retries,
+        retry_base_seconds=settings.graph_llm_retry_base_seconds,
+        retry_max_seconds=settings.graph_llm_retry_max_seconds,
     )
     extractor = LlamaIndexGraphExtractor(
         llm=llm,
@@ -98,6 +113,18 @@ def get_graph_extraction_service() -> GraphExtractionService:
         schema=schema,
         model=settings.llm_model,
         prompt_version=settings.graph_prompt_version,
+        max_failed_parent_ratio=settings.graph_max_failed_parent_ratio,
+        stale_after_seconds=settings.graph_run_stale_seconds,
+        config_snapshot={
+            "reasoning_effort": settings.graph_llm_reasoning_effort,
+            "max_output_tokens": settings.graph_llm_max_output_tokens,
+            "max_triplets_per_parent": settings.graph_max_triplets_per_parent,
+            "extraction_workers": settings.graph_extraction_workers,
+            "max_failed_parent_ratio": settings.graph_max_failed_parent_ratio,
+            "max_retries": settings.graph_llm_max_retries,
+            "retry_base_seconds": settings.graph_llm_retry_base_seconds,
+            "retry_max_seconds": settings.graph_llm_retry_max_seconds,
+        },
     )
 
 

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from typing import Protocol
 
 import httpx
@@ -22,12 +24,14 @@ class EmbeddingAdapterError(Exception):
         *,
         retryable: bool,
         status_code: int | None = None,
+        retry_after_seconds: float | None = None,
     ) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
         self.retryable = retryable
         self.status_code = status_code
+        self.retry_after_seconds = retry_after_seconds
 
 
 class EmbeddingAdapter(Protocol):
@@ -82,6 +86,7 @@ class VoyageEmbeddingAdapter:
                 _safe_error_message(response),
                 retryable=retryable,
                 status_code=response.status_code,
+                retry_after_seconds=_retry_after_seconds(response),
             )
         try:
             payload = response.json()
@@ -119,3 +124,19 @@ def _safe_error_message(response: httpx.Response) -> str:
     return (
         str(detail)[:1000] if detail else f"Voyage request failed with HTTP {response.status_code}"
     )
+
+
+def _retry_after_seconds(response: httpx.Response) -> float | None:
+    value = response.headers.get("Retry-After")
+    if not value:
+        return None
+    try:
+        return max(float(value), 0)
+    except ValueError:
+        try:
+            retry_at = parsedate_to_datetime(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=UTC)
+        return max((retry_at - datetime.now(UTC)).total_seconds(), 0)

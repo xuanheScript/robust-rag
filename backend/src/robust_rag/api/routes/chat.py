@@ -129,6 +129,7 @@ def get_message_trace(message_id: uuid.UUID, db: DatabaseSession) -> dict[str, o
         "status": message.status.value,
         "query_original": message.query_original,
         "query_rewritten": message.query_rewritten,
+        "agent": _agent_debug(message.metadata_json),
         "retrieval": _retrieval_debug(retrieval),
         "generation": _invocation_debug(invocation),
         "citations": [
@@ -162,6 +163,20 @@ def _retrieval_debug(trace: RetrievalTrace | None) -> dict[str, object] | None:
         "rerank_fallback_reason": trace.rerank_fallback_reason,
         "error": trace.error,
     }
+
+
+def _agent_debug(metadata: dict[str, object]) -> dict[str, object] | None:
+    if metadata.get("agentic") is not True:
+        return None
+    keys = {
+        "graph_version",
+        "action",
+        "selected_tool",
+        "tool_call_count",
+        "agent_invocation_ids",
+        "warnings",
+    }
+    return {key: value for key, value in metadata.items() if key in keys}
 
 
 def _invocation_debug(invocation: ModelInvocation | None) -> dict[str, object] | None:

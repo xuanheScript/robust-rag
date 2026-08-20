@@ -7,8 +7,10 @@ const statusLabels: Record<string, string> = {
   succeeded: "成功",
   failed: "失败",
   pending: "等待中",
+  not_requested: "未生成",
   running: "处理中",
   quarantined: "已隔离",
+  released: "已放行",
   warning: "有警告",
   passed: "通过",
   rejected: "已驳回",
@@ -18,6 +20,8 @@ const statusLabels: Record<string, string> = {
   unavailable: "不可用",
   ok: "正常",
   stale: "待同步",
+  hidden: "已隐藏",
+  cancelled: "已取消",
   uploaded: "已上传",
   parsing: "解析中",
   cleaning: "清洗中",
@@ -32,9 +36,9 @@ export function StatusBadge({ value }: { value: string | null | undefined }) {
   const status = value ?? "unknown";
   const tone = ["failed", "rejected", "unavailable"].includes(status)
     ? "danger"
-    : ["warning", "quarantined", "stale", "pending", "unreviewed", "disabled"].includes(status)
+    : ["warning", "quarantined", "stale", "pending", "unreviewed", "disabled", "hidden", "cancelled", "not_requested"].includes(status)
       ? "warning"
-      : ["ready", "succeeded", "active", "passed", "approved", "ok"].includes(status)
+      : ["ready", "succeeded", "active", "passed", "approved", "released", "ok"].includes(status)
         ? "success"
         : "info";
   return <span className={`badge badge-${tone}`}>{statusLabels[status] ?? status}</span>;

@@ -34,6 +34,9 @@ class DocumentRead(BaseModel):
     created_at: datetime
     updated_at: datetime
     deleted_at: datetime | None
+    current_version_status: VersionStatus | None = None
+    graph_status: GraphProjectionStatus | None = None
+    graph_active: bool = False
 
 
 class DocumentVersionRead(BaseModel):
@@ -52,6 +55,7 @@ class DocumentVersionRead(BaseModel):
     ready_at: datetime | None
     superseded_at: datetime | None
     graph_status: GraphProjectionStatus
+    graph_active: bool
     graph_schema_version: str | None
     graph_projected_at: datetime | None
 

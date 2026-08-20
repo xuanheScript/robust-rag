@@ -1,5 +1,8 @@
+import json
+
 from fastapi.testclient import TestClient
 
+from robust_rag.api.routes.health import _worker_observability_health
 from robust_rag.main import create_app
 
 
@@ -45,3 +48,20 @@ def test_dependency_health_includes_runtime_and_langfuse_status(client: TestClie
     assert "configured" in payload["langfuse"]
     assert "secret_key" not in str(payload).lower()
     assert payload["queue"]["status"] == "unknown"
+
+
+def test_worker_observability_health_reads_safe_flush_snapshot() -> None:
+    snapshot = {
+        "status": "ok",
+        "configured": True,
+        "flush_ok": True,
+        "last_flush_at": "2026-08-20T01:00:00+00:00",
+        "task_name": "graph.extract",
+    }
+
+    class RedisClient:
+        def get(self, key: str) -> bytes:
+            assert key == "robust-rag:worker:observability"
+            return json.dumps(snapshot).encode()
+
+    assert _worker_observability_health(RedisClient()) == snapshot  # type: ignore[arg-type]

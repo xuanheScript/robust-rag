@@ -4,6 +4,7 @@ import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
+from math import ceil
 from typing import TypedDict
 
 import structlog
@@ -20,10 +21,30 @@ from robust_rag.core.observability import (
     trace_id_from_seed,
 )
 from robust_rag.core.settings import get_settings
-from robust_rag.db.enums import JobStatus, StageName, StageRunStatus
-from robust_rag.db.models import IngestionJob, StageRun
+from robust_rag.db.enums import (
+    DocumentStatus,
+    GraphBuildRequestStatus,
+    GraphProjectionStatus,
+    GraphRunStatus,
+    JobStatus,
+    StageName,
+    StageRunStatus,
+    VersionStatus,
+)
+from robust_rag.db.models import (
+    Document,
+    DocumentVersion,
+    GraphBuildRequest,
+    GraphExtractionRun,
+    IngestionJob,
+    StageRun,
+)
 from robust_rag.db.session import SessionLocal
-from robust_rag.graph.factory import get_graph_extraction_service, graph_is_configured
+from robust_rag.graph.factory import (
+    get_graph_extraction_service,
+    get_graph_lifecycle_service,
+    graph_is_configured,
+)
 from robust_rag.indexing.embedding_service import get_embedding_service
 from robust_rag.indexing.gate import RetrievalNodeGateService
 from robust_rag.indexing.service import get_indexing_service
@@ -41,16 +62,41 @@ class AdvanceResult(TypedDict):
 
 
 @celery_app.task(name="graph.extract")  # type: ignore[untyped-decorator]
-def extract_graph(document_version_id: str, *, force: bool = False) -> dict[str, str]:
-    """Build the optional graph projection without changing ingestion readiness."""
+def extract_graph(graph_build_request_id: str) -> dict[str, str]:
+    """Execute one explicitly authorized graph build request."""
 
     with _task_context(
         "graph.extract",
-        trace_seed=f"graph:{document_version_id}",
-        metadata={"document_version_id": document_version_id, "force": force},
+        trace_seed=f"graph-build:{graph_build_request_id}",
+        metadata={"graph_build_request_id": graph_build_request_id},
     ) as observation:
-        status = get_graph_extraction_service().execute(uuid.UUID(document_version_id), force=force)
-        result = {"document_version_id": document_version_id, "status": status}
+        request_id = uuid.UUID(graph_build_request_id)
+        prepared = _start_graph_build_request(request_id)
+        if prepared is None:
+            result = {"graph_build_request_id": graph_build_request_id, "status": "cancelled"}
+            observation.update(output=result)
+            return result
+        version_id, force = prepared
+        try:
+            status = get_graph_extraction_service().execute(
+                version_id,
+                force=force,
+                build_request_id=request_id,
+            )
+        except BaseException as exc:
+            cleanup_status = _finish_graph_build_request(
+                request_id, succeeded=False, error=exc
+            )
+            _cleanup_cancelled_graph_projection(version_id, cleanup_status)
+            raise
+        succeeded = status == "succeeded"
+        cleanup_status = _finish_graph_build_request(request_id, succeeded=succeeded)
+        _cleanup_cancelled_graph_projection(version_id, cleanup_status)
+        result = {
+            "graph_build_request_id": graph_build_request_id,
+            "document_version_id": str(version_id),
+            "status": "cancelled" if cleanup_status is not None else status,
+        }
         observation.update(output=result)
         return result
 
@@ -141,6 +187,69 @@ def recover_pending_jobs() -> dict[str, int]:
                 job.status = JobStatus.PENDING
                 job.updated_at = datetime.now(UTC)
         result_payload = {"requeued": len(jobs)}
+        observation.update(output=result_payload, metadata={"cutoff": cutoff.isoformat()})
+        return result_payload
+
+
+@celery_app.task(name="graph.recover_stale")  # type: ignore[untyped-decorator]
+def recover_stale_graph_runs() -> dict[str, int]:
+    """Retry interrupted authorized builds within their persisted attempt budget."""
+
+    with _task_context("graph.recover_stale", trace_seed="graph:recovery") as observation:
+        settings = get_settings()
+        if not graph_is_configured(settings):
+            result_payload = {"requeued": 0}
+            observation.update(output=result_payload, metadata={"configured": False})
+            return result_payload
+        now = datetime.now(UTC)
+        cutoff = now - timedelta(seconds=settings.graph_run_stale_seconds)
+        request_ids: set[uuid.UUID] = set()
+        with SessionLocal.begin() as db:
+            runs = list(
+                db.scalars(
+                    select(GraphExtractionRun)
+                    .where(
+                        GraphExtractionRun.status == GraphRunStatus.RUNNING,
+                        GraphExtractionRun.started_at <= cutoff,
+                    )
+                    .with_for_update(skip_locked=True)
+                )
+            )
+            for run in runs:
+                run.status = GraphRunStatus.FAILED
+                run.finished_at = now
+                run.error = {
+                    "type": "GraphRunStaleError",
+                    "code": "GRAPH_RUN_STALE",
+                    "message": "Graph extraction was interrupted and automatically requeued",
+                }
+                version = db.get(DocumentVersion, run.document_version_id)
+                request = (
+                    db.get(GraphBuildRequest, run.build_request_id)
+                    if run.build_request_id is not None
+                    else None
+                )
+                if request is None:
+                    if version is not None:
+                        version.graph_status = GraphProjectionStatus.FAILED
+                    continue
+                if request.attempt >= request.max_attempts:
+                    request.status = GraphBuildRequestStatus.FAILED
+                    request.finished_at = now
+                    request.error = run.error
+                    if version is not None:
+                        version.graph_status = GraphProjectionStatus.FAILED
+                    continue
+                request.attempt += 1
+                request.status = GraphBuildRequestStatus.PENDING
+                request.started_at = None
+                request.error = None
+                if version is not None:
+                    version.graph_status = GraphProjectionStatus.PENDING
+                request_ids.add(request.id)
+        for request_id in request_ids:
+            extract_graph.delay(str(request_id))
+        result_payload = {"requeued": len(request_ids)}
         observation.update(output=result_payload, metadata={"cutoff": cutoff.isoformat()})
         return result_payload
 
@@ -248,7 +357,20 @@ def _execute_node_gate_then_embedding(job_id: str, parsed_job_id: uuid.UUID) -> 
 
 
 def _execute_embedding_then_indexing(job_id: str, parsed_job_id: uuid.UUID) -> AdvanceResult:
-    embedding_status = get_embedding_service(SessionLocal).execute(parsed_job_id)
+    embedding_service = get_embedding_service(SessionLocal)
+    embedding_status = embedding_service.execute(parsed_job_id)
+    if embedding_status == "rate_limited":
+        retry_after = ceil(
+            embedding_service.retry_after_seconds
+            or get_settings().voyage_embedding_rate_limit_fallback_seconds
+        )
+        scheduled = advance_ingestion.apply_async(args=[job_id], countdown=retry_after)
+        with SessionLocal.begin() as db:
+            waiting_job = db.get(IngestionJob, parsed_job_id)
+            if waiting_job is not None:
+                waiting_job.celery_task_id = str(scheduled.id)
+                waiting_job.status = JobStatus.PENDING
+                waiting_job.updated_at = datetime.now(UTC)
     with SessionLocal() as db:
         updated_job = db.get(IngestionJob, parsed_job_id)
         updated_stage = updated_job.current_stage.value if updated_job else "unknown"
@@ -262,11 +384,168 @@ def _execute_indexing(job_id: str, parsed_job_id: uuid.UUID) -> AdvanceResult:
     with SessionLocal() as db:
         updated_job = db.get(IngestionJob, parsed_job_id)
         updated_stage = updated_job.current_stage.value if updated_job else "unknown"
-        version_id = updated_job.document_version_id if updated_job else None
-    if (
-        indexing_status == "succeeded"
-        and version_id is not None
-        and graph_is_configured(get_settings())
-    ):
-        extract_graph.delay(str(version_id))
     return {"job_id": job_id, "status": indexing_status, "current_stage": updated_stage}
+
+
+def _start_graph_build_request(
+    request_id: uuid.UUID,
+) -> tuple[uuid.UUID, bool] | None:
+    now = datetime.now(UTC)
+    with SessionLocal.begin() as db:
+        request = db.scalar(
+            select(GraphBuildRequest)
+            .where(GraphBuildRequest.id == request_id)
+            .with_for_update()
+        )
+        if request is None or request.status is not GraphBuildRequestStatus.PENDING:
+            return None
+        version = db.get(DocumentVersion, request.document_version_id)
+        document = db.get(Document, request.document_id)
+        valid = (
+            version is not None
+            and document is not None
+            and document.status is DocumentStatus.ACTIVE
+            and document.current_version_id == request.document_version_id
+            and version.status is VersionStatus.READY
+        )
+        if not valid:
+            request.status = GraphBuildRequestStatus.CANCELLED
+            request.finished_at = now
+            request.error = {
+                "code": "GRAPH_BUILD_TARGET_CHANGED",
+                "message": "The selected document version is no longer the active ready version",
+            }
+            if version is not None and version.graph_status in {
+                GraphProjectionStatus.PENDING,
+                GraphProjectionStatus.RUNNING,
+            }:
+                if document is not None and document.status is DocumentStatus.DELETED:
+                    version.graph_status = GraphProjectionStatus.HIDDEN
+                    version.graph_active = False
+                elif version.graph_active:
+                    version.graph_status = GraphProjectionStatus.STALE
+                else:
+                    version.graph_status = GraphProjectionStatus.NOT_REQUESTED
+            return None
+        assert version is not None
+        request.status = GraphBuildRequestStatus.RUNNING
+        request.started_at = now
+        request.error = None
+        version.graph_status = GraphProjectionStatus.RUNNING
+        return version.id, request.force
+
+
+def _finish_graph_build_request(
+    request_id: uuid.UUID,
+    *,
+    succeeded: bool,
+    error: BaseException | None = None,
+) -> GraphProjectionStatus | None:
+    settings = get_settings()
+    now = datetime.now(UTC)
+    with SessionLocal.begin() as db:
+        request = db.get(GraphBuildRequest, request_id)
+        if request is None:
+            return None
+        run = db.scalar(
+            select(GraphExtractionRun)
+            .where(GraphExtractionRun.build_request_id == request_id)
+            .order_by(GraphExtractionRun.started_at.desc())
+            .limit(1)
+        )
+        usage = run.usage_json if run is not None else {}
+        request.actual_input_tokens = _optional_int(usage.get("input_tokens"))
+        request.actual_output_tokens = _optional_int(usage.get("output_tokens"))
+        request.actual_total_tokens = _optional_int(usage.get("total_tokens"))
+        request.actual_cost_usd = _llm_cost(
+            request.actual_input_tokens,
+            request.actual_output_tokens,
+            input_price=settings.llm_price_per_million_input_tokens,
+            output_price=settings.llm_price_per_million_output_tokens,
+        )
+        request.finished_at = now
+        version = db.get(DocumentVersion, request.document_version_id)
+        document = db.get(Document, request.document_id)
+        target_is_valid = (
+            request.status is GraphBuildRequestStatus.RUNNING
+            and version is not None
+            and document is not None
+            and document.status is DocumentStatus.ACTIVE
+            and document.current_version_id == request.document_version_id
+            and version.status is VersionStatus.READY
+        )
+        if not target_is_valid:
+            if request.status is not GraphBuildRequestStatus.CANCELLED:
+                request.status = GraphBuildRequestStatus.CANCELLED
+                request.error = {
+                    "code": "GRAPH_BUILD_TARGET_CHANGED",
+                    "message": (
+                        "The selected document version changed while graph generation was running"
+                    ),
+                }
+            if version is None:
+                return None
+            cleanup_status = (
+                GraphProjectionStatus.HIDDEN
+                if document is not None and document.status is DocumentStatus.DELETED
+                else (
+                    GraphProjectionStatus.STALE
+                    if request.projection_was_active
+                    or version.graph_active
+                    or version.graph_projected_at is not None
+                    else GraphProjectionStatus.NOT_REQUESTED
+                )
+            )
+            version.graph_active = False
+            version.graph_status = cleanup_status
+            return cleanup_status
+        if succeeded:
+            request.status = GraphBuildRequestStatus.SUCCEEDED
+            request.error = None
+            if version is not None:
+                version.graph_status = GraphProjectionStatus.SUCCEEDED
+                version.graph_active = True
+        else:
+            request.status = GraphBuildRequestStatus.FAILED
+            request.error = {
+                "code": getattr(
+                    error,
+                    "code",
+                    type(error).__name__ if error else "GRAPH_BUILD_FAILED",
+                ),
+                "type": type(error).__name__ if error else "GraphBuildError",
+                "message": str(error) if error else "Graph extraction did not succeed",
+            }
+            if version is not None:
+                version.graph_status = GraphProjectionStatus.FAILED
+        return None
+
+
+def _cleanup_cancelled_graph_projection(
+    version_id: uuid.UUID,
+    status: GraphProjectionStatus | None,
+) -> None:
+    if status is None:
+        return
+    lifecycle = get_graph_lifecycle_service()
+    if lifecycle is not None:
+        lifecycle.invalidate_version(version_id, status=status)
+
+
+def _optional_int(value: object) -> int | None:
+    return int(value) if isinstance(value, (int, float)) else None
+
+
+def _llm_cost(
+    input_tokens: int | None,
+    output_tokens: int | None,
+    *,
+    input_price: float | None,
+    output_price: float | None,
+) -> float | None:
+    if input_price is None and output_price is None:
+        return None
+    return (
+        (input_tokens or 0) * (input_price or 0)
+        + (output_tokens or 0) * (output_price or 0)
+    ) / 1_000_000

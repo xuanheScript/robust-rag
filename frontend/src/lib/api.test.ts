@@ -9,6 +9,7 @@ import {
   getConversation,
   getDependencies,
   getDocumentQuality,
+  getDocumentQualityReviewActions,
   getDocumentGraphRuns,
   getDocumentVersions,
   getGraphNeighborhood,
@@ -68,6 +69,8 @@ describe("getSystemInfo", () => {
   it("parses UI message stream events", async () => {
     const events = [
       { type: "start", messageId: "message-1" },
+      { type: "data-agent-status", data: { action: "documents" } },
+      { type: "data-tool-status", data: { tool: "retrieve_enterprise_documents" } },
       { type: "text-delta", id: "text-1", delta: "你好" },
       { type: "finish" },
     ];
@@ -94,7 +97,13 @@ describe("getSystemInfo", () => {
       (event) => received.push(event.type),
     );
 
-    expect(received).toEqual(["start", "text-delta", "finish"]);
+    expect(received).toEqual([
+      "start",
+      "data-agent-status",
+      "data-tool-status",
+      "text-delta",
+      "finish",
+    ]);
   });
 
   it("builds all management API requests through the backend boundary", async () => {
@@ -111,6 +120,7 @@ describe("getSystemInfo", () => {
       listDocuments(),
       getDocumentVersions("doc"),
       getDocumentQuality("doc"),
+      getDocumentQualityReviewActions("doc"),
       getDocumentGraphRuns("doc", "version"),
       uploadDocument(new File(["content"], "demo.txt"), "Demo"),
       retryDocumentJob("job"),
@@ -141,6 +151,6 @@ describe("getSystemInfo", () => {
       getSearchCapabilities(),
     ]);
 
-    expect(fetchMock).toHaveBeenCalledTimes(32);
+    expect(fetchMock).toHaveBeenCalledTimes(33);
   });
 });

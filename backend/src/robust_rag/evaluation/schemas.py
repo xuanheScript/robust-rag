@@ -25,6 +25,11 @@ class ExpectedGraphFact(BaseModel):
         )
 
 
+class GoldenConversationTurn(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str = Field(min_length=1)
+
+
 class GoldenSample(BaseModel):
     id: str = Field(pattern=r"^[a-z0-9][a-z0-9._-]{2,99}$")
     question: str = Field(min_length=1)
@@ -38,14 +43,35 @@ class GoldenSample(BaseModel):
     expected_graph_facts: list[ExpectedGraphFact] = Field(default_factory=list)
     expected_path: list[str] = Field(default_factory=list)
     expected_cypher_outcome: Literal["success", "fallback", "safe_rejection"] | None = None
+    expected_action: Literal["direct", "documents", "relationships", "insufficient"] | None = None
+    expected_tool: Literal[
+        "retrieve_enterprise_documents", "retrieve_enterprise_relationships"
+    ] | None = None
+    conversation_history: list[GoldenConversationTurn] = Field(default_factory=list)
     metadata: dict[str, object] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def validate_ground_truth(self) -> GoldenSample:
         if not self.expected_answer and not self.rubric:
             raise ValueError("expected_answer or rubric is required")
-        if self.answerable and not (self.relevant_document_ids or self.relevant_node_ids):
+        if (
+            self.answerable
+            and self.expected_action != "direct"
+            and not (self.relevant_document_ids or self.relevant_node_ids)
+        ):
             raise ValueError("answerable samples require a relevant document or node")
+        expected_tools = {
+            "documents": "retrieve_enterprise_documents",
+            "relationships": "retrieve_enterprise_relationships",
+        }
+        if (
+            self.expected_tool is not None
+            and (
+                self.expected_action is None
+                or expected_tools.get(self.expected_action) != self.expected_tool
+            )
+        ):
+            raise ValueError("expected_tool must match expected_action")
         if len(set(self.tags)) != len(self.tags):
             raise ValueError("sample tags must be unique")
         return self

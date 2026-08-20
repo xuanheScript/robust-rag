@@ -3,6 +3,7 @@ import uuid
 from typing import cast
 
 import httpx
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import select
@@ -29,6 +30,7 @@ from robust_rag.indexing.embedding import (
 from robust_rag.indexing.embedding_service import EmbeddingService
 from robust_rag.indexing.gate import RetrievalNodeGateService
 from robust_rag.indexing.opensearch import MemoryOpenSearchAdapter
+from robust_rag.indexing.rate_limit import VoyageRateLimiter
 from robust_rag.indexing.service import IndexingService
 from robust_rag.quality.service import QualityService
 from robust_rag.storage.local import LocalFileStorage
@@ -60,6 +62,16 @@ class FakeEmbeddingAdapter:
         return EmbeddingResponse(vectors=vectors, total_tokens=len(texts) * 7)
 
 
+class ScriptedRateLimiter:
+    def __init__(self, waits: list[float]) -> None:
+        self.waits = waits
+        self.reservations: list[int] = []
+
+    def reserve(self, estimated_tokens: int) -> float:
+        self.reservations.append(estimated_tokens)
+        return self.waits.pop(0) if self.waits else 0
+
+
 def _prepare_chunked_job(
     session_factory: sessionmaker[Session], storage: LocalFileStorage
 ) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID]:
@@ -73,18 +85,23 @@ def _prepare_chunked_job(
 
 
 def _embedding_service(
-    session_factory: sessionmaker[Session], adapter: FakeEmbeddingAdapter
+    session_factory: sessionmaker[Session],
+    adapter: FakeEmbeddingAdapter,
+    *,
+    rate_limiter: VoyageRateLimiter | None = None,
+    batch_items: int = 2,
 ) -> EmbeddingService:
     return EmbeddingService(
         session_factory=session_factory,
         adapter=adapter,
         config_version="test-voyage-v1",
-        batch_items=2,
+        batch_items=batch_items,
         batch_tokens=10000,
         max_retries=2,
         retry_base_seconds=0,
         retry_max_seconds=0,
         price_per_million_tokens=0.12,
+        rate_limiter=rate_limiter,
         sleeper=lambda _delay: None,
         jitter=lambda: 0,
     )
@@ -133,6 +150,26 @@ def test_voyage_adapter_contract_orders_vectors_and_rejects_dimensions() -> None
     assert requests[0]["output_dimension"] == 2
 
 
+def test_voyage_adapter_preserves_retry_after_for_rate_limit_deferral() -> None:
+    client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                429,
+                headers={"Retry-After": "37"},
+                json={"detail": "rate limited"},
+            )
+        ),
+        base_url="https://api.voyageai.com/v1",
+    )
+    adapter = VoyageEmbeddingAdapter(api_key="secret", model="voyage-4", dimension=2, client=client)
+
+    with pytest.raises(EmbeddingAdapterError) as raised:
+        adapter.embed(["first"], input_type="document")
+
+    assert raised.value.status_code == 429
+    assert raised.value.retry_after_seconds == 37
+
+
 def test_embedding_batches_retry_audit_cost_and_idempotency(
     session_factory: sessionmaker[Session],
     storage: LocalFileStorage,
@@ -141,6 +178,16 @@ def test_embedding_batches_retry_audit_cost_and_idempotency(
     document_id, version_id, job_id = _prepare_chunked_job(session_factory, storage)
     adapter = FakeEmbeddingAdapter(failures=1)
     service = _embedding_service(session_factory, adapter)
+
+    assert service.execute(job_id) == "rate_limited"
+    assert service.retry_after_seconds == 65
+    with session_factory() as db:
+        waiting_job = db.get(IngestionJob, job_id)
+        waiting_run = db.scalar(
+            select(EmbeddingRun).where(EmbeddingRun.document_version_id == version_id)
+        )
+        assert waiting_job is not None and waiting_job.status is JobStatus.PENDING
+        assert waiting_run is not None and waiting_run.status is ProjectionRunStatus.RUNNING
 
     assert service.execute(job_id) == "deferred"
     calls_after_success = len(adapter.calls)
@@ -167,6 +214,43 @@ def test_embedding_batches_retry_audit_cost_and_idempotency(
     response = client.get(f"/api/v1/documents/{document_id}/versions/{version_id}/embedding-runs")
     assert response.status_code == 200
     assert response.json()[0]["batches"]
+
+
+def test_embedding_pauses_before_over_budget_batch_and_resumes_same_run(
+    session_factory: sessionmaker[Session], storage: LocalFileStorage
+) -> None:
+    _, version_id, job_id = _prepare_chunked_job(session_factory, storage)
+    adapter = FakeEmbeddingAdapter()
+    limiter = ScriptedRateLimiter([0, 47])
+    service = _embedding_service(
+        session_factory,
+        adapter,
+        rate_limiter=limiter,
+        batch_items=1,
+    )
+
+    assert service.execute(job_id) == "rate_limited"
+    assert service.retry_after_seconds == 47
+    first_call_count = len(adapter.calls)
+    assert first_call_count == 1
+
+    with session_factory() as db:
+        runs = list(
+            db.scalars(select(EmbeddingRun).where(EmbeddingRun.document_version_id == version_id))
+        )
+        assert len(runs) == 1
+        assert runs[0].status is ProjectionRunStatus.RUNNING
+        assert runs[0].batches[0].status is EmbeddingBatchStatus.SUCCEEDED
+        assert runs[0].batches[1].status is EmbeddingBatchStatus.PENDING
+
+    assert service.execute(job_id) == "deferred"
+    assert len(adapter.calls) == len(limiter.reservations) - 1
+    with session_factory() as db:
+        runs = list(
+            db.scalars(select(EmbeddingRun).where(EmbeddingRun.document_version_id == version_id))
+        )
+        assert len(runs) == 1
+        assert runs[0].status is ProjectionRunStatus.SUCCEEDED
 
 
 def test_ready_projection_supports_bm25_dense_delete_rebuild_and_alias_switch(

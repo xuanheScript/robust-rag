@@ -10,8 +10,10 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from robust_rag.core.observability import (
     bind_trace_id,
+    bind_trace_output,
     observe,
     reset_trace_id,
+    reset_trace_output,
     trace_id_from_seed,
 )
 
@@ -32,6 +34,8 @@ class TraceContextMiddleware:
         supplied_trace_id = request_headers.get("x-trace-id")
         trace_id = trace_id_from_seed(supplied_trace_id or request_id)
         trace_token = bind_trace_id(trace_id)
+        trace_output: dict[str, object] = {}
+        trace_output_token = bind_trace_output(trace_output)
         structlog.contextvars.clear_contextvars()
         structlog.contextvars.bind_contextvars(request_id=request_id, trace_id=trace_id)
         logger = structlog.get_logger(__name__)
@@ -59,7 +63,7 @@ class TraceContextMiddleware:
                     await self.app(scope, receive, send_with_request_id)
                 finally:
                     observation.update(
-                        output={"status_code": status_code},
+                        output={"status_code": status_code, **trace_output},
                         metadata={"duration_ms": round((time.perf_counter() - started) * 1000, 3)},
                         level="ERROR" if status_code >= 500 else "DEFAULT",
                     )
@@ -72,6 +76,7 @@ class TraceContextMiddleware:
             )
         finally:
             structlog.contextvars.clear_contextvars()
+            reset_trace_output(trace_output_token)
             reset_trace_id(trace_token)
 
 

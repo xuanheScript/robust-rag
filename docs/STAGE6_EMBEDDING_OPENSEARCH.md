@@ -20,8 +20,13 @@ CHUNK_EVALUATING
 
 - 默认模型为 `voyage-4`，输出维度为 1024。
 - 文档嵌入固定使用 `input_type=document`；阶段 7 的查询嵌入应使用 `input_type=query`。
-- 按最大条数与估算 Token 双重限制动态分批。
-- 429、5xx 和网络错误使用有抖动的指数退避；4xx 契约错误立即失败。
+- 按最大条数与估算 Token 双重限制动态分批；默认每批不超过 8,000 Token。
+- 文档与查询 Embedding 通过 Redis 共享滚动窗口预算，默认按未绑定支付方式账号的
+  3 RPM / 9K TPM 安全预算执行（为官方 10K TPM 保留 10% 估算余量）。
+- 本地预算不足或 Provider 返回 429 时，当前批次回到 `pending`，Job 保持在
+  `EMBEDDING`，Celery 按安全等待时间自动续跑；不会把暂时限速记录成文档失败。
+- 429 优先采用 `Retry-After`，没有该响应头时默认等待 65 秒；5xx 和网络错误继续使用
+  有抖动的指数退避，其他 4xx 契约错误立即失败。
 - 返回结果按 `index` 复原输入顺序，并严格校验数量和向量维度。
 - `EmbeddingRun` 保存模型、配置、总量、Provider Token 和估算成本；`EmbeddingBatch` 保存每批节点、Token、重试和错误。
 - Retrieval Node 保存向量及 `provider/model/dimension/config_version/retrieval_text_hash/embedded_at`。因此 OpenSearch 丢失后无需再次调用 Voyage 即可重建。
@@ -77,6 +82,12 @@ VOYAGE_API_KEY
 VOYAGE_EMBEDDING_MODEL=voyage-4
 VOYAGE_EMBEDDING_DIMENSION=1024
 VOYAGE_EMBEDDING_CONFIG_VERSION=stage6-voyage-v1
+VOYAGE_EMBEDDING_BATCH_TOKENS=8000
+VOYAGE_EMBEDDING_RATE_LIMIT_ENABLED=true
+VOYAGE_EMBEDDING_RATE_LIMIT_RPM=3
+VOYAGE_EMBEDDING_RATE_LIMIT_TPM=9000
+VOYAGE_EMBEDDING_RATE_LIMIT_WINDOW_SECONDS=60
+VOYAGE_EMBEDDING_RATE_LIMIT_FALLBACK_SECONDS=65
 OPENSEARCH_URL
 OPENSEARCH_USERNAME
 OPENSEARCH_PASSWORD
@@ -107,7 +118,8 @@ make migration-check
 自动化测试使用 Voyage 与 OpenSearch 契约替身，不访问外部服务、不产生费用。覆盖：
 
 - Voyage 请求字段、返回顺序和维度。
-- 动态批次、429 重试、Token/成本审计和不可重试失败。
+- 动态批次、Redis 共享 RPM/TPM 预算、429 延迟续跑、Token/成本审计和不可重试失败。
+- Worker 中断或限流恢复后复用同一个运行记录和已成功批次，不重复生成已有向量。
 - 重复 Embedding/Indexing 不重复调用或生成文档。
 - READY 文档 BM25 与 Dense 命中。
 - 物理索引删除后的 PostgreSQL 全量重建。

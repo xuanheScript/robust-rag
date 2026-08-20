@@ -13,13 +13,21 @@ from sqlalchemy.orm import Session
 from robust_rag.core.errors import AppError
 from robust_rag.db.enums import (
     DocumentStatus,
+    GraphBuildRequestStatus,
+    GraphProjectionStatus,
     JobStatus,
     JobType,
     StageName,
     StageRunStatus,
     VersionStatus,
 )
-from robust_rag.db.models import Document, DocumentVersion, IngestionJob, StageRun
+from robust_rag.db.models import (
+    Document,
+    DocumentVersion,
+    GraphBuildRequest,
+    IngestionJob,
+    StageRun,
+)
 from robust_rag.services.dispatcher import JobDispatcher
 from robust_rag.storage.base import FileStorage
 
@@ -213,6 +221,31 @@ def create_reprocess_job(
             status_code=409,
             details={"job_id": str(active_job.id)},
         )
+
+    version = db.get(DocumentVersion, document.current_version_id)
+    if version is not None:
+        had_projection = bool(version.graph_active or version.graph_projected_at is not None)
+        version.graph_active = False
+        version.graph_status = (
+            GraphProjectionStatus.STALE
+            if had_projection
+            else GraphProjectionStatus.NOT_REQUESTED
+        )
+        now = datetime.now(UTC)
+        for graph_request in db.scalars(
+            select(GraphBuildRequest).where(
+                GraphBuildRequest.document_version_id == version.id,
+                GraphBuildRequest.status.in_(
+                    [GraphBuildRequestStatus.PENDING, GraphBuildRequestStatus.RUNNING]
+                ),
+            )
+        ):
+            graph_request.status = GraphBuildRequestStatus.CANCELLED
+            graph_request.finished_at = now
+            graph_request.error = {
+                "code": "GRAPH_BUILD_TARGET_REPROCESSING",
+                "message": "The document was reprocessed before graph generation completed",
+            }
 
     job = IngestionJob(
         document_version_id=document.current_version_id,

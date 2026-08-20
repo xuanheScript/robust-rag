@@ -155,12 +155,28 @@ class GraphRunStatus(StrEnum):
 
 
 class GraphProjectionStatus(StrEnum):
+    NOT_REQUESTED = "not_requested"
     PENDING = "pending"
     RUNNING = "running"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     STALE = "stale"
+    HIDDEN = "hidden"
     DISABLED = "disabled"
+
+
+class GraphBuildRequestType(StrEnum):
+    GENERATE = "generate"
+    REBUILD = "rebuild"
+    RETRY = "retry"
+
+
+class GraphBuildRequestStatus(StrEnum):
+    PENDING = "pending"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 class GraphOrigin(StrEnum):

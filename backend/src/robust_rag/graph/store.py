@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -64,7 +65,10 @@ class Neo4jGraphStore:
         timeout_seconds: float = 5,
     ) -> None:
         self.driver = GraphDatabase.driver(
-            url, auth=(username, password), user_agent="robust-rag-stage9"
+            url,
+            auth=(username, password),
+            user_agent="robust-rag-stage9",
+            connection_timeout=timeout_seconds,
         )
         self.database = database
         self.timeout_seconds = timeout_seconds
@@ -150,6 +154,21 @@ class Neo4jGraphStore:
         evidences: list[dict[str, object]],
     ) -> None:
         self.ensure_schema()
+        neo4j_evidences = [
+            {
+                **row,
+                # Neo4j properties cannot contain maps (or lists of maps). Keep the
+                # authoritative structured locators in PostgreSQL and project a stable,
+                # lossless JSON representation for graph inspection/querying.
+                "source_locators": json.dumps(
+                    row.get("source_locators", []),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            }
+            for row in evidences
+        ]
         statements = (
             (
                 "UNWIND $rows AS row MERGE (n:Entity {entity_id: row.entity_id}) "
@@ -176,7 +195,7 @@ class Neo4jGraphStore:
                 "MERGE (f)-[e:SUPPORTED_BY {version_id: row.version_id, "
                 "source_node_id: row.source_node_id}]->(n) "
                 "SET e.active=row.active",
-                evidences,
+                neo4j_evidences,
             ),
         )
         try:

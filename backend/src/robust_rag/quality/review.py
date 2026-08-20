@@ -37,6 +37,7 @@ def release_quarantined_document(
     reason: str,
 ) -> tuple[QualityReviewAction, IngestionJob]:
     version, job, assessment = _review_context(db, document_id)
+    _ensure_not_already_reviewed(db, assessment)
     if assessment.decision is not QualityDecisionValue.QUARANTINED:
         raise AppError(
             code="QUALITY_RELEASE_NOT_ALLOWED",
@@ -73,6 +74,7 @@ def reject_quarantined_document(
     reason: str,
 ) -> tuple[QualityReviewAction, IngestionJob]:
     version, job, assessment = _review_context(db, document_id)
+    _ensure_not_already_reviewed(db, assessment)
     if assessment.decision is not QualityDecisionValue.QUARANTINED:
         raise AppError(
             code="QUALITY_REJECT_NOT_ALLOWED",
@@ -180,6 +182,30 @@ def _review_context(
             status_code=409,
         )
     return version, job, assessment
+
+
+def _ensure_not_already_reviewed(db: Session, assessment: QualityAssessment) -> None:
+    latest_decision = db.scalar(
+        select(QualityReviewAction)
+        .where(
+            QualityReviewAction.assessment_id == assessment.id,
+            QualityReviewAction.action.in_(
+                [QualityReviewActionValue.RELEASE, QualityReviewActionValue.REJECT]
+            ),
+        )
+        .order_by(QualityReviewAction.created_at.desc())
+        .limit(1)
+        .with_for_update()
+    )
+    if latest_decision is not None:
+        decision_label = (
+            "released" if latest_decision.action is QualityReviewActionValue.RELEASE else "rejected"
+        )
+        raise AppError(
+            code="QUALITY_ALREADY_REVIEWED",
+            message=f"Quality assessment was already {decision_label}",
+            status_code=409,
+        )
 
 
 def _record_action(

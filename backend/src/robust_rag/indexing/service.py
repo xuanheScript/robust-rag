@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from functools import lru_cache, partial
 from typing import NoReturn, Protocol, TypeVar
 
+import structlog
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -42,12 +43,20 @@ from robust_rag.indexing.opensearch import (
 )
 
 T = TypeVar("T")
+logger = structlog.get_logger(__name__)
 
 
 class GraphLifecycle(Protocol):
     def hide_document(self, document_id: uuid.UUID) -> dict[str, int]: ...
 
     def restore_version(self, version_id: uuid.UUID) -> dict[str, int]: ...
+
+    def invalidate_version(
+        self,
+        version_id: uuid.UUID,
+        *,
+        status: GraphProjectionStatus = GraphProjectionStatus.STALE,
+    ) -> int: ...
 
     def purge_document(self, document_id: uuid.UUID) -> dict[str, int]: ...
 
@@ -157,6 +166,8 @@ class IndexingService:
                 self._rollback_projection(version_id, old_version_id)
             self._record_failure(job_id, run_id, stage_id, version_id, exc)
             return "failed"
+        if old_version_id is not None:
+            self._invalidate_graph_version(old_version_id)
         self._record_success(
             job_id,
             run_id,
@@ -327,6 +338,7 @@ class IndexingService:
                     version = db.get(DocumentVersion, version_id)
                     if version is not None:
                         version.graph_status = GraphProjectionStatus.FAILED
+                        version.graph_active = False
 
         with self.session_factory.begin() as db:
             nodes = list(
@@ -362,6 +374,31 @@ class IndexingService:
             chunks_read_alias=self.settings.opensearch_chunks_read_alias,
             chunks_write_alias=self.settings.opensearch_chunks_write_alias,
         )
+
+    def _invalidate_graph_version(self, version_id: uuid.UUID) -> None:
+        if self.graph_lifecycle is not None:
+            try:
+                self.graph_lifecycle.invalidate_version(version_id)
+                return
+            except Exception as exc:
+                logger.exception(
+                    "graph_version_invalidation_failed",
+                    document_version_id=str(version_id),
+                    error_type=type(exc).__name__,
+                )
+        with self.session_factory.begin() as db:
+            version = db.get(DocumentVersion, version_id)
+            if version is None:
+                return
+            had_projection = bool(
+                version.graph_active or version.graph_projected_at is not None
+            )
+            version.graph_active = False
+            version.graph_status = (
+                GraphProjectionStatus.STALE
+                if had_projection
+                else GraphProjectionStatus.NOT_REQUESTED
+            )
 
     def _prepare(
         self, job_id: uuid.UUID

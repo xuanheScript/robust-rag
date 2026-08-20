@@ -30,6 +30,8 @@ from robust_rag.db.enums import (
     EmbeddingBatchStatus,
     EvaluationRunStatus,
     EvaluationSampleStatus,
+    GraphBuildRequestStatus,
+    GraphBuildRequestType,
     GraphConflictStatus,
     GraphCorrectionAction,
     GraphOrigin,
@@ -57,13 +59,16 @@ from robust_rag.db.enums import (
 )
 
 
-def enum_type(enum_class: type[StrEnum], name: str) -> Enum:
+def enum_type(
+    enum_class: type[StrEnum], name: str, *, length: int | None = None
+) -> Enum:
     """Build a portable string-backed enum with stable lowercase values."""
 
     return Enum(
         enum_class,
         name=name,
         native_enum=False,
+        length=length,
         values_callable=lambda members: [member.value for member in members],
         validate_strings=True,
     )
@@ -105,6 +110,18 @@ class Document(Base):
         foreign_keys=[current_version_id], post_update=True
     )
 
+    @property
+    def current_version_status(self) -> VersionStatus | None:
+        return self.current_version.status if self.current_version is not None else None
+
+    @property
+    def graph_status(self) -> GraphProjectionStatus | None:
+        return self.current_version.graph_status if self.current_version is not None else None
+
+    @property
+    def graph_active(self) -> bool:
+        return self.current_version.graph_active if self.current_version is not None else False
+
 
 class DocumentVersion(Base):
     __tablename__ = "document_versions"
@@ -139,10 +156,15 @@ class DocumentVersion(Base):
     ready_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     superseded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     graph_status: Mapped[GraphProjectionStatus] = mapped_column(
-        enum_type(GraphProjectionStatus, "document_version_graph_status"),
-        default=GraphProjectionStatus.PENDING,
+        enum_type(
+            GraphProjectionStatus,
+            "document_version_graph_status",
+            length=20,
+        ),
+        default=GraphProjectionStatus.NOT_REQUESTED,
         index=True,
     )
+    graph_active: Mapped[bool] = mapped_column(default=False, index=True)
     graph_schema_version: Mapped[str | None] = mapped_column(String(100))
     graph_projected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
@@ -178,6 +200,9 @@ class DocumentVersion(Base):
         back_populates="document_version", cascade="all, delete-orphan"
     )
     graph_extraction_runs: Mapped[list["GraphExtractionRun"]] = relationship(
+        back_populates="document_version", cascade="all, delete-orphan"
+    )
+    graph_build_requests: Mapped[list["GraphBuildRequest"]] = relationship(
         back_populates="document_version", cascade="all, delete-orphan"
     )
 
@@ -778,6 +803,75 @@ class IndexingRun(Base):
     embedding_run: Mapped[EmbeddingRun] = relationship(back_populates="indexing_runs")
 
 
+class GraphBuildRequest(Base):
+    __tablename__ = "graph_build_requests"
+    __table_args__ = (
+        CheckConstraint(
+            "request_type IN ('generate', 'rebuild', 'retry')",
+            name="ck_graph_build_requests_type",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'running', 'succeeded', 'failed', 'cancelled')",
+            name="ck_graph_build_requests_status",
+        ),
+        UniqueConstraint("idempotency_key", name="uq_graph_build_requests_idempotency_key"),
+        Index(
+            "ix_graph_build_requests_version_status",
+            "document_version_id",
+            "status",
+        ),
+        Index("ix_graph_build_requests_batch", "batch_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    batch_id: Mapped[uuid.UUID] = mapped_column(index=True)
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("documents.id", ondelete="CASCADE"), index=True
+    )
+    document_version_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("document_versions.id", ondelete="CASCADE"), index=True
+    )
+    request_type: Mapped[GraphBuildRequestType] = mapped_column(
+        enum_type(GraphBuildRequestType, "graph_build_request_type")
+    )
+    status: Mapped[GraphBuildRequestStatus] = mapped_column(
+        enum_type(GraphBuildRequestStatus, "graph_build_request_status"),
+        default=GraphBuildRequestStatus.PENDING,
+        index=True,
+    )
+    requested_by: Mapped[str] = mapped_column(String(255), default="local-admin")
+    idempotency_key: Mapped[str] = mapped_column(String(255))
+    force: Mapped[bool] = mapped_column(default=False)
+    projection_was_active: Mapped[bool] = mapped_column(default=False)
+    celery_task_id: Mapped[str | None] = mapped_column(String(255))
+    parent_count: Mapped[int] = mapped_column(Integer, default=0)
+    estimated_input_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    estimated_input_cost_usd: Mapped[float | None] = mapped_column(Float)
+    actual_input_tokens: Mapped[int | None] = mapped_column(Integer)
+    actual_output_tokens: Mapped[int | None] = mapped_column(Integer)
+    actual_total_tokens: Mapped[int | None] = mapped_column(Integer)
+    actual_cost_usd: Mapped[float | None] = mapped_column(Float)
+    attempt: Mapped[int] = mapped_column(Integer, default=1)
+    max_attempts: Mapped[int] = mapped_column(Integer, default=2)
+    previous_graph_status: Mapped[str] = mapped_column(String(50))
+    error: Mapped[dict[str, object] | None] = mapped_column(JSON)
+    requested_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    document_version: Mapped[DocumentVersion] = relationship(
+        back_populates="graph_build_requests"
+    )
+    extraction_runs: Mapped[list["GraphExtractionRun"]] = relationship(
+        back_populates="build_request"
+    )
+
+
 class GraphExtractionRun(Base):
     __tablename__ = "graph_extraction_runs"
     __table_args__ = (
@@ -789,12 +883,16 @@ class GraphExtractionRun(Base):
             "schema_version",
             "extractor_version",
             "input_hash",
+            "attempt",
             name="uq_graph_run_idempotency",
         ),
         Index("ix_graph_runs_version_status", "document_version_id", "status"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    build_request_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("graph_build_requests.id", ondelete="SET NULL"), index=True
+    )
     document_version_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("document_versions.id", ondelete="CASCADE")
     )
@@ -804,6 +902,7 @@ class GraphExtractionRun(Base):
     model: Mapped[str] = mapped_column(String(255))
     prompt_version: Mapped[str] = mapped_column(String(100))
     input_hash: Mapped[str] = mapped_column(String(64))
+    attempt: Mapped[int] = mapped_column(Integer, default=1)
     config_snapshot: Mapped[dict[str, object]] = mapped_column(JSON, default=dict)
     status: Mapped[GraphRunStatus] = mapped_column(
         enum_type(GraphRunStatus, "graph_run_status"), default=GraphRunStatus.RUNNING
@@ -818,6 +917,9 @@ class GraphExtractionRun(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     document_version: Mapped[DocumentVersion] = relationship(back_populates="graph_extraction_runs")
+    build_request: Mapped[GraphBuildRequest | None] = relationship(
+        back_populates="extraction_runs"
+    )
     evidences: Mapped[list["GraphFactEvidence"]] = relationship(back_populates="extraction_run")
 
 
@@ -1099,7 +1201,7 @@ class Conversation(Base):
     messages: Mapped[list["Message"]] = relationship(
         back_populates="conversation",
         cascade="all, delete-orphan",
-        order_by="Message.created_at",
+        order_by=lambda: (Message.created_at, Message.finished_at),
     )
 
 

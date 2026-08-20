@@ -1,5 +1,6 @@
 """Process health endpoints."""
 
+import json
 from datetime import UTC, datetime
 from functools import lru_cache
 from typing import Any, Literal, cast
@@ -145,6 +146,7 @@ def _celery_health(
         worker = _heartbeat_status(value, settings.celery_heartbeat_ttl_seconds)
     except Exception as exc:
         worker = {"status": "unknown", "error": type(exc).__name__}
+    worker["observability"] = _worker_observability_health(redis_client)
 
     try:
         value = cast(Any, redis_client).get("robust-rag:beat:last_seen")
@@ -152,6 +154,23 @@ def _celery_health(
     except Exception as exc:
         scheduler = {"status": "unknown", "error": type(exc).__name__}
     return worker, queue, scheduler
+
+
+def _worker_observability_health(redis_client: Redis) -> dict[str, object]:
+    try:
+        value = cast(Any, redis_client).get("robust-rag:worker:observability")
+    except Exception as exc:
+        return {"status": "unknown", "error": type(exc).__name__}
+    if value is None:
+        return {"status": "unavailable", "last_flush_at": None}
+    raw = value.decode("utf-8") if isinstance(value, bytes) else str(value)
+    try:
+        snapshot = json.loads(raw)
+    except (TypeError, ValueError):
+        return {"status": "unavailable", "error": "invalid_snapshot"}
+    if not isinstance(snapshot, dict):
+        return {"status": "unavailable", "error": "invalid_snapshot"}
+    return {str(key): item for key, item in snapshot.items()}
 
 
 def _heartbeat_status(value: object, ttl_seconds: int) -> dict[str, object]:

@@ -36,6 +36,19 @@ from robust_rag.indexing.embedding import (
     EmbeddingResponse,
     VoyageEmbeddingAdapter,
 )
+from robust_rag.indexing.rate_limit import (
+    NoopVoyageRateLimiter,
+    RateLimiterUnavailable,
+    VoyageRateLimiter,
+    build_voyage_rate_limiter,
+)
+
+
+class _RateLimitDeferred(Exception):
+    def __init__(self, wait_seconds: float, message: str) -> None:
+        super().__init__(message)
+        self.wait_seconds = wait_seconds
+        self.message = message
 
 
 class EmbeddingService:
@@ -51,6 +64,8 @@ class EmbeddingService:
         retry_base_seconds: float,
         retry_max_seconds: float,
         price_per_million_tokens: float | None,
+        rate_limiter: VoyageRateLimiter | None = None,
+        rate_limit_fallback_seconds: float = 65,
         sleeper: Callable[[float], None] = time.sleep,
         jitter: Callable[[], float] = random.random,
     ) -> None:
@@ -63,8 +78,11 @@ class EmbeddingService:
         self.retry_base_seconds = retry_base_seconds
         self.retry_max_seconds = retry_max_seconds
         self.price_per_million_tokens = price_per_million_tokens
+        self.rate_limiter = rate_limiter or NoopVoyageRateLimiter()
+        self.rate_limit_fallback_seconds = rate_limit_fallback_seconds
         self.sleeper = sleeper
         self.jitter = jitter
+        self.retry_after_seconds: float | None = None
 
     @property
     def config_snapshot(self) -> dict[str, object]:
@@ -77,42 +95,52 @@ class EmbeddingService:
             "max_retries": self.max_retries,
             "retry_base_seconds": self.retry_base_seconds,
             "retry_max_seconds": self.retry_max_seconds,
+            "rate_limit_fallback_seconds": self.rate_limit_fallback_seconds,
             "price_per_million_tokens": self.price_per_million_tokens,
             "input_type": "document",
         }
 
     def execute(self, job_id: uuid.UUID) -> str:
+        self.retry_after_seconds = None
         prepared = self._prepare(job_id)
         if isinstance(prepared, str):
             return prepared
         run_id, stage_id, batches = prepared
-        total_provider_tokens = 0
-        has_provider_usage = False
-        for batch_id, node_ids, texts in batches:
+        for batch_id, node_ids, texts, estimated_tokens in batches:
             try:
-                response, retry_count = self._embed_with_retry(texts, batch_id)
+                response, retry_count = self._embed_with_retry(texts, batch_id, estimated_tokens)
+            except _RateLimitDeferred as exc:
+                self.retry_after_seconds = exc.wait_seconds
+                self._record_rate_limited(
+                    job_id,
+                    run_id,
+                    stage_id,
+                    batch_id,
+                    exc,
+                )
+                return "rate_limited"
             except EmbeddingAdapterError as exc:
                 self._record_failure(job_id, run_id, stage_id, batch_id, node_ids, exc)
                 return "failed"
-            total_provider_tokens += response.total_tokens or 0
-            has_provider_usage = has_provider_usage or response.total_tokens is not None
             self._record_batch_success(
                 batch_id=batch_id,
                 node_ids=node_ids,
                 response=response,
                 retry_count=retry_count,
             )
-        self._record_success(
-            job_id,
-            run_id,
-            stage_id,
-            total_provider_tokens if has_provider_usage else None,
-        )
+        self._record_success(job_id, run_id, stage_id)
         return "deferred"
 
     def _prepare(
         self, job_id: uuid.UUID
-    ) -> str | tuple[uuid.UUID, uuid.UUID, list[tuple[uuid.UUID, list[uuid.UUID], list[str]]]]:
+    ) -> (
+        str
+        | tuple[
+            uuid.UUID,
+            uuid.UUID,
+            list[tuple[uuid.UUID, list[uuid.UUID], list[str], int]],
+        ]
+    ):
         with self.session_factory.begin() as db:
             job = db.scalar(select(IngestionJob).where(IngestionJob.id == job_id).with_for_update())
             if job is None:
@@ -157,6 +185,59 @@ class EmbeddingService:
                 return "deferred"
 
             pending = [node for node in nodes if not self._node_is_current(node)]
+            active_run = db.scalar(
+                select(EmbeddingRun)
+                .where(
+                    EmbeddingRun.chunking_run_id == chunking_run.id,
+                    EmbeddingRun.provider == self.adapter.provider,
+                    EmbeddingRun.model == self.adapter.model,
+                    EmbeddingRun.dimension == self.adapter.dimension,
+                    EmbeddingRun.config_version == self.config_version,
+                    EmbeddingRun.status == ProjectionRunStatus.RUNNING,
+                )
+                .order_by(EmbeddingRun.started_at.desc())
+                .limit(1)
+            )
+            active_stage = db.scalar(
+                select(StageRun)
+                .where(
+                    StageRun.job_id == job.id,
+                    StageRun.stage_name == StageName.EMBEDDING,
+                    StageRun.status == StageRunStatus.RUNNING,
+                )
+                .order_by(StageRun.started_at.desc())
+                .limit(1)
+            )
+            if active_run is not None and active_stage is not None:
+                by_id = {node.id: node for node in pending}
+                resumed: list[tuple[uuid.UUID, list[uuid.UUID], list[str], int]] = []
+                for batch in active_run.batches:
+                    batch_node_ids = [uuid.UUID(value) for value in batch.node_ids_json]
+                    resumable_ids = [node_id for node_id in batch_node_ids if node_id in by_id]
+                    if not resumable_ids:
+                        continue
+                    batch.status = EmbeddingBatchStatus.PENDING
+                    batch.started_at = None
+                    batch.finished_at = None
+                    resumed.append(
+                        (
+                            batch.id,
+                            resumable_ids,
+                            [by_id[node_id].retrieval_text for node_id in resumable_ids],
+                            sum(
+                                self._estimated_tokens(by_id[node_id]) for node_id in resumable_ids
+                            ),
+                        )
+                    )
+                if resumed or not pending:
+                    job.status = JobStatus.RUNNING
+                    job.error_code = None
+                    job.error_message = None
+                    job.finished_at = None
+                    job.updated_at = datetime.now(UTC)
+                    job.document_version.status = VersionStatus.EMBEDDING
+                    return active_run.id, active_stage.id, resumed
+
             attempt = (
                 int(
                     db.scalar(
@@ -219,7 +300,7 @@ class EmbeddingService:
             )
             db.add_all([run, stage])
             db.flush()
-            prepared: list[tuple[uuid.UUID, list[uuid.UUID], list[str]]] = []
+            prepared: list[tuple[uuid.UUID, list[uuid.UUID], list[str], int]] = []
             for index, group in enumerate(grouped):
                 batch = EmbeddingBatch(
                     embedding_run_id=run.id,
@@ -232,7 +313,12 @@ class EmbeddingService:
                 db.add(batch)
                 db.flush()
                 prepared.append(
-                    (batch.id, [node.id for node in group], [node.retrieval_text for node in group])
+                    (
+                        batch.id,
+                        [node.id for node in group],
+                        [node.retrieval_text for node in group],
+                        batch.estimated_tokens,
+                    )
                 )
             job.status = JobStatus.RUNNING
             job.error_code = None
@@ -243,22 +329,53 @@ class EmbeddingService:
             return run.id, stage.id, prepared
 
     def _embed_with_retry(
-        self, texts: list[str], batch_id: uuid.UUID
+        self,
+        texts: list[str],
+        batch_id: uuid.UUID,
+        estimated_tokens: int,
     ) -> tuple[EmbeddingResponse, int]:
+        previous_retry_count = 0
         with self.session_factory.begin() as db:
             batch = db.get(EmbeddingBatch, batch_id)
             if batch is not None:
+                previous_retry_count = batch.retry_count
                 batch.status = EmbeddingBatchStatus.RUNNING
                 batch.started_at = datetime.now(UTC)
         for retry_count in range(self.max_retries + 1):
             try:
-                return self.adapter.embed(texts, input_type="document"), retry_count
+                wait_seconds = self.rate_limiter.reserve(estimated_tokens)
+            except RateLimiterUnavailable as exc:
+                raise _RateLimitDeferred(
+                    self.rate_limit_fallback_seconds,
+                    str(exc),
+                ) from exc
+            except ValueError as exc:
+                raise EmbeddingAdapterError(
+                    "VOYAGE_RATE_LIMITER_ERROR",
+                    str(exc),
+                    retryable=False,
+                ) from exc
+            if wait_seconds > 0:
+                raise _RateLimitDeferred(
+                    wait_seconds,
+                    "Voyage free-tier request budget is temporarily exhausted",
+                )
+            try:
+                return (
+                    self.adapter.embed(texts, input_type="document"),
+                    previous_retry_count + retry_count,
+                )
             except EmbeddingAdapterError as exc:
                 with self.session_factory.begin() as db:
                     batch = db.get(EmbeddingBatch, batch_id)
                     if batch is not None:
-                        batch.retry_count = retry_count
+                        batch.retry_count = previous_retry_count + retry_count + 1
                         batch.error = self._error_value(exc)
+                if exc.status_code == 429:
+                    raise _RateLimitDeferred(
+                        exc.retry_after_seconds or self.rate_limit_fallback_seconds,
+                        exc.message,
+                    ) from exc
                 if not exc.retryable or retry_count >= self.max_retries:
                     raise
                 delay = min(
@@ -302,7 +419,6 @@ class EmbeddingService:
         job_id: uuid.UUID,
         run_id: uuid.UUID,
         stage_id: uuid.UUID,
-        provider_tokens: int | None,
     ) -> None:
         with self.session_factory.begin() as db:
             job = db.get(IngestionJob, job_id)
@@ -311,14 +427,63 @@ class EmbeddingService:
             if job is None or run is None or stage is None:
                 raise RuntimeError("Embedding state disappeared before completion")
             now = datetime.now(UTC)
+            provider_tokens = db.scalar(
+                select(func.sum(EmbeddingBatch.provider_tokens)).where(
+                    EmbeddingBatch.embedding_run_id == run_id,
+                    EmbeddingBatch.status == EmbeddingBatchStatus.SUCCEEDED,
+                )
+            )
             run.status = ProjectionRunStatus.SUCCEEDED
-            run.provider_tokens = provider_tokens
+            run.provider_tokens = int(provider_tokens) if provider_tokens is not None else None
             if provider_tokens is not None and self.price_per_million_tokens is not None:
                 run.estimated_cost_usd = provider_tokens * self.price_per_million_tokens / 1_000_000
+            run.error = None
             run.finished_at = now
             stage.status = StageRunStatus.SUCCEEDED
+            stage.error = None
             stage.finished_at = now
             self._advance(job)
+
+    def _record_rate_limited(
+        self,
+        job_id: uuid.UUID,
+        run_id: uuid.UUID,
+        stage_id: uuid.UUID,
+        batch_id: uuid.UUID,
+        deferred: _RateLimitDeferred,
+    ) -> None:
+        with self.session_factory.begin() as db:
+            now = datetime.now(UTC)
+            value: dict[str, object] = {
+                "code": "VOYAGE_RATE_LIMIT_WAIT",
+                "message": deferred.message,
+                "retryable": True,
+                "retry_after_seconds": deferred.wait_seconds,
+            }
+            run = db.get(EmbeddingRun, run_id)
+            stage = db.get(StageRun, stage_id)
+            batch = db.get(EmbeddingBatch, batch_id)
+            job = db.get(IngestionJob, job_id)
+            if run is not None:
+                run.status = ProjectionRunStatus.RUNNING
+                run.error = value
+                run.finished_at = None
+            if stage is not None:
+                stage.status = StageRunStatus.RUNNING
+                stage.error = value
+                stage.finished_at = None
+            if batch is not None:
+                batch.status = EmbeddingBatchStatus.PENDING
+                batch.error = value
+                batch.started_at = None
+                batch.finished_at = None
+            if job is not None:
+                job.status = JobStatus.PENDING
+                job.error_code = None
+                job.error_message = None
+                job.finished_at = None
+                job.updated_at = now
+                job.document_version.status = VersionStatus.EMBEDDING
 
     def _record_failure(
         self,
@@ -399,6 +564,7 @@ class EmbeddingService:
             "message": error.message,
             "retryable": error.retryable,
             "status_code": error.status_code,
+            "retry_after_seconds": error.retry_after_seconds,
         }
 
     @staticmethod
@@ -466,4 +632,6 @@ def get_embedding_service(session_factory: sessionmaker[Session]) -> EmbeddingSe
         retry_base_seconds=settings.voyage_embedding_retry_base_seconds,
         retry_max_seconds=settings.voyage_embedding_retry_max_seconds,
         price_per_million_tokens=settings.voyage_embedding_price_per_million_tokens,
+        rate_limiter=build_voyage_rate_limiter(settings),
+        rate_limit_fallback_seconds=settings.voyage_embedding_rate_limit_fallback_seconds,
     )

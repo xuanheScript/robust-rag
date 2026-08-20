@@ -212,7 +212,22 @@ class Settings(BaseSettings):
         default=128, ge=1, validation_alias="VOYAGE_EMBEDDING_BATCH_ITEMS"
     )
     voyage_embedding_batch_tokens: int = Field(
-        default=120000, ge=1, validation_alias="VOYAGE_EMBEDDING_BATCH_TOKENS"
+        default=8000, ge=1, validation_alias="VOYAGE_EMBEDDING_BATCH_TOKENS"
+    )
+    voyage_embedding_rate_limit_enabled: bool = Field(
+        default=True, validation_alias="VOYAGE_EMBEDDING_RATE_LIMIT_ENABLED"
+    )
+    voyage_embedding_rate_limit_rpm: int = Field(
+        default=3, ge=1, validation_alias="VOYAGE_EMBEDDING_RATE_LIMIT_RPM"
+    )
+    voyage_embedding_rate_limit_tpm: int = Field(
+        default=9000, ge=1, validation_alias="VOYAGE_EMBEDDING_RATE_LIMIT_TPM"
+    )
+    voyage_embedding_rate_limit_window_seconds: int = Field(
+        default=60, ge=1, validation_alias="VOYAGE_EMBEDDING_RATE_LIMIT_WINDOW_SECONDS"
+    )
+    voyage_embedding_rate_limit_fallback_seconds: int = Field(
+        default=65, ge=1, validation_alias="VOYAGE_EMBEDDING_RATE_LIMIT_FALLBACK_SECONDS"
     )
     voyage_embedding_max_retries: int = Field(
         default=3, ge=0, le=10, validation_alias="VOYAGE_EMBEDDING_MAX_RETRIES"
@@ -276,16 +291,40 @@ class Settings(BaseSettings):
         default="enterprise-core-v1", validation_alias="GRAPH_SCHEMA_VERSION"
     )
     graph_extractor_version: str = Field(
-        default="llama-schema-v1", validation_alias="GRAPH_EXTRACTOR_VERSION"
+        default="llama-schema-v3", validation_alias="GRAPH_EXTRACTOR_VERSION"
     )
     graph_prompt_version: str = Field(
-        default="stage9-extraction-v1", validation_alias="GRAPH_PROMPT_VERSION"
+        default="stage9-extraction-v3", validation_alias="GRAPH_PROMPT_VERSION"
     )
     graph_max_triplets_per_parent: int = Field(
         default=12, ge=1, le=50, validation_alias="GRAPH_MAX_TRIPLETS_PER_PARENT"
     )
     graph_extraction_workers: int = Field(
         default=2, ge=1, le=16, validation_alias="GRAPH_EXTRACTION_WORKERS"
+    )
+    graph_llm_reasoning_effort: Literal["none", "low", "medium", "high"] = Field(
+        default="none", validation_alias="GRAPH_LLM_REASONING_EFFORT"
+    )
+    graph_llm_max_output_tokens: int = Field(
+        default=8000, ge=256, le=32000, validation_alias="GRAPH_LLM_MAX_OUTPUT_TOKENS"
+    )
+    graph_llm_max_retries: int = Field(
+        default=3, ge=0, le=10, validation_alias="GRAPH_LLM_MAX_RETRIES"
+    )
+    graph_llm_retry_base_seconds: float = Field(
+        default=2, ge=0, le=60, validation_alias="GRAPH_LLM_RETRY_BASE_SECONDS"
+    )
+    graph_llm_retry_max_seconds: float = Field(
+        default=15, ge=0, le=120, validation_alias="GRAPH_LLM_RETRY_MAX_SECONDS"
+    )
+    graph_max_failed_parent_ratio: float = Field(
+        default=0.2, ge=0, le=1, validation_alias="GRAPH_MAX_FAILED_PARENT_RATIO"
+    )
+    graph_run_stale_seconds: int = Field(
+        default=900, ge=60, validation_alias="GRAPH_RUN_STALE_SECONDS"
+    )
+    graph_build_max_attempts: int = Field(
+        default=2, ge=1, le=5, validation_alias="GRAPH_BUILD_MAX_ATTEMPTS"
     )
     graph_query_enabled: bool = Field(default=True, validation_alias="GRAPH_QUERY_ENABLED")
     graph_query_max_depth: int = Field(
@@ -295,7 +334,13 @@ class Settings(BaseSettings):
         default=50, ge=1, le=200, validation_alias="GRAPH_QUERY_MAX_ROWS"
     )
     graph_query_timeout_seconds: float = Field(
-        default=5, gt=0, le=30, validation_alias="GRAPH_QUERY_TIMEOUT_SECONDS"
+        default=3, gt=0, le=30, validation_alias="GRAPH_QUERY_TIMEOUT_SECONDS"
+    )
+    graph_text_to_cypher_timeout_seconds: float = Field(
+        default=8,
+        gt=0,
+        le=30,
+        validation_alias="GRAPH_TEXT_TO_CYPHER_TIMEOUT_SECONDS",
     )
     graph_rrf_weight: float = Field(default=0.8, gt=0, validation_alias="GRAPH_RRF_WEIGHT")
     neo4j_url: str | None = Field(default=None, validation_alias="NEO4J_URL")
@@ -386,10 +431,10 @@ class Settings(BaseSettings):
         default=None, ge=0, validation_alias="LLM_PRICE_PER_MILLION_OUTPUT_TOKENS"
     )
     generation_prompt_version: str = Field(
-        default="stage8-grounded-rag-v1", validation_alias="GENERATION_PROMPT_VERSION"
+        default="stage8-grounded-rag-v2-zh", validation_alias="GENERATION_PROMPT_VERSION"
     )
     query_rewrite_prompt_version: str = Field(
-        default="stage8-conversation-rewrite-v1",
+        default="stage8-conversation-rewrite-v2-zh",
         validation_alias="QUERY_REWRITE_PROMPT_VERSION",
     )
     query_rewrite_history_messages: int = Field(
@@ -400,6 +445,23 @@ class Settings(BaseSettings):
     )
     citation_excerpt_max_chars: int = Field(
         default=500, ge=50, le=5000, validation_alias="CITATION_EXCERPT_MAX_CHARS"
+    )
+
+    agentic_rag_enabled: bool = Field(default=False, validation_alias="AGENTIC_RAG_ENABLED")
+    agent_graph_version: str = Field(
+        default="stage13-langgraph-agentic-rag-v1", validation_alias="AGENT_GRAPH_VERSION"
+    )
+    agent_prompt_version: str = Field(
+        default="stage13-agent-decision-v3-zh", validation_alias="AGENT_PROMPT_VERSION"
+    )
+    agent_max_output_tokens: int = Field(
+        default=500, ge=1, le=4000, validation_alias="AGENT_MAX_OUTPUT_TOKENS"
+    )
+    agent_reasoning_effort: Literal["none", "low", "medium", "high", "xhigh", "max"] = Field(
+        default="none", validation_alias="AGENT_REASONING_EFFORT"
+    )
+    agent_recursion_limit: int = Field(
+        default=12, ge=4, le=50, validation_alias="AGENT_RECURSION_LIMIT"
     )
 
     evaluation_dataset_root: Path = Field(

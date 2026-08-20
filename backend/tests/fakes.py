@@ -12,8 +12,8 @@ class FakeDispatcher:
 
 class FakeGraphDispatcher:
     def __init__(self) -> None:
-        self.dispatched: list[tuple[uuid.UUID, bool]] = []
+        self.dispatched: list[uuid.UUID] = []
 
-    def dispatch(self, document_version_id: uuid.UUID, *, force: bool = False) -> str:
-        self.dispatched.append((document_version_id, force))
-        return f"graph-task-{document_version_id}"
+    def dispatch(self, graph_build_request_id: uuid.UUID) -> str:
+        self.dispatched.append(graph_build_request_id)
+        return f"graph-task-{graph_build_request_id}"

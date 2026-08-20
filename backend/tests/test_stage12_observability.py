@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from contextvars import copy_context
+from datetime import UTC, datetime
+
 from robust_rag.core.logging import redact_sensitive_log_fields
 from robust_rag.core.observability import (
     ObservabilityService,
@@ -10,11 +13,11 @@ from robust_rag.core.settings import Settings
 
 
 class FakeObservation:
-    id = "observation-id"
-
-    def __init__(self) -> None:
+    def __init__(self, observation_id: str = "observation-id") -> None:
+        self.id = observation_id
         self.updates: list[dict[str, object]] = []
         self.scores: list[dict[str, object]] = []
+        self.ended = False
 
     def update(self, **kwargs: object) -> None:
         self.updates.append(kwargs)
@@ -25,29 +28,22 @@ class FakeObservation:
     def score_trace(self, **kwargs: object) -> None:
         self.scores.append(kwargs)
 
-
-class FakeObservationManager:
-    def __init__(self, observation: FakeObservation) -> None:
-        self.observation = observation
-        self.exited = False
-
-    def __enter__(self) -> FakeObservation:
-        return self.observation
-
-    def __exit__(self, *_: object) -> None:
-        self.exited = True
+    def end(self) -> None:
+        self.ended = True
 
 
 class FakeLangfuse:
     def __init__(self) -> None:
         self.observation = FakeObservation()
-        self.manager = FakeObservationManager(self.observation)
+        self.observations: list[FakeObservation] = []
         self.started: list[dict[str, object]] = []
         self.flushed = False
 
-    def start_as_current_observation(self, **kwargs: object) -> FakeObservationManager:
+    def start_observation(self, **kwargs: object) -> FakeObservation:
         self.started.append(kwargs)
-        return self.manager
+        self.observation = FakeObservation(f"{len(self.started):016x}")
+        self.observations.append(self.observation)
+        return self.observation
 
     def auth_check(self) -> bool:
         return True
@@ -60,7 +56,7 @@ class FakeLangfuse:
 
 
 class FailingLangfuse(FakeLangfuse):
-    def start_as_current_observation(self, **kwargs: object) -> FakeObservationManager:
+    def start_observation(self, **kwargs: object) -> FakeObservation:
         raise TimeoutError
 
 
@@ -119,8 +115,10 @@ def test_langfuse_observation_uses_stable_trace_and_redacted_content() -> None:
         metadata={"authorization": "Bearer secret", "input_tokens": 4},
         model="test-model",
     ) as observation:
+        completion_start_time = datetime.now(UTC)
         observation.update(
             output="private answer",
+            completion_start_time=completion_start_time,
             usage_details={"input": 4, "output": 2},
         )
         observation.score_trace("faithfulness", 1.0)
@@ -141,8 +139,68 @@ def test_langfuse_observation_uses_stable_trace_and_redacted_content() -> None:
         "type": "string",
         "characters": 14,
     }
+    assert client.observation.updates[0]["completion_start_time"] == completion_start_time
     assert client.observation.scores[0]["name"] == "faithfulness"
-    assert client.manager.exited is True
+    assert client.observation.ended is True
+
+
+def test_nested_observations_preserve_parent_child_relationship() -> None:
+    client = FakeLangfuse()
+    service = ObservabilityService(_settings(), client=client)  # type: ignore[arg-type]
+    trace_id = trace_id_from_seed("request-with-children")
+
+    with (
+        service.observe("http.request", trace_id=trace_id),
+        service.observe("retrieval.graph"),
+        service.observe("graph.neo4j.query"),
+    ):
+        pass
+
+    assert client.started[0]["trace_context"] == {"trace_id": trace_id}
+    assert client.started[1]["trace_context"] == {
+        "trace_id": trace_id,
+        "parent_span_id": "0000000000000001",
+    }
+    assert client.started[2]["trace_context"] == {
+        "trace_id": trace_id,
+        "parent_span_id": "0000000000000002",
+    }
+
+
+def test_observation_can_end_in_a_different_streaming_context() -> None:
+    client = FakeLangfuse()
+    service = ObservabilityService(_settings(), client=client)  # type: ignore[arg-type]
+    manager = service.observe(
+        "llm.rag_generation",
+        trace_id=trace_id_from_seed("streaming-request"),
+    )
+
+    entered_context = copy_context()
+    exited_context = copy_context()
+    entered_context.run(manager.__enter__)
+    exited_context.run(manager.__exit__, None, None, None)
+
+    assert client.observation.ended is True
+
+
+def test_observation_preserves_specific_error_status() -> None:
+    client = FakeLangfuse()
+    service = ObservabilityService(_settings(), client=client)  # type: ignore[arg-type]
+
+    try:
+        with service.observe("llm.text_to_cypher") as observation:
+            observation.update(level="ERROR", status_message="LLM_TIMEOUT")
+            raise TimeoutError
+    except TimeoutError:
+        pass
+
+    status_messages = [
+        update.get("status_message")
+        for update in client.observation.updates
+        if "status_message" in update
+    ]
+    assert status_messages == ["LLM_TIMEOUT"]
+    assert client.observation.updates[-1]["level"] == "ERROR"
 
 
 def test_langfuse_failure_degrades_without_breaking_business_flow() -> None:

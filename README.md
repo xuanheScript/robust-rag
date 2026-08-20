@@ -1,6 +1,6 @@
 # Robust RAG
 
-面向中英双语通用企业知识库的完整 RAG 项目。阶段 12 正在实施，已接入默认启用、可失败降级且默认不采集正文的 Langfuse Cloud 可观测层，并补充 HTTP/Celery Trace、运行时健康状态与任务恢复加固。
+面向中英双语通用企业知识库的完整 RAG 项目。阶段 13 已接入 LangGraph 1.2.11 Agentic RAG：由 LLM 自主选择直接回答、企业文档检索或企业关系检索，并保留固定 RAG 回退开关、来源引用和全链路审计。
 
 完整实施方案见 [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md)。
 
@@ -114,10 +114,11 @@ GET  /api/v1/evaluations/{evaluation_id}
 阶段 6 的设计和运行说明见 [docs/STAGE6_EMBEDDING_OPENSEARCH.md](docs/STAGE6_EMBEDDING_OPENSEARCH.md)。
 阶段 7 的设计和运行说明见 [docs/STAGE7_RETRIEVAL.md](docs/STAGE7_RETRIEVAL.md)。
 阶段 8 的生成、会话和引用说明见 [docs/STAGE8_GENERATION.md](docs/STAGE8_GENERATION.md)。
-阶段 9 的知识图谱构建与检索说明见 [docs/STAGE9_KNOWLEDGE_GRAPH.md](docs/STAGE9_KNOWLEDGE_GRAPH.md)。
+阶段 9 的人工知识图谱构建、成本预览、状态流与检索边界说明见 [docs/STAGE9_KNOWLEDGE_GRAPH.md](docs/STAGE9_KNOWLEDGE_GRAPH.md)。
 阶段 10 的管理后台、Chat UI 与生命周期操作说明见 [docs/STAGE10_ADMIN_UI.md](docs/STAGE10_ADMIN_UI.md)。
 阶段 11 的黄金集、Ragas、确定性/图谱指标与回归报告说明见 [docs/STAGE11_EVALUATION.md](docs/STAGE11_EVALUATION.md)。
 阶段 12 的 Langfuse、Trace、健康检查、恢复和故障处理说明见 [docs/STAGE12_OBSERVABILITY.md](docs/STAGE12_OBSERVABILITY.md)。
+阶段 13 的 LangGraph Agentic RAG、启用方式、状态图和事件协议说明见 [docs/STAGE13_AGENTIC_RAG.md](docs/STAGE13_AGENTIC_RAG.md)。
 
 ## 工程检查
 

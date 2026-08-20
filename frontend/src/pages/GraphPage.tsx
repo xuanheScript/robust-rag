@@ -1,10 +1,11 @@
-import { FormEvent, useState, type CSSProperties } from "react";
+import { FormEvent, useEffect, useState, type CSSProperties } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import {
   createGraphEntity,
   createGraphRelation,
   getGraphNeighborhood,
+  listGraphEntities,
   listGraphConflicts,
   mergeGraphEntities,
   resolveGraphConflict,
@@ -35,8 +36,7 @@ export function GraphPage() {
   const [conflictDialog, setConflictDialog] = useState(false);
   const results = useQuery({
     queryKey: ["graph-search", query],
-    queryFn: ({ signal }) => searchGraph(query, signal),
-    enabled: Boolean(query),
+    queryFn: ({ signal }) => query ? searchGraph(query, signal) : listGraphEntities(signal),
   });
   const neighborhood = useQuery({
     queryKey: ["graph-neighborhood", selected?.id],
@@ -56,8 +56,14 @@ export function GraphPage() {
   });
   function submitSearch(event: FormEvent) {
     event.preventDefault();
-    if (input.trim()) setQuery(input.trim());
+    setQuery(input.trim());
   }
+  useEffect(() => {
+    if (!results.data) return;
+    if (selected && results.data.some((entity) => entity.id === selected.id)) return;
+    setSelected(results.data[0] ?? null);
+    setSelectedFact(null);
+  }, [results.data, selected]);
   return (
     <div className="page-stack graph-page">
       <PageHeader eyebrow="Knowledge graph" title="知识图谱" description="搜索实体、展开局部关系，并在保留审计记录的前提下完成人工修正。" actions={<button className="primary-button" onClick={() => setEntityDialog(true)}>＋ 新建实体</button>} />
@@ -68,12 +74,12 @@ export function GraphPage() {
       </section>
       <div className="graph-workspace">
         <section className="panel graph-results">
-          <div className="panel-heading"><div><span>Entities</span><h2>实体结果</h2></div></div>
-          {!query ? <EmptyState title="搜索知识图谱" detail="输入实体名称后查看它的关系与来源证据。" /> : results.isPending ? <Loading /> : results.data?.length ? results.data.map((entity) => <button className={selected?.id === entity.id ? "entity-result active" : "entity-result"} key={entity.id} onClick={() => { setSelected(entity); setSelectedFact(null); }}><span className={`entity-type type-${entity.entity_type.toLowerCase()}`}>{entity.entity_type.slice(0, 2)}</span><div><strong>{entity.primary_name}</strong><small>{entity.entity_type} · {entity.origin}</small></div><StatusBadge value={entity.review_status} /></button>) : <EmptyState title="没有找到实体" detail="尝试名称的一部分，或创建新的人工实体。" />}
+          <div className="panel-heading"><div><span>Entities</span><h2>{query ? "搜索结果" : "全部实体"}</h2></div></div>
+          {results.isPending ? <Loading /> : results.isError ? <div className="inline-error graph-load-error">实体加载失败：{results.error.message}</div> : results.data?.length ? results.data.map((entity) => <button className={selected?.id === entity.id ? "entity-result active" : "entity-result"} key={entity.id} onClick={() => { setSelected(entity); setSelectedFact(null); }}><span className={`entity-type type-${entity.entity_type.toLowerCase()}`}>{entity.entity_type.slice(0, 2)}</span><div><strong>{entity.primary_name}</strong><small>{entity.entity_type} · {entity.origin}</small></div><StatusBadge value={entity.review_status} /></button>) : <EmptyState title="没有找到实体" detail={query ? "尝试名称的一部分，或清空搜索查看全部实体。" : "当前 Schema 下还没有可展示的实体。"} />}
         </section>
         <section className="panel graph-canvas-panel">
           <div className="panel-heading"><div><span>Neighborhood</span><h2>局部关系图</h2></div>{selected ? <button onClick={() => setRelationDialog(true)}>＋ 添加关系</button> : null}</div>
-          {!selected ? <EmptyState title="选择一个实体" detail="局部图只加载相关节点，不会把整张图一次性发送到浏览器。" /> : neighborhood.isPending ? <Loading label="正在展开关系" /> : neighborhood.data ? <LocalGraph center={selected} entities={neighborhood.data.entities} facts={neighborhood.data.facts} onSelectFact={setSelectedFact} /> : <EmptyState title="暂无关系" detail="该实体目前没有可用的在线关系。" />}
+          {!selected ? <EmptyState title="选择一个实体" detail="局部图只加载相关节点，不会把整张图一次性发送到浏览器。" /> : neighborhood.isPending ? <Loading label="正在展开关系" /> : neighborhood.isError ? <div className="inline-error graph-load-error">关系加载失败：{neighborhood.error.message}</div> : neighborhood.data ? <LocalGraph center={selected} entities={neighborhood.data.entities} facts={neighborhood.data.facts} onSelectFact={setSelectedFact} /> : <EmptyState title="暂无关系" detail="该实体目前没有可用的在线关系。" />}
         </section>
         <aside className="panel graph-inspector">
           <div className="panel-heading"><div><span>Inspector</span><h2>{selectedFact ? "关系详情" : "实体详情"}</h2></div></div>
@@ -98,11 +104,22 @@ function LocalGraph({ center, entities, facts, onSelectFact }: { center: GraphEn
   return <div className="local-graph"><div className="center-node"><span>{center.entity_type.slice(0, 2)}</span><strong>{center.primary_name}</strong></div><div className="relation-rays">{facts.map((fact, index) => { const relatedId = fact.subject_entity_id === center.id ? fact.object_entity_id : fact.subject_entity_id; const entity = entities.find((value) => value.id === relatedId); return <button key={fact.id} className="graph-ray" style={{ "--ray-index": index } as CSSProperties} onClick={() => onSelectFact(fact)}><span className="ray-label">{fact.predicate}</span><span className="ray-line" /><span className="ray-node"><b>{entity?.entity_type.slice(0, 2) ?? "?"}</b><strong>{entity?.primary_name ?? "未知实体"}</strong></span></button>; })}</div></div>;
 }
 
-function FactInspector({ fact, entities, evidence, onReview, onEdit }: { fact: GraphFact; entities: GraphEntity[]; evidence: Array<{ fact_id: string; excerpt: string; source_locators: Array<Record<string, unknown>> }>; onReview: (action: "approve" | "reject") => void; onEdit: () => void }) {
+function FactInspector({ fact, entities, evidence, onReview, onEdit }: { fact: GraphFact; entities: GraphEntity[]; evidence: Array<{ fact_id: string; source_node_id: string; excerpt: string; source_locators: Array<Record<string, unknown>> }>; onReview: (action: "approve" | "reject") => void; onEdit: () => void }) {
   const subject = entities.find((entity) => entity.id === fact.subject_entity_id);
   const object = entities.find((entity) => entity.id === fact.object_entity_id);
   const sources = evidence.filter((item) => item.fact_id === fact.id);
-  return <div className="inspector-content"><StatusBadge value={fact.review_status} /><div className="triple"><strong>{subject?.primary_name ?? "?"}</strong><span>{fact.predicate}</span><strong>{object?.primary_name ?? "?"}</strong></div><dl><dt>来源</dt><dd>{fact.origin}</dd><dt>置信度</dt><dd>{fact.confidence == null ? "—" : `${Math.round(fact.confidence * 100)}%`}</dd><dt>Schema</dt><dd>{fact.schema_version}</dd></dl><h4>来源证据</h4>{sources.length ? sources.map((source, index) => <blockquote key={index}>{source.excerpt}</blockquote>) : <p className="muted">人工关系或暂无可展示证据</p>}<div className="review-actions"><button onClick={onEdit}>修正关系</button>{fact.review_status === "unreviewed" ? <><button onClick={() => onReview("approve")}>确认事实</button><button className="danger-button" onClick={() => onReview("reject")}>驳回</button></> : null}</div></div>;
+  return <div className="inspector-content"><StatusBadge value={fact.review_status} /><div className="triple"><strong>{subject?.primary_name ?? "?"}</strong><span>{fact.predicate}</span><strong>{object?.primary_name ?? "?"}</strong></div><dl><dt>来源</dt><dd>{fact.origin}</dd><dt>置信度</dt><dd>{fact.confidence == null ? "—" : `${Math.round(fact.confidence * 100)}%`}</dd><dt>Schema</dt><dd>{fact.schema_version}</dd></dl><h4>来源证据</h4>{sources.length ? sources.map((source, index) => <article className="graph-evidence" key={`${source.source_node_id}-${index}`}><small>{sourceLocation(source.source_locators)} · Parent {source.source_node_id.slice(0, 8)}</small><blockquote>{source.excerpt}</blockquote></article>) : <p className="muted">人工关系或暂无可展示证据</p>}<div className="review-actions"><button onClick={onEdit}>修正关系</button>{fact.review_status === "unreviewed" ? <><button onClick={() => onReview("approve")}>确认事实</button><button className="danger-button" onClick={() => onReview("reject")}>驳回</button></> : null}</div></div>;
+}
+
+function sourceLocation(locators: Array<Record<string, unknown>>) {
+  const labels = locators.map((locator) => {
+    if (typeof locator.page_number === "number") return `第 ${locator.page_number} 页`;
+    if (typeof locator.slide_number === "number") return `第 ${locator.slide_number} 张幻灯片`;
+    if (typeof locator.sheet_name === "string") return `工作表 ${locator.sheet_name}`;
+    if (typeof locator.line_start === "number") return `第 ${locator.line_start} 行`;
+    return null;
+  }).filter(Boolean);
+  return labels.join("、") || "来源位置未标注";
 }
 
 function EntityDialog({ onClose, onCreate, pending }: { onClose: () => void; onCreate: (value: { entity_type: string; primary_name: string; aliases: string[]; properties: Record<string, unknown>; reason: string }) => void; pending: boolean }) {

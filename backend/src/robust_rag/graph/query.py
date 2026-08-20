@@ -15,6 +15,7 @@ from llama_index.core.indices.property_graph.sub_retrievers.text_to_cypher impor
 from llama_index.core.llms import CustomLLM
 from sqlalchemy.orm import Session, sessionmaker
 
+from robust_rag.core.observability import observe
 from robust_rag.db.enums import GraphQueryTraceStatus
 from robust_rag.db.models import GraphQueryTrace
 from robust_rag.graph.cypher import (
@@ -85,7 +86,33 @@ class _ValidatedQueryStore(SimplePropertyGraphStore):
         self, query: str, param_map: dict[str, Any] | None = None
     ) -> list[dict[str, object]]:
         validated = self.validator.validate(query)
-        explain = self.adapter.explain(validated.query, param_map)
+        observation_metadata = {
+            "cypher_characters": len(validated.query),
+            "parameter_count": len(param_map or {}),
+            "timeout_seconds": getattr(self.adapter, "timeout_seconds", None),
+        }
+        with observe(
+            "graph.neo4j.explain",
+            as_type="tool",
+            input={"cypher": validated.query, "parameters": param_map or {}},
+            metadata=observation_metadata,
+        ) as explain_span:
+            try:
+                explain = self.adapter.explain(validated.query, param_map)
+            except GraphStoreError as exc:
+                explain_span.update(
+                    level="ERROR",
+                    status_message=exc.code,
+                    metadata={**observation_metadata, "retryable": exc.retryable},
+                )
+                raise
+            explain_span.update(
+                output=explain.snapshot(),
+                metadata={
+                    **observation_metadata,
+                    "estimated_rows": explain.estimated_rows,
+                },
+            )
         self.last_explain = explain.snapshot()
         if explain.has_cartesian_product:
             raise GraphStoreError(
@@ -95,7 +122,25 @@ class _ValidatedQueryStore(SimplePropertyGraphStore):
             raise GraphStoreError(
                 "CYPHER_COMPLEXITY", "Cypher plan exceeds the complexity budget", retryable=False
             )
-        self.last_rows = self.adapter.query(validated.query, param_map)
+        with observe(
+            "graph.neo4j.query",
+            as_type="tool",
+            input={"cypher": validated.query, "parameters": param_map or {}},
+            metadata=observation_metadata,
+        ) as query_span:
+            try:
+                self.last_rows = self.adapter.query(validated.query, param_map)
+            except GraphStoreError as exc:
+                query_span.update(
+                    level="ERROR",
+                    status_message=exc.code,
+                    metadata={**observation_metadata, "retryable": exc.retryable},
+                )
+                raise
+            query_span.update(
+                output={"row_count": len(self.last_rows), "rows": self.last_rows},
+                metadata={**observation_metadata, "row_count": len(self.last_rows)},
+            )
         return self.last_rows
 
 

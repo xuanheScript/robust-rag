@@ -19,6 +19,7 @@ from robust_rag.generation.provider import (
     FakeLLMProvider,
     LLMProviderError,
     LLMRequest,
+    LLMToolCall,
     ResponsesAPIProvider,
 )
 from robust_rag.generation.schemas import ChatRequest
@@ -161,6 +162,118 @@ def test_responses_api_provider_non_stream_and_stream_contract() -> None:
     assert provider.endpoint == "https://llm.example.test/v1/responses"
 
 
+def test_responses_api_provider_tool_call_contract() -> None:
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content))
+        response_payload = {
+            "id": "resp_tool",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_1",
+                    "name": "retrieve_enterprise_documents",
+                    "arguments": '{"query":"Policy effective date"}',
+                }
+            ],
+            "usage": {"input_tokens": 12, "output_tokens": 4, "total_tokens": 16},
+        }
+        if captured["stream"] is True:
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                text=(
+                    "data: "
+                    + json.dumps({"type": "response.completed", "response": response_payload})
+                    + "\n\ndata: [DONE]\n\n"
+                ),
+            )
+        return httpx.Response(200, json=response_payload)
+
+    provider = ResponsesAPIProvider(
+        base_url="https://llm.example.test/v1",
+        model="test-responses-model",
+        reasoning_effort="none",
+        api_key="secret",
+        client=httpx.Client(
+            transport=httpx.MockTransport(handler),
+            base_url="https://llm.example.test/v1/",
+        ),
+    )
+    tool = {
+        "type": "function",
+        "name": "retrieve_enterprise_documents",
+        "parameters": {
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    }
+    request = LLMRequest(
+        instructions="Choose a tool",
+        input=[{"role": "user", "content": "When?"}],
+        max_output_tokens=100,
+        tools=[tool],
+        tool_choice="auto",
+    )
+    response = provider.generate(request)
+    streamed = list(provider.stream(request))
+
+    assert response.text == ""
+    assert response.tool_calls == (
+        LLMToolCall(
+            call_id="call_1",
+            name="retrieve_enterprise_documents",
+            arguments={"query": "Policy effective date"},
+        ),
+    )
+    assert streamed[-1].tool_calls == response.tool_calls
+    assert captured["tools"] == [tool]
+    assert captured["tool_choice"] == "auto"
+    assert captured["stream"] is True
+
+
+def test_responses_api_provider_allows_request_to_disable_global_reasoning() -> None:
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "id": "resp_fast_route",
+                "status": "completed",
+                "output": [{"type": "message", "content": [{"type": "output_text", "text": "ok"}]}],
+            },
+        )
+
+    provider = ResponsesAPIProvider(
+        base_url="https://llm.example.test/v1",
+        model="test-responses-model",
+        reasoning_effort="medium",
+        api_key="secret",
+        client=httpx.Client(
+            transport=httpx.MockTransport(handler),
+            base_url="https://llm.example.test/v1/",
+        ),
+    )
+    provider.generate(
+        LLMRequest(
+            instructions="Route",
+            input=[{"role": "user", "content": "Question"}],
+            max_output_tokens=100,
+            reasoning_effort="none",
+        )
+    )
+
+    assert "reasoning" not in captured
+
+
 def test_responses_api_provider_exposes_retryable_http_and_stream_errors() -> None:
     unavailable = httpx.Client(
         transport=httpx.MockTransport(
@@ -197,6 +310,116 @@ def test_responses_api_provider_exposes_retryable_http_and_stream_errors() -> No
     provider.client = failed_stream
     with pytest.raises(LLMProviderError, match="failed"):
         list(provider.stream(request))
+
+
+def test_graph_extraction_empty_response_logs_safe_response_structure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    upstream_payload = {
+        "id": "resp_empty",
+        "status": "completed",
+        "output": [
+            {
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": "private reasoning"}],
+            }
+        ],
+        "usage": {"input_tokens": 31, "output_tokens": 0, "total_tokens": 31},
+    }
+    client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200,
+                headers={"content-type": "application/json", "x-request-id": "upstream-1"},
+                json=upstream_payload,
+            )
+        ),
+        base_url="https://llm.example.test/v1/",
+    )
+    provider = ResponsesAPIProvider(
+        base_url="https://llm.example.test/v1",
+        model="test-responses-model",
+        reasoning_effort="medium",
+        api_key="secret",
+        client=client,
+    )
+    local_logger = Mock()
+    monkeypatch.setattr("robust_rag.generation.provider.logger", local_logger)
+
+    with pytest.raises(LLMProviderError) as captured:
+        provider.generate(
+            LLMRequest(
+                instructions="Extract facts",
+                input=[{"role": "user", "content": "private document content"}],
+                max_output_tokens=4000,
+                metadata={"purpose": "graph-extraction"},
+                text_format={
+                    "type": "json_schema",
+                    "name": "kg_schema",
+                    "strict": True,
+                    "schema": {"type": "object"},
+                },
+            )
+        )
+
+    assert captured.value.code == "LLM_EMPTY_RESPONSE"
+    error_call = local_logger.error.call_args
+    assert error_call.args[0] == "graph_llm_provider_empty_response"
+    assert error_call.kwargs["http_status"] == 200
+    assert error_call.kwargs["upstream_request_id"] == "upstream-1"
+    assert error_call.kwargs["response_status"] == "completed"
+    assert error_call.kwargs["output_types"] == ["reasoning"]
+    assert error_call.kwargs["output_item_keys"] == [["summary", "type"]]
+    assert error_call.kwargs["output_count"] == 1
+    assert error_call.kwargs["input_tokens"] == 31
+    logged_values = repr([*local_logger.info.call_args_list, *local_logger.error.call_args_list])
+    assert "private document content" not in logged_values
+    assert "private reasoning" not in logged_values
+    assert "secret" not in logged_values
+
+
+def test_graph_extraction_incomplete_response_has_specific_error_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200,
+                json={
+                    "id": "resp_incomplete",
+                    "status": "incomplete",
+                    "incomplete_details": {"reason": "max_output_tokens"},
+                    "output": [{"type": "reasoning", "summary": []}],
+                    "usage": {"input_tokens": 189, "output_tokens": 4001, "total_tokens": 4190},
+                },
+            )
+        ),
+        base_url="https://llm.example.test/v1/",
+    )
+    provider = ResponsesAPIProvider(
+        base_url="https://llm.example.test/v1",
+        model="test-responses-model",
+        reasoning_effort="none",
+        api_key="secret",
+        client=client,
+    )
+    local_logger = Mock()
+    monkeypatch.setattr("robust_rag.generation.provider.logger", local_logger)
+
+    with pytest.raises(LLMProviderError) as captured:
+        provider.generate(
+            LLMRequest(
+                instructions="Extract facts",
+                input=[{"role": "user", "content": "source"}],
+                max_output_tokens=4000,
+                metadata={"purpose": "graph-extraction"},
+            )
+        )
+
+    assert captured.value.code == "LLM_INCOMPLETE_RESPONSE"
+    assert "max_output_tokens" in captured.value.message
+    assert local_logger.error.call_args.args[0] == "graph_llm_provider_incomplete_response"
+    assert local_logger.error.call_args.kwargs["response_status"] == "incomplete"
 
 
 def test_responses_api_provider_requires_api_key() -> None:
@@ -349,6 +572,7 @@ def test_multiturn_rewrite_is_saved_and_generation_failure_is_explainable(
 
     second = service.prepare(_request("它什么时候生效\uff1f", first.conversation_id))
     assert second.rewritten_question == "Policy effective date"
+    assert second.retrieval is not None
     assert len(provider.generate_requests) == 1
     with session_factory() as db:
         trace = db.get(RetrievalTrace, second.retrieval.trace_id)
@@ -356,7 +580,7 @@ def test_multiturn_rewrite_is_saved_and_generation_failure_is_explainable(
         assert trace.query_original == "它什么时候生效?"
         assert trace.query_rewritten == "Policy effective date"
         assert trace.rewrite_snapshot["history_message_count"] == 2
-        assert trace.rewrite_snapshot["prompt_version"] == "stage8-conversation-rewrite-v1"
+        assert trace.rewrite_snapshot["prompt_version"] == ("stage8-conversation-rewrite-v2-zh")
 
     provider.failure = LLMProviderError(
         "LLM_UNAVAILABLE",

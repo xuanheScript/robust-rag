@@ -11,9 +11,11 @@
     "test": "vitest run --coverage"
   },
   "dependencies": {
+    "@radix-ui/react-collapsible": "^1.1.20",
     "@tanstack/react-query": "^5.85.0",
     "clsx": "^2.1.1",
     "lucide-react": "^1.31.0",
+    "motion": "^13.1.0",
     "react": "^19.1.1",
     "react-dom": "^19.1.1",
     "react-router-dom": "^7.8.0",

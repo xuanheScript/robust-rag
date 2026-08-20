@@ -3,32 +3,43 @@
 import uuid
 from typing import Annotated
 
-import structlog
 from fastapi import APIRouter, Depends, Query, status
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from robust_rag.core.errors import AppError
 from robust_rag.core.settings import get_settings
 from robust_rag.db.enums import (
-    DocumentStatus,
     GraphConflictStatus,
-    GraphProjectionStatus,
-    VersionStatus,
+    GraphReviewStatus,
+    RetrievalNodeLevel,
 )
 from robust_rag.db.models import (
     Document,
     DocumentVersion,
+    GraphBuildRequest,
     GraphConflictRecord,
     GraphEntityRecord,
     GraphExtractionRun,
+    GraphFactEvidence,
     GraphFactRecord,
+    RetrievalNode,
 )
 from robust_rag.db.session import get_db
 from robust_rag.graph.admin import GraphAdminError, GraphAdminService
+from robust_rag.graph.builds import (
+    GraphBuildValidationError,
+    create_graph_builds,
+    preview_graph_builds,
+)
 from robust_rag.graph.factory import graph_is_configured
 from robust_rag.graph.schema import get_graph_schema
 from robust_rag.graph.schemas import (
+    DocumentGraphRead,
+    GraphBuildBatchResponse,
+    GraphBuildCreateRequest,
+    GraphBuildPreviewResponse,
+    GraphBuildSelection,
     GraphConflictRead,
     GraphConflictResolveRequest,
     GraphEntityCreate,
@@ -53,7 +64,6 @@ DatabaseSession = Annotated[Session, Depends(get_db)]
 GraphDispatcherDependency = Annotated[
     GraphExtractionDispatcher, Depends(get_graph_extraction_dispatcher)
 ]
-logger = structlog.get_logger(__name__)
 
 
 def _service(db: Session) -> GraphAdminService:
@@ -66,6 +76,80 @@ def _handle(exc: GraphAdminError) -> AppError:
     return AppError(code=exc.code, message=exc.message, status_code=status_code)
 
 
+def _require_graph_configured() -> None:
+    if not graph_is_configured(get_settings()):
+        raise AppError(
+            code="GRAPH_NOT_CONFIGURED",
+            message="Neo4j graph projection is not configured",
+            status_code=409,
+        )
+
+
+@router.post("/graph/builds/preview", response_model=GraphBuildPreviewResponse)
+def preview_manual_graph_builds(
+    request: GraphBuildSelection,
+    db: DatabaseSession,
+) -> GraphBuildPreviewResponse:
+    _require_graph_configured()
+    return preview_graph_builds(
+        db,
+        document_ids=request.document_ids,
+        force=request.force,
+        settings=get_settings(),
+    )
+
+
+@router.post(
+    "/graph/builds",
+    response_model=GraphBuildBatchResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def queue_manual_graph_builds(
+    request: GraphBuildCreateRequest,
+    db: DatabaseSession,
+    dispatcher: GraphDispatcherDependency,
+) -> GraphBuildBatchResponse:
+    _require_graph_configured()
+    try:
+        batch_id, requests = create_graph_builds(
+            db,
+            dispatcher=dispatcher,
+            document_ids=request.document_ids,
+            requested_by=request.requested_by,
+            force=request.force,
+            settings=get_settings(),
+        )
+    except GraphBuildValidationError as exc:
+        raise AppError(
+            code=exc.code,
+            message=exc.message,
+            status_code=409,
+            details=exc.details,
+        ) from exc
+    return GraphBuildBatchResponse(batch_id=batch_id, requests=requests)
+
+
+@router.get("/graph/builds/{batch_id}", response_model=GraphBuildBatchResponse)
+def get_graph_build_batch(
+    batch_id: uuid.UUID,
+    db: DatabaseSession,
+) -> GraphBuildBatchResponse:
+    requests = list(
+        db.scalars(
+            select(GraphBuildRequest)
+            .where(GraphBuildRequest.batch_id == batch_id)
+            .order_by(GraphBuildRequest.created_at, GraphBuildRequest.id)
+        )
+    )
+    if not requests:
+        raise AppError(
+            code="GRAPH_BUILD_BATCH_NOT_FOUND",
+            message="Graph build batch was not found",
+            status_code=404,
+        )
+    return GraphBuildBatchResponse(batch_id=batch_id, requests=requests)
+
+
 @router.get("/graph/search", response_model=list[GraphEntityRead])
 def search_graph(
     db: DatabaseSession,
@@ -75,6 +159,18 @@ def search_graph(
 ) -> list[GraphEntityRecord]:
     try:
         return _service(db).search(q, entity_type=entity_type, limit=limit)
+    except GraphAdminError as exc:
+        raise _handle(exc) from exc
+
+
+@router.get("/graph/entities", response_model=list[GraphEntityRead])
+def list_graph_entities(
+    db: DatabaseSession,
+    entity_type: str | None = None,
+    limit: Annotated[int, Query(ge=1, le=200)] = 100,
+) -> list[GraphEntityRecord]:
+    try:
+        return _service(db).list_entities(entity_type=entity_type, limit=limit)
     except GraphAdminError as exc:
         raise _handle(exc) from exc
 
@@ -262,6 +358,93 @@ def list_graph_runs(
     )
 
 
+@router.get(
+    "/documents/{document_id}/versions/{version_id}/graph",
+    response_model=DocumentGraphRead,
+)
+def get_document_graph(
+    document_id: uuid.UUID,
+    version_id: uuid.UUID,
+    db: DatabaseSession,
+) -> dict[str, object]:
+    document = db.get(Document, document_id)
+    version = db.get(DocumentVersion, version_id)
+    if document is None or version is None or version.document_id != document_id:
+        raise AppError(
+            code="DOCUMENT_VERSION_NOT_FOUND",
+            message="Document version was not found",
+            status_code=404,
+        )
+    evidence = list(
+        db.scalars(
+            select(GraphFactEvidence)
+            .where(
+                GraphFactEvidence.document_version_id == version_id,
+                GraphFactEvidence.active.is_(True),
+            )
+            .order_by(GraphFactEvidence.source_node_id, GraphFactEvidence.fact_id)
+        )
+    )
+    fact_ids = {value.fact_id for value in evidence}
+    facts = (
+        list(
+            db.scalars(
+                select(GraphFactRecord)
+                .where(
+                    GraphFactRecord.id.in_(fact_ids),
+                    GraphFactRecord.active.is_(True),
+                    GraphFactRecord.review_status != GraphReviewStatus.REJECTED,
+                )
+                .order_by(GraphFactRecord.predicate, GraphFactRecord.id)
+            )
+        )
+        if fact_ids
+        else []
+    )
+    active_fact_ids = {value.id for value in facts}
+    evidence = [value for value in evidence if value.fact_id in active_fact_ids]
+    entity_ids = {
+        entity_id for fact in facts for entity_id in (fact.subject_entity_id, fact.object_entity_id)
+    }
+    entities = (
+        list(
+            db.scalars(
+                select(GraphEntityRecord)
+                .where(GraphEntityRecord.id.in_(entity_ids))
+                .order_by(GraphEntityRecord.primary_name)
+            )
+        )
+        if entity_ids
+        else []
+    )
+    parent_count = db.scalar(
+        select(func.count())
+        .select_from(RetrievalNode)
+        .where(
+            RetrievalNode.document_version_id == version_id,
+            RetrievalNode.node_level == RetrievalNodeLevel.PARENT,
+        )
+    )
+    return {
+        "document_id": document_id,
+        "document_version_id": version_id,
+        "parent_count": int(parent_count or 0),
+        "entities": entities,
+        "facts": facts,
+        "evidence": [
+            {
+                "fact_id": value.fact_id,
+                "source_node_id": value.source_node_id,
+                "document_id": value.document_id,
+                "document_version_id": value.document_version_id,
+                "source_locators": value.source_locators_json,
+                "excerpt": value.excerpt,
+            }
+            for value in evidence
+        ],
+    }
+
+
 @router.post(
     "/documents/{document_id}/graph/rebuild",
     response_model=GraphRebuildResponse,
@@ -272,72 +455,32 @@ def rebuild_document_graph(
     db: DatabaseSession,
     dispatcher: GraphDispatcherDependency,
 ) -> GraphRebuildResponse:
-    document = db.scalar(select(Document).where(Document.id == document_id).with_for_update())
-    if document is None or document.status is DocumentStatus.DELETED:
-        raise AppError(code="DOCUMENT_NOT_FOUND", message="Document was not found", status_code=404)
-    settings = get_settings()
-    if not graph_is_configured(settings):
-        raise AppError(
-            code="GRAPH_NOT_CONFIGURED",
-            message="Neo4j graph projection is not configured",
-            status_code=409,
-        )
-    if document.current_version_id is None:
-        raise AppError(
-            code="DOCUMENT_VERSION_NOT_READY",
-            message="The document has no current version to extract",
-            status_code=409,
-        )
-    version = db.get(DocumentVersion, document.current_version_id)
-    if version is None or version.status is not VersionStatus.READY:
-        raise AppError(
-            code="DOCUMENT_VERSION_NOT_READY",
-            message="The current document version is not ready for graph extraction",
-            status_code=409,
-        )
-    if version.graph_status in {
-        GraphProjectionStatus.PENDING,
-        GraphProjectionStatus.RUNNING,
-    }:
-        raise AppError(
-            code="GRAPH_EXTRACTION_IN_PROGRESS",
-            message="Graph extraction is already pending or running for this document",
-            status_code=409,
-            details={"graph_status": version.graph_status.value},
-        )
-
-    previous_status = version.graph_status
-    version.graph_status = GraphProjectionStatus.PENDING
-    db.commit()
     try:
-        task_id = dispatcher.dispatch(version.id, force=True)
-    except Exception as exc:
-        db.rollback()
-        version = db.get(DocumentVersion, document.current_version_id)
-        if version is not None:
-            version.graph_status = previous_status
-            db.commit()
-        logger.exception(
-            "graph_rebuild_dispatch_failed",
-            document_id=str(document_id),
-            document_version_id=str(document.current_version_id),
-            error_type=type(exc).__name__,
+        _require_graph_configured()
+        _batch_id, requests = create_graph_builds(
+            db,
+            dispatcher=dispatcher,
+            document_ids=[document_id],
+            requested_by="local-admin",
+            force=True,
+            settings=get_settings(),
         )
+    except GraphBuildValidationError as exc:
+        raise AppError(
+            code=exc.code,
+            message=exc.message,
+            status_code=409,
+            details=exc.details,
+        ) from exc
+    build_request = requests[0]
+    if build_request.celery_task_id is None:
         raise AppError(
             code="GRAPH_REBUILD_DISPATCH_FAILED",
             message="Graph extraction could not be queued",
             status_code=503,
-        ) from exc
-
-    logger.info(
-        "graph_rebuild_queued",
-        document_id=str(document_id),
-        document_version_id=str(version.id),
-        task_id=task_id,
-        force=True,
-    )
+        )
     return GraphRebuildResponse(
         document_id=document_id,
-        document_version_id=version.id,
-        task_id=task_id,
+        document_version_id=build_request.document_version_id,
+        task_id=build_request.celery_task_id,
     )

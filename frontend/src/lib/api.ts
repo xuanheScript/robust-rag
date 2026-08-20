@@ -12,6 +12,9 @@ export interface DocumentItem {
   created_at: string;
   updated_at: string;
   deleted_at: string | null;
+  current_version_status: string | null;
+  graph_status: string | null;
+  graph_active: boolean;
 }
 
 export interface DocumentVersion {
@@ -25,6 +28,7 @@ export interface DocumentVersion {
   uploaded_at: string;
   ready_at: string | null;
   graph_status: string;
+  graph_active: boolean;
   graph_schema_version: string | null;
   graph_projected_at: string | null;
 }
@@ -36,12 +40,45 @@ export interface QualityAssessment {
   decision: string | null;
   overall_score: number | null;
   dimensions_json: Array<Record<string, unknown>>;
-  issues_json: Array<Record<string, unknown>>;
+  issues_json: QualityIssue[];
   evaluator: string;
   engine_version: string;
   started_at: string;
   finished_at: string | null;
   error: Record<string, unknown> | null;
+}
+
+export interface QualityEvidence {
+  metric: string;
+  value: unknown;
+  threshold: unknown;
+  block_ids: string[];
+  details: Record<string, unknown>;
+}
+
+export interface QualityIssue {
+  code: string;
+  dimension: string;
+  severity: string;
+  source: string;
+  evaluator: string;
+  evaluator_version: string;
+  message: string;
+  evidence: QualityEvidence[];
+  labels: string[];
+}
+
+export interface QualityReviewAction {
+  id: string;
+  document_version_id: string;
+  assessment_id: string;
+  action: "release" | "reject" | "reevaluate";
+  actor: string;
+  reason: string;
+  previous_job_status: string;
+  previous_version_status: string;
+  previous_decision: string;
+  created_at: string;
 }
 
 export interface JobItem {
@@ -124,18 +161,29 @@ export interface GraphFact {
   active: boolean;
 }
 
+export interface GraphEvidence {
+  fact_id: string;
+  source_node_id: string;
+  document_id: string;
+  document_version_id: string;
+  source_locators: Array<Record<string, unknown>>;
+  excerpt: string;
+}
+
 export interface GraphNeighborhood {
   center: GraphEntity;
   entities: GraphEntity[];
   facts: GraphFact[];
-  evidence: Array<{
-    fact_id: string;
-    source_node_id: string;
-    document_id: string;
-    document_version_id: string;
-    source_locators: Array<Record<string, unknown>>;
-    excerpt: string;
-  }>;
+  evidence: GraphEvidence[];
+}
+
+export interface DocumentGraph {
+  document_id: string;
+  document_version_id: string;
+  parent_count: number;
+  entities: GraphEntity[];
+  facts: GraphFact[];
+  evidence: GraphEvidence[];
 }
 
 export interface GraphConflict {
@@ -160,12 +208,16 @@ export interface GraphExtractionRun {
   model: string;
   prompt_version: string;
   input_hash: string;
+  attempt: number;
   status: string;
   parent_count: number;
   entity_count: number;
   relation_count: number;
   artifact_uri: string | null;
+  usage_json: Record<string, unknown>;
   error: Record<string, unknown> | null;
+  started_at: string;
+  finished_at: string | null;
 }
 
 export interface GraphRebuildResponse {
@@ -173,6 +225,59 @@ export interface GraphRebuildResponse {
   document_version_id: string;
   status: "queued";
   task_id: string;
+}
+
+export interface GraphBuildPreviewItem {
+  document_id: string;
+  document_version_id: string | null;
+  display_name: string;
+  graph_status: string | null;
+  graph_active: boolean;
+  eligible: boolean;
+  reason: string | null;
+  parent_count: number;
+  estimated_input_tokens: number;
+}
+
+export interface GraphBuildPreview {
+  items: GraphBuildPreviewItem[];
+  eligible_count: number;
+  parent_count: number;
+  estimated_calls: number;
+  estimated_input_tokens: number;
+  estimated_input_cost_usd: number | null;
+}
+
+export interface GraphBuildRequest {
+  id: string;
+  batch_id: string;
+  document_id: string;
+  document_version_id: string;
+  request_type: "generate" | "rebuild" | "retry";
+  status: "pending" | "running" | "succeeded" | "failed" | "cancelled";
+  requested_by: string;
+  force: boolean;
+  projection_was_active: boolean;
+  celery_task_id: string | null;
+  parent_count: number;
+  estimated_input_tokens: number;
+  estimated_input_cost_usd: number | null;
+  actual_input_tokens: number | null;
+  actual_output_tokens: number | null;
+  actual_total_tokens: number | null;
+  actual_cost_usd: number | null;
+  attempt: number;
+  max_attempts: number;
+  previous_graph_status: string;
+  error: Record<string, unknown> | null;
+  requested_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+}
+
+export interface GraphBuildBatch {
+  batch_id: string;
+  requests: GraphBuildRequest[];
 }
 
 export interface CanonicalDocumentMetadata {
@@ -373,12 +478,24 @@ export function listDocuments(includeDeleted = true, signal?: AbortSignal) {
   );
 }
 
+export function getDocument(documentId: string, signal?: AbortSignal) {
+  return request<DocumentItem>(`/documents/${documentId}`, undefined, signal);
+}
+
 export function getDocumentVersions(documentId: string, signal?: AbortSignal) {
   return request<DocumentVersion[]>(`/documents/${documentId}/versions`, undefined, signal);
 }
 
 export function getDocumentQuality(documentId: string, signal?: AbortSignal) {
   return request<QualityAssessment[]>(`/documents/${documentId}/quality`, undefined, signal);
+}
+
+export function getDocumentQualityReviewActions(documentId: string, signal?: AbortSignal) {
+  return request<QualityReviewAction[]>(
+    `/documents/${documentId}/quality/review-actions`,
+    undefined,
+    signal,
+  );
 }
 
 export function uploadDocument(file: File, displayName?: string) {
@@ -431,6 +548,24 @@ export function rebuildDocumentGraph(documentId: string) {
   });
 }
 
+export function previewDocumentGraphs(documentIds: string[], force = false) {
+  return request<GraphBuildPreview>("/graph/builds/preview", {
+    method: "POST",
+    body: JSON.stringify({ document_ids: documentIds, force }),
+  });
+}
+
+export function createDocumentGraphs(documentIds: string[], force = false) {
+  return request<GraphBuildBatch>("/graph/builds", {
+    method: "POST",
+    body: JSON.stringify({
+      document_ids: documentIds,
+      requested_by: "local-admin",
+      force,
+    }),
+  });
+}
+
 export function getDocumentGraphRuns(
   documentId: string,
   documentVersionId: string,
@@ -438,6 +573,18 @@ export function getDocumentGraphRuns(
 ) {
   return request<GraphExtractionRun[]>(
     `/documents/${documentId}/versions/${documentVersionId}/graph-runs`,
+    undefined,
+    signal,
+  );
+}
+
+export function getDocumentGraph(
+  documentId: string,
+  documentVersionId: string,
+  signal?: AbortSignal,
+) {
+  return request<DocumentGraph>(
+    `/documents/${documentId}/versions/${documentVersionId}/graph`,
     undefined,
     signal,
   );
@@ -631,6 +778,10 @@ export async function streamChat(
 
 export function searchGraph(query: string, signal?: AbortSignal) {
   return request<GraphEntity[]>(`/graph/search?q=${encodeURIComponent(query)}&limit=50`, undefined, signal);
+}
+
+export function listGraphEntities(signal?: AbortSignal) {
+  return request<GraphEntity[]>("/graph/entities?limit=100", undefined, signal);
 }
 
 export function getGraphNeighborhood(entityId: string, signal?: AbortSignal) {

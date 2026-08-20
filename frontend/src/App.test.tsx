@@ -11,6 +11,9 @@ const documentItem = {
   display_name: "企业制度.pdf",
   status: "active",
   current_version_id: "version-1",
+  current_version_status: "ready",
+  graph_status: "succeeded",
+  graph_active: true,
   created_at: "2026-08-17T01:00:00Z",
   updated_at: "2026-08-17T02:00:00Z",
   deleted_at: null,
@@ -73,12 +76,14 @@ function json(value: unknown, status = 200) {
 
 function installFetch() {
   let isDocumentDeleted = false;
+  let qualityReviewAction: "release" | "reject" | null = null;
   vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
     const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
     if (url.endsWith("/system/info")) return json({ name: "Robust RAG", version: "0.1.0", environment: "test" });
-    if (url.endsWith("/health/dependencies")) return json({ database: { status: "ok" }, redis: { status: "ok" }, graph: { status: "disabled", schema_version: "enterprise-core-v1" } });
+    if (url.endsWith("/health/dependencies")) return json({ database: { status: "ok" }, redis: { status: "ok" }, worker: { status: "ok", observability: { status: "ok", flush_ok: true, last_flush_at: "2026-08-20T01:00:00Z", task_name: "graph.extract" } }, graph: { status: "disabled", schema_version: "enterprise-core-v1" } });
     if (url.includes("/system/search-capabilities")) return json({ version: "2.19", plugins: ["knn", "icu"], knn_available: true, icu_available: true, neural_search_available: false });
     if (url.includes("/documents/doc-1/versions/version-1/graph-runs")) return json([{ id: "graph-run-1", document_version_id: "version-1", schema_version: "enterprise-core-v1", extractor_name: "LlamaIndex.SchemaLLMPathExtractor", extractor_version: "llama-schema-v1", model: "test-model", prompt_version: "stage9-extraction-v1", input_hash: "hash", status: "succeeded", parent_count: 3, entity_count: 4, relation_count: 2, artifact_uri: "local://graph.json", error: null }]);
+    if (url.endsWith("/documents/doc-1/versions/version-1/graph")) return json({ document_id: "doc-1", document_version_id: "version-1", parent_count: 3, entities: [entity, organization], facts: [{ id: "fact-1", subject_entity_id: "entity-1", predicate: "PART_OF", object_entity_id: "entity-2", properties_json: {}, origin: "extracted", confidence: 0.91, review_status: "unreviewed", schema_version: "enterprise-core-v1", manual_lock: false, active: true }], evidence: [{ fact_id: "fact-1", source_node_id: "parent-1", document_id: "doc-1", document_version_id: "version-1", source_locators: [{ page_number: 1 }], excerpt: "订单系统属于示例公司。" }] });
     if (url.includes("/documents/doc-1/versions/version-1/canonical/metadata")) return json({ id: "canonical-1", document_version_id: "version-1", title: "企业制度", language: "zh", block_count: 12 });
     if (url.includes("/documents/doc-1/versions/version-1/chunking-runs")) return json([{ id: "chunk-run-1", status: "succeeded", parent_count: 3, child_count: 8, total_tokens: 3200 }]);
     if (url.includes("/documents/doc-1/versions/version-1/parse-runs")) return json([{ id: "parse-1", parser_name: "mineru-precision", parser_version: "1", parser_mode: "precision-cloud", parser_config: {}, status: "succeeded", artifact_uri: "local://parse.json", started_at: "2026-08-17T01:00:00Z", finished_at: "2026-08-17T01:01:00Z", error: null }]);
@@ -90,8 +95,14 @@ function installFetch() {
       return json([{ node_id: "parent-1", node_level: "parent", parent_node_id: null, previous_node_id: null, next_node_id: null, title: "企业制度", heading_path: ["总则"], content: "企业制度分块后的完整父节点正文", retrieval_text: "企业制度\n总则\n企业制度分块后的完整父节点正文", token_count: 800, source_locators_json: [{ page_number: 1 }], source_block_ids: ["block-1"], content_types: ["paragraph"], language: "zh", quality_status: "passed", quality_summary_json: {}, attributes_json: { group_kind: "heading_section" }, embedding_status: "succeeded", index_status: "succeeded" }]);
     }
     if (url.endsWith("/documents/doc-1/versions/version-1/canonical")) return json({ document_id: "doc-1", document_version_id: "version-1", title: "企业制度", language: "zh", metadata: {}, root_node_id: "root", blocks: [{ id: "root", block_type: "document", parent_id: null, semantic_order: 0, heading_path: [], original_text: "", normalized_text: "", source_locators: [], attributes: {}, language: "zh", token_count: 0, quality_status: "unassessed", quality_flags: [] }, { id: "block-1", block_type: "paragraph", parent_id: "root", semantic_order: 1, heading_path: ["总则"], original_text: "  企业制度解析正文  ", normalized_text: "企业制度解析正文", source_locators: [{ page_number: 1 }], attributes: {}, language: "zh", token_count: 10, quality_status: "unassessed", quality_flags: [] }] });
-    if (url.includes("/documents/doc-1/versions")) return json([{ id: "version-1", document_id: "doc-1", version_number: 1, original_filename: "企业制度.pdf", mime_type: "application/pdf", file_size: 2048, status: "ready", uploaded_at: "2026-08-17T01:00:00Z", ready_at: "2026-08-17T02:00:00Z", graph_status: "succeeded", graph_schema_version: "enterprise-core-v1", graph_projected_at: "2026-08-17T02:00:00Z" }]);
-    if (url.includes("/documents/doc-1/quality")) return json([{ id: "qa-1", document_version_id: "version-1", status: "succeeded", decision: "passed", overall_score: 0.92, dimensions_json: [], issues_json: [], evaluator: "quality", engine_version: "1.0", started_at: "2026-08-17T01:00:00Z", finished_at: "2026-08-17T01:01:00Z", error: null }]);
+    if (url.includes("/documents/doc-1/versions")) return json([{ id: "version-1", document_id: "doc-1", version_number: 1, original_filename: "企业制度.pdf", mime_type: "application/pdf", file_size: 2048, status: "ready", uploaded_at: "2026-08-17T01:00:00Z", ready_at: "2026-08-17T02:00:00Z", graph_status: "succeeded", graph_active: true, graph_schema_version: "enterprise-core-v1", graph_projected_at: "2026-08-17T02:00:00Z" }]);
+    if (url.includes("/documents/doc-1/quality/review-actions")) return json(qualityReviewAction ? [{ id: "review-1", document_version_id: "version-1", assessment_id: "qa-1", action: qualityReviewAction, actor: "local-admin", reason: "reviewed", previous_job_status: "quarantined", previous_version_status: "quarantined", previous_decision: "quarantined", created_at: "2026-08-17T01:02:00Z" }] : []);
+    if (url.includes("/documents/doc-1/quality")) return json([{ id: "qa-1", document_version_id: "version-1", status: "succeeded", decision: "quarantined", overall_score: 0.82, dimensions_json: [], issues_json: [{ code: "DUPLICATION_DETECTED", dimension: "duplication", severity: "warning", source: "deterministic", evaluator: "quality", evaluator_version: "1.0", message: "Duplicate content", evidence: [{ metric: "duplicate_block_ratio", value: 0.2, threshold: 0.15, block_ids: ["block-1"], details: {} }], labels: [] }], evaluator: "quality", engine_version: "1.0", started_at: "2026-08-17T01:00:00Z", finished_at: "2026-08-17T01:01:00Z", error: null }]);
+    if (url.endsWith("/documents/doc-1/release") && init?.method === "POST") {
+      qualityReviewAction = "release";
+      return json({ action: { action: "release" }, job: { ...jobItem, status: "pending", current_stage: "chunking" } });
+    }
+    if (url.endsWith("/documents/doc-1") && !init?.method) return json(documentItem);
     if (url.endsWith("/documents/doc-1") && init?.method === "DELETE") {
       isDocumentDeleted = true;
       return json({ document_id: "doc-1", status: "deleted" });
@@ -119,7 +130,10 @@ function installFetch() {
       ].map((event) => `data: ${JSON.stringify(event)}\n\n`).join("") + "data: [DONE]\n\n";
       return Promise.resolve(new Response(new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode(payload)); controller.close(); } }), { status: 200 }));
     }
+    if (url.endsWith("/graph/builds/preview") && init?.method === "POST") return json({ items: [{ document_id: "doc-1", document_version_id: "version-1", display_name: "企业制度.pdf", graph_status: "succeeded", graph_active: true, eligible: true, reason: null, parent_count: 3, estimated_input_tokens: 3200 }], eligible_count: 1, parent_count: 3, estimated_calls: 3, estimated_input_tokens: 3200, estimated_input_cost_usd: 0.001 });
+    if (url.endsWith("/graph/builds") && init?.method === "POST") return json({ batch_id: "batch-1", requests: [{ id: "request-1", status: "pending" }] }, 202);
     if (url.includes("/graph/search")) return json([entity, organization, otherSystem]);
+    if (url.includes("/graph/entities?limit=100")) return json([entity, organization, otherSystem]);
     if (url.includes("/graph/entities/entity-1/neighborhood")) return json({ center: entity, entities: [organization], facts: [{ id: "fact-1", subject_entity_id: "entity-1", predicate: "PART_OF", object_entity_id: "entity-2", properties_json: {}, origin: "extracted", confidence: 0.91, review_status: "unreviewed", schema_version: "enterprise-core-v1", manual_lock: false, active: true }], evidence: [{ fact_id: "fact-1", source_node_id: "node-1", document_id: "doc-1", document_version_id: "version-1", source_locators: [{ page_number: 1 }], excerpt: "订单系统属于示例公司。" }] });
     if (url.includes("/graph/conflicts") && !init?.method) return json([{ id: "conflict-1", extraction_run_id: "run-1", target_type: "fact", target_id: "fact-1", conflict_type: "manual_lock_vs_extraction", current_json: { review_status: "rejected" }, proposed_json: { active: true }, status: "pending", resolution_json: {}, resolved_by: null }]);
     return json({}, 200);
@@ -140,22 +154,30 @@ describe("stage 10 application", () => {
 
   it("filters documents and opens version and quality details", async () => {
     const user = userEvent.setup();
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
     renderApp("/documents");
     await user.type(await screen.findByPlaceholderText("搜索文档名称"), "制度");
     await user.click(screen.getByText("企业制度.pdf").closest("button") as HTMLButtonElement);
     const dialog = await screen.findByRole("dialog", { name: "文档详情" });
-    expect(within(dialog).getByText(/v1 · 企业制度.pdf/)).toBeInTheDocument();
+    const versionCard = within(dialog).getByText(/v1 · 企业制度.pdf/).closest("article") as HTMLElement;
+    expect(within(versionCard).getByText("可检索")).toBeInTheDocument();
+    expect(within(versionCard).getByText("成功")).toBeInTheDocument();
     expect(within(dialog).getByText("综合分")).toBeInTheDocument();
     expect(within(dialog).getByText("图谱生成")).toBeInTheDocument();
     expect(within(dialog).getByText("4")).toBeInTheDocument();
     expect(within(dialog).getByText("处理诊断")).toBeInTheDocument();
     expect(within(dialog).getByText("12")).toBeInTheDocument();
     await user.click(within(dialog).getByRole("button", { name: "重新生成图谱" }));
-    expect(await screen.findByText("图谱抽取任务已进入队列")).toBeInTheDocument();
+    expect(await screen.findByText("已创建 1 个图谱生成任务")).toBeInTheDocument();
     expect(fetch).toHaveBeenCalledWith(
-      expect.stringContaining("/documents/doc-1/graph/rebuild"),
+      expect.stringContaining("/graph/builds/preview"),
       expect.objectContaining({ method: "POST" }),
     );
+    expect(fetch).toHaveBeenCalledWith(
+      expect.stringContaining("/graph/builds"),
+      expect.objectContaining({ method: "POST" }),
+    );
+    confirm.mockRestore();
   });
 
   it("uploads and reprocesses documents from the management page", async () => {
@@ -205,6 +227,35 @@ describe("stage 10 application", () => {
     await user.click(within(debuggerDialog).getByRole("button", { name: /3\. 分块/ }));
     expect(await within(debuggerDialog).findByText("送入图谱模型的完整输入")).toBeInTheDocument();
     expect(within(debuggerDialog).getByText("企业制度分块后的完整父节点正文")).toBeInTheDocument();
+
+    await user.click(within(debuggerDialog).getByRole("button", { name: /4\. 图谱/ }));
+    expect(await within(debuggerDialog).findByText(/订单系统 —PART_OF→ 示例公司/)).toBeInTheDocument();
+    expect(within(debuggerDialog).getByText("订单系统属于示例公司。")).toBeInTheDocument();
+    expect(within(debuggerDialog).getByText("parent-1")).toBeInTheDocument();
+  });
+
+  it("reviews a quarantined document in a dedicated quality workspace", async () => {
+    const user = userEvent.setup();
+    renderApp("/documents/doc-1/quality-review");
+
+    expect(await screen.findByRole("heading", { name: "文档质量审核" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "检测到重复或近似重复内容" })).toBeInTheDocument();
+    expect(screen.getAllByText("20.0%").length).toBeGreaterThan(0);
+    expect(screen.getByText("1 个受影响内容块")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: /在原文中核对/ }));
+    const debuggerDialog = await screen.findByRole("dialog", { name: "文档处理调试器" });
+    expect(await within(debuggerDialog).findByText("仅显示 1 个受影响内容块")).toBeInTheDocument();
+    await user.click(within(debuggerDialog).getByRole("button", { name: "关闭" }));
+
+    await user.click(screen.getByRole("button", { name: "人工放行" }));
+    await user.type(screen.getByLabelText("放行依据"), "抽查重复内容后确认只是模板信息");
+    await user.click(screen.getByRole("button", { name: "确认放行" }));
+    expect(await screen.findByText("文档已人工放行")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "返回文档管理" }));
+    await user.click((await screen.findByText("企业制度.pdf")).closest("button") as HTMLButtonElement);
+    const detail = await screen.findByRole("dialog", { name: "文档详情" });
+    expect(within(detail).getAllByText("已放行").length).toBeGreaterThan(0);
   });
 
   it("retries a failed processing job", async () => {
@@ -244,6 +295,7 @@ describe("stage 10 application", () => {
   it("searches and selects a graph entity", async () => {
     const user = userEvent.setup();
     renderApp("/graph");
+    expect(await screen.findByRole("button", { name: /订单系统/ })).toBeInTheDocument();
     await user.type(await screen.findByPlaceholderText("搜索人员、组织、系统、项目…"), "订单");
     await user.click(screen.getByRole("button", { name: "搜索" }));
     await user.click(await screen.findByRole("button", { name: /订单系统/ }));
@@ -302,6 +354,8 @@ describe("stage 10 application", () => {
     renderApp("/system");
     expect(await screen.findByRole("heading", { name: "系统状态" })).toBeInTheDocument();
     expect(screen.getByText("OpenSearch")).toBeInTheDocument();
+    expect(screen.getByText("Worker Langfuse")).toBeInTheDocument();
+    expect(screen.getByText("graph.extract")).toBeInTheDocument();
     expect(screen.getByText("外部凭据不会发送到浏览器")).toBeInTheDocument();
   });
 });

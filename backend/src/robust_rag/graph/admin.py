@@ -65,6 +65,21 @@ class GraphAdminService:
             self.db.scalars(statement.order_by(GraphEntityRecord.primary_name).limit(limit))
         )
 
+    def list_entities(self, *, entity_type: str | None, limit: int) -> list[GraphEntityRecord]:
+        statement = select(GraphEntityRecord).where(
+            GraphEntityRecord.schema_version == self.schema.version,
+            GraphEntityRecord.review_status != GraphReviewStatus.REJECTED,
+        )
+        if entity_type:
+            if entity_type not in self.schema.entity_types:
+                raise GraphAdminError(
+                    "GRAPH_ENTITY_TYPE_INVALID", "Entity type is outside the schema"
+                )
+            statement = statement.where(GraphEntityRecord.entity_type == entity_type)
+        return list(
+            self.db.scalars(statement.order_by(GraphEntityRecord.primary_name).limit(limit))
+        )
+
     def create_entity(self, request: GraphEntityCreate) -> GraphEntityRecord:
         if request.entity_type not in self.schema.entity_types:
             raise GraphAdminError("GRAPH_ENTITY_TYPE_INVALID", "Entity type is outside the schema")

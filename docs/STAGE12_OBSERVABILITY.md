@@ -44,7 +44,8 @@ LANGFUSE_FLUSH_INTERVAL_SECONDS=5
 - API 接受 `X-Request-ID`，生成稳定的 128-bit `X-Trace-ID`，并在响应头返回两者。
 - HTTP 请求创建 `http.request` 根 Span，结构化日志同时绑定 `request_id` 和 `trace_id`。
 - 入库任务使用 `ingestion:{job_id}` 生成稳定 Trace ID，Worker 日志绑定 `task_id`。
-- 图谱抽取使用 `graph:{document_version_id}`，恢复扫描使用固定恢复 Trace。
+- 图谱抽取使用 `graph-build:{graph_build_request_id}`，恢复扫描使用固定恢复 Trace。
+- 每个 Celery 子进程在 fork 后丢弃继承的 Langfuse 客户端并初始化独立 exporter，避免复用父进程中已经失效的后台线程。
 
 ### 4.2 RAG 与模型
 
@@ -52,11 +53,19 @@ LANGFUSE_FLUSH_INTERVAL_SECONDS=5
 - `retrieval.query_embedding`：Embedding 模型、Token、重试和向量数量。
 - `retrieval.dense`：Dense 命中数与重试。
 - `retrieval.graph`：图谱命中数与回退原因。
+- `llm.text_to_cypher`：Cypher 生成 Prompt、输出、Token、耗时和错误码。
+- `graph.neo4j.explain`：验证后的 Cypher、执行计划和估算行数。
+- `graph.neo4j.query`：实际查询耗时、返回行数和开发环境下的结果详情。
 - `retrieval.rerank`：候选数、结果数、模型、Token 与重试。
 - `llm.query_rewrite`：Prompt 版本、模型、Token、成本、耗时和降级。
 - `llm.rag_generation`：模型、Token、估算成本、总耗时、首 Token 耗时、重试和引用数量。
 
 `ModelInvocation.trace_id` 保存应用 Trace ID；上游 Provider 的 `response_id` 保存在 `response_snapshot`，两者不得混用。
+所有子 Observation 显式继承当前 Observation ID，HTTP Trace 应形成一棵连续的父子树，
+不能为每个阶段生成独立的虚拟父节点。
+流式 SSE 生成使用非上下文绑定的 Langfuse Observation，并显式传递 Trace/Parent Span ID；
+不得让 OpenTelemetry 的 Context Token 跨越同步生成器 `yield`，避免 Starlette 在复制的
+worker Context 中恢复生成器时出现 `Failed to detach context`。
 
 ### 4.3 评测
 
@@ -74,6 +83,10 @@ LANGFUSE_FLUSH_INTERVAL_SECONDS=5
 
 脱敏在应用进程内、数据进入 Langfuse SDK 和日志 Renderer 前执行。浏览器只读取状态、Base URL、采样率、最近 Trace 时间、错误类别和丢弃计数，不读取任何 Langfuse 凭据。
 
+本地开发排障可临时设置 `LANGFUSE_CAPTURE_CONTENT=true`，以查看检索查询、命中详情、
+Text-to-Cypher Prompt/输出及回答正文。共享测试、预发布和生产环境必须恢复为 `false`，
+并清理开发阶段已经上传的不必要 Trace。
+
 ## 6. 健康检查
 
 ```text
@@ -85,7 +98,7 @@ GET /health/observability?remote=true
 ```
 
 - `/health/ready` 只检查业务必需的 PostgreSQL 与 Redis。
-- `/health/dependencies` 返回数据库、Redis、Worker、Beat、队列、Neo4j、Provider 配置和 Langfuse 本地状态。
+- `/health/dependencies` 返回数据库、Redis、Worker、Beat、队列、Neo4j、Provider 配置和 Langfuse 本地状态；`worker.observability` 另行报告最近一次 Worker flush 的任务、时间、结果和安全健康快照，不能再用 API 进程状态代替 Worker 状态。
 - `remote=true` 调用 Langfuse `auth_check`，只用于人工诊断或低频探测，不应作为高频就绪检查。
 - `degraded` 表示观测链路未配置或降级，不能据此摘除仍可提供业务服务的 API 实例。
 
@@ -95,6 +108,8 @@ GET /health/observability?remote=true
 - PostgreSQL 保存最终状态，Celery 消息只携带业务 ID。
 - 恢复扫描使用数据库行锁和 `skip_locked`，避免多个恢复进程重复领取同一批任务。
 - Worker 心跳写入 `robust-rag:worker:last_seen`；Beat 定时探针写入 `robust-rag:beat:last_seen`。
+- 每个 Celery 任务无论成功或失败都会在 `task_postrun` 后有限等待 Langfuse `flush()`，确保 Worker 内的 Trace/Generation 在任务结束后交付；Worker 子进程退出时对已初始化客户端执行一次幂等 `shutdown()`。
+- Worker 最近一次 flush 状态写入带 TTL 的 `robust-rag:worker:observability`，上报失败只产生结构化告警，不改变任务结果或数据库终态。
 - 队列深度达到 `CELERY_QUEUE_WARNING_DEPTH` 后状态变为 `warning`。
 - 所有阶段仍必须幂等；Late Ack 提供重新投递，不提供业务幂等保证。
 
@@ -106,7 +121,8 @@ GET /health/observability?remote=true
 2. 检查 Public Key、Secret Key 和 Base URL 是否从后端环境注入。
 3. 调用 `/health/observability?remote=true` 验证凭据；响应不包含密钥。
 4. 检查本地日志中的 `langfuse_export_degraded`，按 `operation` 和 `error_type` 定位。
-5. Cloud 未恢复前继续以 PostgreSQL、本地日志和评测报告排障，不重跑成功业务只为补 Trace。
+5. 检查 `/health/dependencies` 中的 `worker.observability.flush_ok`、`last_flush_at`、`task_name` 和 `last_error`，区分 API 正常但 Worker exporter 异常的情况。
+6. Cloud 未恢复前继续以 PostgreSQL、本地日志和评测报告排障，不重跑成功业务只为补 Trace。
 
 ### Worker 或 Beat 不可用
 
@@ -147,7 +163,7 @@ pnpm build
 真实 Cloud 验收必须在配置有效凭据后执行：
 
 1. 调用 `/health/observability?remote=true`，期望 `status=ok`。
-2. 发起一次 Chat 和一次小样本评测。
-3. 在 Langfuse 确认 Trace 层级、Generation Token/成本、首 Token 耗时和 Score。
+2. 发起一次 Chat、一次人工图谱生成和一次小样本评测。
+3. 在 Langfuse 确认 `graph.extract` 下存在逐 Parent 的 `llm.graph_extraction` Generation，并核对 Trace 层级、Token/成本、首 Token 耗时和 Score。
 4. 确认 Trace 中不存在完整文档、完整上下文、密钥、Cookie 和连接串。
 5. 临时配置错误 Base URL，确认 Chat、入库和本地评测报告仍成功，仅产生观测降级告警。

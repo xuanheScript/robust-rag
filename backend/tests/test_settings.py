@@ -24,13 +24,32 @@ def test_settings_defaults_are_local_only() -> None:
     assert settings.chunking_child_overlap_tokens == 64
     assert settings.voyage_embedding_model == "voyage-4"
     assert settings.voyage_embedding_dimension == 1024
+    assert settings.voyage_embedding_batch_tokens == 8000
+    assert settings.voyage_embedding_rate_limit_rpm == 3
+    assert settings.voyage_embedding_rate_limit_tpm == 9000
+    assert settings.voyage_embedding_rate_limit_window_seconds == 60
     assert settings.voyage_rerank_model == "rerank-2.5"
     assert settings.opensearch_chunks_index == "rag-chunks-v1"
     assert settings.opensearch_chunks_read_alias == "rag-chunks-read"
     assert settings.retrieval_rrf_rank_constant == 60
     assert settings.retrieval_final_child_top_k == 10
+    assert settings.graph_query_timeout_seconds == 3
+    assert settings.graph_text_to_cypher_timeout_seconds == 8
+    assert settings.graph_extractor_version == "llama-schema-v3"
+    assert settings.graph_prompt_version == "stage9-extraction-v3"
+    assert settings.graph_llm_reasoning_effort == "none"
+    assert settings.graph_llm_max_output_tokens == 8000
+    assert settings.graph_llm_max_retries == 3
+    assert settings.graph_llm_retry_base_seconds == 2
+    assert settings.graph_llm_retry_max_seconds == 15
+    assert settings.graph_max_failed_parent_ratio == 0.2
+    assert settings.graph_run_stale_seconds == 900
+    assert settings.graph_build_max_attempts == 2
     assert settings.llm_base_url == "https://api.openai.com/v1"
     assert settings.llm_model == "gpt-5.4"
+    assert settings.agentic_rag_enabled is False
+    assert settings.agent_graph_version == "stage13-langgraph-agentic-rag-v1"
+    assert settings.agent_reasoning_effort == "none"
     assert settings.langfuse_enabled is True
     assert settings.langfuse_base_url == "https://cloud.langfuse.com"
     assert settings.langfuse_sample_rate == 1.0
@@ -45,6 +64,8 @@ def test_settings_can_be_overridden(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setenv("QUALITY_POLICY_VERSION", "test-quality-v2")
     monkeypatch.setenv("DINGO_ENABLED", "true")
     monkeypatch.setenv("CHUNKING_CHILD_TARGET_TOKENS", "420")
+    monkeypatch.setenv("AGENTIC_RAG_ENABLED", "true")
+    monkeypatch.setenv("AGENT_REASONING_EFFORT", "low")
 
     settings = Settings(_env_file=None)
 
@@ -56,6 +77,8 @@ def test_settings_can_be_overridden(monkeypatch: MonkeyPatch) -> None:
     assert settings.quality_policy_version == "test-quality-v2"
     assert settings.dingo_enabled is True
     assert settings.chunking_child_target_tokens == 420
+    assert settings.agentic_rag_enabled is True
+    assert settings.agent_reasoning_effort == "low"
     assert "secret-token" not in repr(settings)
 
 

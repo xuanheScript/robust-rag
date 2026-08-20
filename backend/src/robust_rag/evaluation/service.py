@@ -636,6 +636,7 @@ def _without_graph(service: Retriever) -> Retriever | None:
         query_rewriter=service.query_rewriter,
         settings=service.settings,
         graph_retriever=None,
+        embedding_rate_limiter=service.embedding_rate_limiter,
         sleeper=service.sleeper,
         jitter=service.jitter,
     )

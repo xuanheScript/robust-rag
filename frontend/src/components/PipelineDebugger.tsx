@@ -7,28 +7,37 @@ import {
   getCleaningReport,
   getDocumentChunkingRuns,
   getDocumentCleaningRuns,
+  getDocumentGraph,
+  getDocumentGraphRuns,
   getDocumentParseRuns,
   getDocumentRetrievalNodes,
   type CanonicalBlockItem,
+  type DocumentGraph,
+  type GraphEntity,
+  type GraphFact,
   type RetrievalNodeItem,
 } from "@/lib/api";
 import { formatDate } from "@/lib/format";
 import { EmptyState, Loading, Modal, StatusBadge } from "@/components/ui";
 
-type DebugStage = "parse" | "clean" | "chunk";
+export type DebugStage = "parse" | "clean" | "chunk" | "graph";
 
 export function PipelineDebugger({
   documentId,
   versionId,
   documentName,
+  initialStage = "parse",
+  focusBlockIds = [],
   onClose,
 }: {
   documentId: string;
   versionId: string;
   documentName: string;
+  initialStage?: DebugStage;
+  focusBlockIds?: string[];
   onClose: () => void;
 }) {
-  const [stage, setStage] = useState<DebugStage>("parse");
+  const [stage, setStage] = useState<DebugStage>(initialStage);
   const parseRuns = useQuery({
     queryKey: ["pipeline-debug-parse-runs", documentId, versionId],
     queryFn: ({ signal }) => getDocumentParseRuns(documentId, versionId, signal),
@@ -40,6 +49,10 @@ export function PipelineDebugger({
   const chunkingRuns = useQuery({
     queryKey: ["pipeline-debug-chunking-runs", documentId, versionId],
     queryFn: ({ signal }) => getDocumentChunkingRuns(documentId, versionId, signal),
+  });
+  const graphRuns = useQuery({
+    queryKey: ["pipeline-debug-graph-runs", documentId, versionId],
+    queryFn: ({ signal }) => getDocumentGraphRuns(documentId, versionId, signal),
   });
 
   return (
@@ -71,11 +84,19 @@ export function PipelineDebugger({
             status={chunkingRuns.data?.[0]?.status}
             onClick={() => setStage("chunk")}
           />
+          <StageTab
+            active={stage === "graph"}
+            label="4. 图谱"
+            summary={`${graphRuns.data?.[0]?.entity_count ?? "—"} 实体 / ${graphRuns.data?.[0]?.relation_count ?? "—"} 关系`}
+            status={graphRuns.data?.[0]?.status}
+            onClick={() => setStage("graph")}
+          />
         </nav>
         <main className="debugger-stage-content">
           {stage === "parse" ? <ParseDebugger documentId={documentId} versionId={versionId} /> : null}
-          {stage === "clean" ? <CleaningDebugger documentId={documentId} versionId={versionId} /> : null}
+          {stage === "clean" ? <CleaningDebugger documentId={documentId} versionId={versionId} focusBlockIds={focusBlockIds} /> : null}
           {stage === "chunk" ? <ChunkDebugger documentId={documentId} versionId={versionId} /> : null}
+          {stage === "graph" ? <GraphDebugger documentId={documentId} versionId={versionId} /> : null}
         </main>
       </div>
     </Modal>
@@ -159,8 +180,9 @@ function ParseDebugger({ documentId, versionId }: { documentId: string; versionI
   );
 }
 
-function CleaningDebugger({ documentId, versionId }: { documentId: string; versionId: string }) {
+function CleaningDebugger({ documentId, versionId, focusBlockIds }: { documentId: string; versionId: string; focusBlockIds: string[] }) {
   const [query, setQuery] = useState("");
+  const [showFocusedOnly, setShowFocusedOnly] = useState(focusBlockIds.length > 0);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const runs = useQuery({
     queryKey: ["pipeline-debug-cleaning-runs", documentId, versionId],
@@ -181,10 +203,11 @@ function CleaningDebugger({ documentId, versionId }: { documentId: string; versi
     queryFn: ({ signal }) => getCleaningReport(documentId, versionId, latestRun?.id ?? "", signal),
     enabled: Boolean(latestRun?.id),
   });
-  const blocks = useMemo(
-    () => filterBlocks(cleaned.data?.blocks ?? [], query, "all"),
-    [cleaned.data?.blocks, query],
-  );
+  const focusBlockIdSet = useMemo(() => new Set(focusBlockIds), [focusBlockIds]);
+  const blocks = useMemo(() => {
+    const filtered = filterBlocks(cleaned.data?.blocks ?? [], query, "all");
+    return showFocusedOnly ? filtered.filter((block) => focusBlockIdSet.has(block.id)) : filtered;
+  }, [cleaned.data?.blocks, focusBlockIdSet, query, showFocusedOnly]);
   useSelectFirst(
     blocks,
     selectedId,
@@ -229,6 +252,14 @@ function CleaningDebugger({ documentId, versionId }: { documentId: string; versi
       </details>
       <div className="debug-browser">
         <aside className="debug-list-pane">
+          {focusBlockIds.length ? (
+            <div className="debug-focus-filter">
+              <span>{showFocusedOnly ? `仅显示 ${blocks.length} 个受影响内容块` : "正在显示全部内容块"}</span>
+              <button onClick={() => { setQuery(""); setShowFocusedOnly((value) => !value); }}>
+                {showFocusedOnly ? "查看全部" : "只看受影响内容"}
+              </button>
+            </div>
+          ) : null}
           <div className="debug-filter-row single">
             <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索清洗后文本或块 ID" />
           </div>
@@ -338,6 +369,148 @@ function ChunkDebugger({ documentId, versionId }: { documentId: string; versionI
           ) : <NoSelection />}
         </section>
       </div>
+    </div>
+  );
+}
+
+function GraphDebugger({ documentId, versionId }: { documentId: string; versionId: string }) {
+  const [mode, setMode] = useState<"relations" | "entities">("relations");
+  const [selectedFactId, setSelectedFactId] = useState<string | null>(null);
+  const [selectedEntityId, setSelectedEntityId] = useState<string | null>(null);
+  const graph = useQuery({
+    queryKey: ["pipeline-debug-graph", documentId, versionId],
+    queryFn: ({ signal }) => getDocumentGraph(documentId, versionId, signal),
+  });
+  const facts = graph.data?.facts ?? [];
+  const entities = graph.data?.entities ?? [];
+  useSelectFirst(facts, selectedFactId, setSelectedFactId, (fact) => fact.id);
+  useSelectFirst(entities, selectedEntityId, setSelectedEntityId, (entity) => entity.id);
+  const selectedFact = facts.find((fact) => fact.id === selectedFactId) ?? null;
+  const selectedEntity = entities.find((entity) => entity.id === selectedEntityId) ?? null;
+
+  if (graph.isPending) return <Loading label="正在加载文档图谱产物" />;
+  if (graph.isError) return <StageError message={graph.error.message} />;
+  if (!graph.data) return <EmptyState title="没有图谱产物" detail="当前版本尚未生成可查看的图谱。" />;
+  return (
+    <div className="debug-stage-stack">
+      <section className="debug-run-summary">
+        <Metric label="输入 Parent" value={graph.data.parent_count} />
+        <Metric label="实体" value={entities.length} />
+        <Metric label="去重关系" value={facts.length} />
+        <Metric label="来源证据" value={graph.data.evidence.length} />
+      </section>
+      <div className="debug-browser">
+        <aside className="debug-list-pane">
+          <div className="debug-node-controls">
+            <div className="segmented" aria-label="图谱产物类型">
+              <button className={mode === "relations" ? "active" : ""} onClick={() => setMode("relations")}>关系（{facts.length}）</button>
+              <button className={mode === "entities" ? "active" : ""} onClick={() => setMode("entities")}>实体（{entities.length}）</button>
+            </div>
+            <small>只有形成事实的 Parent 会产生证据；全部 {graph.data.parent_count} 个 Parent 可在“3. 分块”逐条查看。</small>
+          </div>
+          {mode === "relations" ? (
+            <GraphFactList
+              facts={facts}
+              entities={entities}
+              selectedId={selectedFactId}
+              onSelect={setSelectedFactId}
+            />
+          ) : (
+            <GraphEntityList
+              entities={entities}
+              selectedId={selectedEntityId}
+              onSelect={setSelectedEntityId}
+            />
+          )}
+        </aside>
+        <section className="debug-inspector-pane">
+          {mode === "relations" ? (
+            selectedFact ? <GraphFactInspector graph={graph.data} fact={selectedFact} /> : <NoSelection />
+          ) : selectedEntity ? (
+            <GraphEntityInspector graph={graph.data} entity={selectedEntity} />
+          ) : <NoSelection />}
+        </section>
+      </div>
+    </div>
+  );
+}
+
+function GraphFactList({ facts, entities, selectedId, onSelect }: { facts: GraphFact[]; entities: GraphEntity[]; selectedId: string | null; onSelect: (id: string) => void }) {
+  if (!facts.length) return <EmptyState title="没有关系" detail="该文档没有形成符合当前 Schema 的关系。" />;
+  const names = new Map(entities.map((entity) => [entity.id, entity.primary_name]));
+  return (
+    <div className="debug-item-list graph-debug-list">
+      {facts.map((fact) => (
+        <button key={fact.id} className={selectedId === fact.id ? "active" : ""} onClick={() => onSelect(fact.id)}>
+          <span><StatusBadge value={fact.predicate} /><small>{fact.origin}</small></span>
+          <strong>{names.get(fact.subject_entity_id) ?? "?"} → {names.get(fact.object_entity_id) ?? "?"}</strong>
+          <code>{fact.id.slice(0, 12)}</code>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function GraphEntityList({ entities, selectedId, onSelect }: { entities: GraphEntity[]; selectedId: string | null; onSelect: (id: string) => void }) {
+  if (!entities.length) return <EmptyState title="没有实体" detail="该文档没有形成符合当前 Schema 的实体。" />;
+  return (
+    <div className="debug-item-list graph-debug-list">
+      {entities.map((entity) => (
+        <button key={entity.id} className={selectedId === entity.id ? "active" : ""} onClick={() => onSelect(entity.id)}>
+          <span><StatusBadge value={entity.entity_type} /><small>{entity.origin}</small></span>
+          <strong>{entity.primary_name}</strong>
+          <code>{entity.id.slice(0, 12)}</code>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function GraphFactInspector({ graph, fact }: { graph: DocumentGraph; fact: GraphFact }) {
+  const subject = graph.entities.find((entity) => entity.id === fact.subject_entity_id);
+  const object = graph.entities.find((entity) => entity.id === fact.object_entity_id);
+  const evidence = graph.evidence.filter((value) => value.fact_id === fact.id);
+  return (
+    <div className="block-inspector graph-debug-inspector">
+      <InspectorHeader title={`${subject?.primary_name ?? "?"} —${fact.predicate}→ ${object?.primary_name ?? "?"}`} id={fact.id} badges={[fact.origin, fact.review_status]} />
+      <section className="debug-kv-grid">
+        <span><small>关系类型</small><strong>{fact.predicate}</strong></span>
+        <span><small>置信度</small><strong>{fact.confidence == null ? "—" : `${Math.round(fact.confidence * 100)}%`}</strong></span>
+        <span><small>Schema</small><strong>{fact.schema_version}</strong></span>
+        <span><small>证据数</small><strong>{evidence.length}</strong></span>
+      </section>
+      <JsonArtifact title="关系属性" value={fact.properties_json ?? fact.properties ?? {}} />
+      {evidence.length ? evidence.map((source, index) => (
+        <section className="graph-debug-evidence" key={`${source.source_node_id}-${index}`}>
+          <TextArtifact title={`证据 ${index + 1} · ${sourceLabels(source.source_locators).join("；") || "位置未标注"}`} text={source.excerpt} />
+          <dl><dt>Parent Node</dt><dd><code>{source.source_node_id}</code></dd></dl>
+          <JsonArtifact title="来源定位" value={source.source_locators} />
+        </section>
+      )) : <EmptyState title="没有来源证据" detail="这可能是一条人工创建的关系。" />}
+    </div>
+  );
+}
+
+function GraphEntityInspector({ graph, entity }: { graph: DocumentGraph; entity: GraphEntity }) {
+  const relatedFacts = graph.facts.filter(
+    (fact) => fact.subject_entity_id === entity.id || fact.object_entity_id === entity.id,
+  );
+  const names = new Map(graph.entities.map((value) => [value.id, value.primary_name]));
+  return (
+    <div className="block-inspector graph-debug-inspector">
+      <InspectorHeader title={entity.primary_name} id={entity.id} badges={[entity.entity_type, entity.review_status]} />
+      <section className="debug-kv-grid">
+        <span><small>类型</small><strong>{entity.entity_type}</strong></span>
+        <span><small>来源</small><strong>{entity.origin}</strong></span>
+        <span><small>Schema</small><strong>{entity.schema_version}</strong></span>
+        <span><small>相关关系</small><strong>{relatedFacts.length}</strong></span>
+      </section>
+      <JsonArtifact title="别名" value={entity.aliases_json ?? entity.aliases ?? []} />
+      <JsonArtifact title="实体属性" value={entity.properties_json ?? entity.properties ?? {}} />
+      <section className="graph-debug-related">
+        <h4>相关关系</h4>
+        {relatedFacts.map((fact) => <p key={fact.id}>{names.get(fact.subject_entity_id) ?? "?"} <b>{fact.predicate}</b> {names.get(fact.object_entity_id) ?? "?"}</p>)}
+      </section>
     </div>
   );
 }

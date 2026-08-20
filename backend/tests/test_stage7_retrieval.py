@@ -1,5 +1,7 @@
 import json
 import uuid
+from collections.abc import Callable
+from threading import Event
 from typing import cast
 
 import httpx
@@ -13,7 +15,8 @@ from robust_rag.core.settings import Settings
 from robust_rag.db.enums import RetrievalMode, RetrievalTraceStatus
 from robust_rag.db.models import RetrievalTrace
 from robust_rag.indexing.embedding import EmbeddingAdapterError, EmbeddingResponse
-from robust_rag.indexing.opensearch import MemoryOpenSearchAdapter, SearchHit
+from robust_rag.indexing.opensearch import MemoryOpenSearchAdapter, OpenSearchAdapter, SearchHit
+from robust_rag.indexing.rate_limit import VoyageRateLimiter
 from robust_rag.indexing.service import IndexingService
 from robust_rag.retrieval.context import assemble_context
 from robust_rag.retrieval.fusion import diversify_candidates, reciprocal_rank_fusion
@@ -72,6 +75,42 @@ class FakeRerankAdapter:
         )
 
 
+class QueryRateLimiter:
+    def __init__(self, wait_seconds: float) -> None:
+        self.wait_seconds = wait_seconds
+        self.reservations: list[int] = []
+
+    def reserve(self, estimated_tokens: int) -> float:
+        self.reservations.append(estimated_tokens)
+        return self.wait_seconds
+
+
+class ParallelProbeEmbeddingAdapter(FakeQueryEmbeddingAdapter):
+    def __init__(self, started: Event) -> None:
+        super().__init__()
+        self.started = started
+
+    def embed(self, texts: list[str], *, input_type: str) -> EmbeddingResponse:
+        self.started.set()
+        return super().embed(texts, input_type=input_type)
+
+
+class ParallelProbeSearchAdapter:
+    def __init__(self, delegate: MemoryOpenSearchAdapter, embedding_started: Event) -> None:
+        self.delegate = delegate
+        self.embedding_started = embedding_started
+        self.observed_parallel_start = False
+
+    def search_bm25_hits(self, alias: str, query: str, size: int = 10) -> list[SearchHit]:
+        self.observed_parallel_start = self.embedding_started.wait(timeout=1)
+        if not self.observed_parallel_start:
+            raise AssertionError("dense pipeline did not start while BM25 was running")
+        return self.delegate.search_bm25_hits(alias, query, size)
+
+    def search_dense_hits(self, alias: str, vector: list[float], size: int = 10) -> list[SearchHit]:
+        return self.delegate.search_dense_hits(alias, vector, size)
+
+
 def _retrieval_settings() -> Settings:
     return _stage6_settings().model_copy(
         update={
@@ -108,10 +147,12 @@ def _ready_search_fixture(
 
 def _retrieval_service(
     session_factory: sessionmaker[Session],
-    search_adapter: MemoryOpenSearchAdapter,
+    search_adapter: OpenSearchAdapter,
     *,
     embedding: FakeQueryEmbeddingAdapter | None = None,
     reranker: FakeRerankAdapter | None = None,
+    embedding_rate_limiter: VoyageRateLimiter | None = None,
+    sleeper: Callable[[float], None] = lambda _delay: None,
 ) -> RetrievalService:
     return RetrievalService(
         session_factory=session_factory,
@@ -120,7 +161,8 @@ def _retrieval_service(
         rerank_adapter=reranker or FakeRerankAdapter(),
         query_rewriter=IdentityQueryRewriter(),
         settings=_retrieval_settings(),
-        sleeper=lambda _delay: None,
+        embedding_rate_limiter=embedding_rate_limiter,
+        sleeper=sleeper,
         jitter=lambda: 0,
     )
 
@@ -365,6 +407,52 @@ def test_all_retrieval_modes_and_debug_trace_are_independently_runnable(
     )
     assert empty_query.status_code == 422
     assert empty_query.json()["error"]["code"] == "QUERY_EMPTY"
+
+
+def test_query_embedding_uses_the_shared_voyage_budget(
+    session_factory: sessionmaker[Session],
+) -> None:
+    limiter = QueryRateLimiter(12)
+    slept: list[float] = []
+    embedding = FakeQueryEmbeddingAdapter()
+    service = _retrieval_service(
+        session_factory,
+        MemoryOpenSearchAdapter(),
+        embedding=embedding,
+        embedding_rate_limiter=limiter,
+        sleeper=slept.append,
+    )
+
+    response, retries = service._embed_query_with_retry("shared Voyage budget")
+
+    assert response.total_tokens == 4
+    assert retries == 0
+    assert limiter.reservations == [5]
+    assert slept == [12]
+    assert embedding.calls == [(["shared Voyage budget"], "query")]
+
+
+def test_hybrid_runs_bm25_and_dense_pipeline_in_parallel(
+    session_factory: sessionmaker[Session], storage: LocalFileStorage
+) -> None:
+    _, _, delegate = _ready_search_fixture(session_factory, storage)
+    embedding_started = Event()
+    search_adapter = ParallelProbeSearchAdapter(delegate, embedding_started)
+    service = _retrieval_service(
+        session_factory,
+        cast(OpenSearchAdapter, search_adapter),
+        embedding=ParallelProbeEmbeddingAdapter(embedding_started),
+    )
+
+    response = service.search(
+        RetrievalSearchRequest(query="Policy", mode=RetrievalMode.HYBRID_RERANK)
+    )
+
+    assert search_adapter.observed_parallel_start is True
+    assert response.children
+    assert cast(float, response.latency_ms["lexical_dense_fanout"]) >= 0
+    assert cast(float, response.latency_ms["parallel_savings_estimate"]) >= 0
+    assert cast(float, response.latency_ms["dense_pipeline"]) >= 0
 
 
 def test_rerank_failure_degrades_but_dense_failure_is_audited(

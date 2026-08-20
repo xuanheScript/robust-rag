@@ -32,6 +32,15 @@ ObservationType = Literal[
 ]
 
 _current_trace_id: ContextVar[str | None] = ContextVar("robust_rag_trace_id", default=None)
+_current_observation_id: ContextVar[str | None] = ContextVar(
+    "robust_rag_observation_id", default=None
+)
+_current_observation_trace_id: ContextVar[str | None] = ContextVar(
+    "robust_rag_observation_trace_id", default=None
+)
+_current_trace_output: ContextVar[dict[str, object] | None] = ContextVar(
+    "robust_rag_trace_output", default=None
+)
 _sensitive_key = re.compile(
     r"(^|_)(authorization|cookie|set_cookie|password|passwd|secret|secret_key|api_key|access_token|refresh_token|database_url|redis_url|connection_string)($|_)",
     re.IGNORECASE,
@@ -58,6 +67,38 @@ def bind_trace_id(trace_id: str) -> Token[str | None]:
 
 def reset_trace_id(token: Token[str | None]) -> None:
     _current_trace_id.reset(token)
+
+
+def bind_trace_output(output: dict[str, object]) -> Token[dict[str, object] | None]:
+    """Bind a mutable request-level output collected across copied stream contexts."""
+
+    return _current_trace_output.set(output)
+
+
+def update_trace_output(**values: object) -> None:
+    """Add safe business output to the current root trace when one is active."""
+
+    output = _current_trace_output.get()
+    if output is not None:
+        output.update(values)
+
+
+def reset_trace_output(token: Token[dict[str, object] | None]) -> None:
+    _current_trace_output.reset(token)
+
+
+def _reset_observation_context_safely(
+    variable: ContextVar[str | None], token: Token[str | None]
+) -> None:
+    """Ignore teardown in a different async/thread context after a streamed yield."""
+
+    try:
+        variable.reset(token)
+    except ValueError:
+        # Starlette resumes synchronous streaming generators in copied worker contexts.
+        # The original context is discarded after that iterator step, so no cleanup is
+        # required in the new context and the business response must keep streaming.
+        return
 
 
 def _normalize_trace_id(value: str) -> str:
@@ -158,8 +199,13 @@ class Observation:
     def __init__(self, service: ObservabilityService, raw: Any | None, trace_id: str) -> None:
         self._service = service
         self._raw = raw
+        self._has_status_message = False
         self.trace_id = trace_id
         self.id = str(getattr(raw, "id", "")) or None
+
+    @property
+    def has_status_message(self) -> bool:
+        return self._has_status_message
 
     def update(
         self,
@@ -168,6 +214,7 @@ class Observation:
         metadata: Mapping[str, object] | None = None,
         level: Literal["DEBUG", "DEFAULT", "WARNING", "ERROR"] | None = None,
         status_message: str | None = None,
+        completion_start_time: datetime | None = None,
         usage_details: Mapping[str, int] | None = None,
         cost_details: Mapping[str, float] | None = None,
     ) -> None:
@@ -182,6 +229,9 @@ class Observation:
             payload["level"] = level
         if status_message is not None:
             payload["status_message"] = str(sanitize_payload(status_message))
+            self._has_status_message = True
+        if completion_start_time is not None:
+            payload["completion_start_time"] = completion_start_time
         if usage_details is not None:
             payload["usage_details"] = dict(usage_details)
         if cost_details is not None:
@@ -264,15 +314,22 @@ class ObservabilityService:
         model: str | None = None,
         model_parameters: Mapping[str, str | int | float | bool | list[str] | None] | None = None,
     ) -> Iterator[Observation]:
-        resolved_trace_id = _normalize_trace_id(trace_id or current_trace_id() or name)
+        resolved_trace_id = _normalize_trace_id(
+            trace_id or _current_observation_trace_id.get() or current_trace_id() or name
+        )
         if self._client is None:
             yield Observation(self, None, resolved_trace_id)
             return
-        manager: Any | None = None
         raw: Any | None = None
+        observation_token: Token[str | None] | None = None
+        observation_trace_token: Token[str | None] | None = None
         try:
-            manager = cast(Any, self._client).start_as_current_observation(
-                trace_context={"trace_id": resolved_trace_id},
+            trace_context = {"trace_id": resolved_trace_id}
+            parent_observation_id = _current_observation_id.get()
+            if parent_observation_id:
+                trace_context["parent_span_id"] = parent_observation_id
+            raw = cast(Any, self._client).start_observation(
+                trace_context=trace_context,
                 name=name,
                 as_type=as_type,
                 input=self.prepare_content(input),
@@ -281,7 +338,6 @@ class ObservabilityService:
                 model=model,
                 model_parameters=dict(model_parameters) if model_parameters else None,
             )
-            raw = manager.__enter__()
             with self._lock:
                 self._last_trace_at = datetime.now(UTC)
         except Exception as exc:
@@ -290,16 +346,25 @@ class ObservabilityService:
             return
 
         observation = Observation(self, raw, resolved_trace_id)
+        observation_trace_token = _current_observation_trace_id.set(resolved_trace_id)
+        if observation.id:
+            observation_token = _current_observation_id.set(observation.id)
         try:
             yield observation
         except BaseException as exc:
-            observation.update(level="ERROR", status_message=type(exc).__name__)
+            observation.update(
+                level="ERROR",
+                status_message=None if observation.has_status_message else type(exc).__name__,
+            )
             raise
         finally:
-            try:
-                manager.__exit__(None, None, None)
-            except Exception as exc:
-                self._record_failure("span_end", exc)
+            if observation_token is not None:
+                _reset_observation_context_safely(_current_observation_id, observation_token)
+            if observation_trace_token is not None:
+                _reset_observation_context_safely(
+                    _current_observation_trace_id, observation_trace_token
+                )
+            self.safe_call("span_end", raw.end)
 
     def safe_call(self, operation: str, function: Any, **kwargs: object) -> None:
         try:
@@ -397,9 +462,29 @@ class ObservabilityService:
         return value.isoformat() if value else None
 
 
+_initialized_observability_service: ObservabilityService | None = None
+
+
 @lru_cache(maxsize=1)
 def get_observability_service() -> ObservabilityService:
-    return ObservabilityService(get_settings())
+    global _initialized_observability_service
+    service = ObservabilityService(get_settings())
+    _initialized_observability_service = service
+    return service
+
+
+def get_initialized_observability_service() -> ObservabilityService | None:
+    """Return the process-local client without creating one during shutdown."""
+
+    return _initialized_observability_service
+
+
+def reset_observability_service_after_fork() -> None:
+    """Discard an inherited SDK client so every Worker child owns its exporter threads."""
+
+    global _initialized_observability_service
+    get_observability_service.cache_clear()
+    _initialized_observability_service = None
 
 
 @contextmanager

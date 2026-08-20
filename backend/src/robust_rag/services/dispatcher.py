@@ -9,7 +9,7 @@ class JobDispatcher(Protocol):
 
 
 class GraphExtractionDispatcher(Protocol):
-    def dispatch(self, document_version_id: uuid.UUID, *, force: bool = False) -> str: ...
+    def dispatch(self, graph_build_request_id: uuid.UUID) -> str: ...
 
 
 class CeleryJobDispatcher:
@@ -21,10 +21,10 @@ class CeleryJobDispatcher:
 
 
 class CeleryGraphExtractionDispatcher:
-    def dispatch(self, document_version_id: uuid.UUID, *, force: bool = False) -> str:
+    def dispatch(self, graph_build_request_id: uuid.UUID) -> str:
         from robust_rag.workers.tasks import extract_graph
 
-        result = extract_graph.delay(str(document_version_id), force=force)
+        result = extract_graph.delay(str(graph_build_request_id))
         return str(result.id)
 
 

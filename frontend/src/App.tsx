@@ -5,6 +5,7 @@ import { DashboardPage } from "@/pages/DashboardPage";
 import { DocumentsPage } from "@/pages/DocumentsPage";
 import { GraphPage } from "@/pages/GraphPage";
 import { JobsPage } from "@/pages/JobsPage";
+import { QualityReviewPage } from "@/pages/QualityReviewPage";
 import { SystemPage } from "@/pages/SystemPage";
 
 const ChatPage = lazy(() => import("@/pages/ChatPage").then((module) => ({ default: module.ChatPage })));
@@ -62,6 +63,7 @@ export default function App() {
         <Route index element={<Navigate to="/overview" replace />} />
         <Route path="/overview" element={<DashboardPage />} />
         <Route path="/documents" element={<DocumentsPage />} />
+        <Route path="/documents/:documentId/quality-review" element={<QualityReviewPage />} />
         <Route path="/jobs" element={<JobsPage />} />
         <Route path="/chat" element={<ChatRoute />} />
         <Route path="/chat/:conversationId" element={<ChatRoute />} />

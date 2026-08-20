@@ -31,6 +31,7 @@
 - 支持企业常见文件上传、解析、质量检查、索引和问答。
 - 支持中文、英文及中英混合文档与问题。
 - 上传文件完成处理后自动变为可检索状态，无需人工重建索引。
+- 知识图谱属于高成本可选增强：文档入库不自动构建，管理员按文档选择、查看调用量与成本预估并确认后才启动。
 - 回答严格基于企业知识库内容，并提供可验证的来源引用。
 - 对解析失败、质量异常、检索失败和模型调用失败提供可解释状态与恢复能力。
 - 通过黄金测试集和可重复评测衡量每次算法、模型和参数变更。
@@ -259,6 +260,7 @@ sha256
 storage_uri
 status
 graph_status
+graph_active
 uploaded_at
 ready_at
 superseded_at
@@ -402,12 +404,47 @@ trace_id
 created_at
 ```
 
-### 7.11 GraphExtractionRun
+### 7.11 GraphBuildRequest
+
+记录一次由管理员明确发起的图谱生成授权及其完整生命周期：
+
+```text
+graph_build_request_id
+batch_id
+document_id
+document_version_id
+request_type
+status
+requested_by
+idempotency_key
+force
+projection_was_active
+celery_task_id
+parent_count
+estimated_input_tokens
+estimated_input_cost_usd
+actual_input_tokens
+actual_output_tokens
+actual_total_tokens
+actual_cost_usd
+attempt
+max_attempts
+previous_graph_status
+error
+requested_at
+started_at
+finished_at
+```
+
+请求状态为 `PENDING / RUNNING / SUCCEEDED / FAILED / CANCELLED`。只有持久化且仍为 `PENDING` 的请求可以进入 LLM；重复投递、目标版本变化和文档删除不得产生新的付费调用。
+
+### 7.12 GraphExtractionRun
 
 记录某个文档版本的图谱抽取与投影状态：
 
 ```text
 graph_extraction_run_id
+graph_build_request_id
 document_version_id
 schema_version
 extractor_name
@@ -425,7 +462,7 @@ finished_at
 
 完整抽取产物保存在文件存储，PostgreSQL 保存状态与定位信息，Neo4j 只保存当前查询投影。
 
-### 7.12 GraphEntityRecord
+### 7.13 GraphEntityRecord
 
 保存跨文档稳定的实体身份、规范名称和别名：
 
@@ -445,7 +482,7 @@ updated_at
 
 实体规范化和人工合并以 `entity_id` 为稳定身份；名称、别名或显示语言变化不应创建新的业务实体。
 
-### 7.13 GraphFactRecord
+### 7.14 GraphFactRecord
 
 为每条自动抽取或人工确认的图谱事实保存稳定身份和来源证据：
 
@@ -469,7 +506,7 @@ updated_at
 
 同一实体或关系可以由多个来源共同支撑；删除一个文档版本时只移除该版本的证据，不得误删仍被其他来源或人工事实支撑的关系。
 
-### 7.14 GraphCorrectionAudit
+### 7.15 GraphCorrectionAudit
 
 记录图谱管理后台的新增、修改、合并、拆分、确认和驳回操作。至少保存操作类型、变更前后快照、原因、时间和关联事实。第一阶段没有登录系统时，操作者使用本机管理员标识；未来接入认证后迁移为真实用户 ID。
 
@@ -687,8 +724,9 @@ stateDiagram-v2
 - 新版本 READY 前，旧 READY 版本继续可检索。
 - 新版本成功后原子切换当前版本并移除旧版本检索投影。
 - 处理中间状态不能产生部分可检索数据。
-- OpenSearch 主检索投影成功后文档可以进入 READY；图谱使用独立的 `graph_status` 异步构建，不阻塞基础检索。
-- 只有 `graph_status=READY` 的当前文档版本可以进入图谱问答；其他状态自动回退 OpenSearch。
+- OpenSearch 主检索投影成功后文档可以进入 READY；入库流程到此结束，不自动创建图谱任务。
+- 管理员只能为当前 `READY` 版本人工创建图谱任务。`graph_active=true` 的投影可以进入图谱问答；其他文档仍可通过 OpenSearch 服务。
+- Agent 选择关系检索工具后直接查询全局有效图谱，不增加文档覆盖率或图谱数量预查询；未人工生成的文档自然不会向 Neo4j 提供证据。
 - 图谱抽取与写入必须按文档版本原子切换，不能让半成品关系进入在线查询。
 
 ### 10.2 幂等性
@@ -711,21 +749,20 @@ stateDiagram-v2
 
 ```mermaid
 stateDiagram-v2
-    [*] --> NOT_SCHEDULED
-    NOT_SCHEDULED --> PENDING: document READY
-    PENDING --> EXTRACTING
-    EXTRACTING --> PROJECTING
-    PROJECTING --> READY
-    EXTRACTING --> FAILED
-    PROJECTING --> FAILED
-    FAILED --> PENDING: retry
-    READY --> STALE: document/config/schema changed
-    STALE --> PENDING: rebuild
-    READY --> HIDDEN: document deleted
-    HIDDEN --> PENDING: restore
+    [*] --> NOT_REQUESTED
+    NOT_REQUESTED --> PENDING: admin generate
+    PENDING --> RUNNING: worker accepts persisted request
+    RUNNING --> SUCCEEDED: extraction and projection committed
+    RUNNING --> FAILED: extraction or projection failed
+    FAILED --> PENDING: admin retry
+    SUCCEEDED --> PENDING: admin rebuild
+    SUCCEEDED --> STALE: version/content/config changed
+    STALE --> PENDING: admin rebuild
+    SUCCEEDED --> HIDDEN: document deleted
+    HIDDEN --> SUCCEEDED: restore existing evidence
 ```
 
-`graph_status` 不复用主入库 `status`。只有图谱自身完成原子投影后才进入 `READY`；任何失败都保留错误和上一次可用投影信息。
+`graph_status` 不复用主入库 `status`，也不使用主流程的 `READY`。只有图谱自身完成原子投影后才进入 `SUCCEEDED`。`graph_active` 与最近一次执行状态分离：强制重建失败时可以保留上一次可用投影，同时把最新请求标为 `FAILED`。任务目标在排队或执行期间失效时，`GraphBuildRequest` 转为 `CANCELLED`，投影状态按实际情况回到 `NOT_REQUESTED`、`STALE` 或 `HIDDEN`。
 
 ---
 
@@ -1029,6 +1066,8 @@ document_updated_at: date
 
 抽取输入以 Parent 为主要语义单元，必要时携带标题路径、相邻 Child 和表头上下文。不得把整份长文档无边界地交给抽取模型。抽取使用后端配置的 Responses-compatible LLM API 与模型，并记录 Provider、模型、Prompt、Schema、输入哈希、Token、耗时和原始结果位置。
 
+图谱构建采用人工选择模式：文档完成 OpenSearch 索引后保持 `NOT_REQUESTED`，管理端允许勾选一个或多个当前 `READY` 文档；提交前先返回符合质量门禁的 Parent 数、估算输入 Token 与可选费用。用户确认后才持久化 `GraphBuildRequest` 并投递任务。批次中的每份文档独立记录 `GENERATE / REBUILD / RETRY` 类型和状态，单份失败不丢失其他请求的审计结果。
+
 ### 16.3 图谱投影与来源证据
 
 Neo4j 至少表达以下逻辑对象：
@@ -1110,8 +1149,10 @@ Text-to-Cypher 不是数据库直通能力，第一阶段必须满足：
 
 - OpenSearch 是主检索路径，图谱是独立最终一致的增强投影。
 - 文档 READY 与 `graph_status` 分离；图谱失败可重试，不把已经可检索的文档回退为不可用。
-- 新文档版本的图谱完成后再原子切换在线版本，旧版本在切换前继续服务。
-- 软删除文档时同时从在线图谱隐藏其证据；恢复时重新投影。
+- 新文档版本进入 READY 后不会自动生成图谱；旧版本图谱随版本切换失效，新版本需要管理员再次选择生成。
+- 强制重建采用原子投影；失败时保留原有可用投影，并通过 `graph_active` 与最新请求状态同时表达。
+- 软删除文档时同时从在线图谱隐藏其证据；恢复时若证据仍在则直接恢复投影，不产生新的 LLM 调用。
+- 排队或执行中的请求遇到删除、重新处理或当前版本变化时转为 `CANCELLED`；晚到结果必须再次校验目标并撤下，不能重新激活失效版本。
 - 永久删除时清除该版本的图谱证据，但保留仍被其他文档或人工事实支撑的实体与关系。
 - 第一阶段使用 AuraDB Free 普通后端凭据，不把独立只读数据库账号作为上线前置条件。
 - Text-to-Cypher 的应用层校验、查询网关、执行限制和审计是第一阶段硬边界；进入正式多用户或敏感数据生产环境时，再评估支持数据库级 RBAC、独立读写凭据、备份和更高可用性的 Aura 规格。
@@ -1297,6 +1338,7 @@ text-start / text-delta / text-end
 - Parent/Child 和来源位置查看。
 - OpenSearch 同步状态。
 - 图谱抽取、审核和 Neo4j 投影状态。
+- 图谱是否有效、最近请求状态、预估/实际 Token 与费用及失败原因。
 
 ### 20.2 操作
 
@@ -1307,7 +1349,8 @@ text-start / text-delta / text-end
 - 重新分块。
 - 重新生成 Embedding。
 - 重新索引。
-- 重新抽取和投影图谱。
+- 勾选当前 READY 文档，预览 Parent 调用量与输入成本后人工生成图谱。
+- 对失败、过期或已有投影的文档人工重试/重新抽取；上传、重新处理和重新索引本身不自动触发图谱。
 - 隔离文档人工放行或拒绝。
 - 软删除、恢复和永久删除。
 
@@ -1329,6 +1372,7 @@ text-start / text-delta / text-end
 - 实体、关系、来源证据和审核状态详情。
 - 实体/关系新增与修改、重复实体合并、错误合并拆分。
 - 自动抽取事实确认、驳回和冲突处理。
+- 图谱构建批次与单文档请求状态查询。
 - 所有写入只调用受控管理 API，不提供任意 Cypher 控制台。
 
 ---
@@ -2065,6 +2109,14 @@ eval-golden
 - 97 个后端测试通过、1 个真实外部集成测试默认跳过，整体覆盖率 83.43%；Ruff、Mypy、前端测试和生产构建均通过。
 - 详细配置、边界和验证说明见 `docs/STAGE9_KNOWLEDGE_GRAPH.md`。
 
+人工构建改造记录（2026-08-19）：
+
+- 已移除索引成功后的自动图谱投递；新文档版本默认 `graph_status=NOT_REQUESTED, graph_active=false`，OpenSearch READY 流程不受影响。
+- 已新增批量预览、批量创建和批次查询 API，以及持久化 `GraphBuildRequest`；记录生成/重建/重试类型、请求人、任务 ID、预估与实际 Token/费用、尝试次数、错误和终态。
+- 已实现 `NOT_REQUESTED / PENDING / RUNNING / SUCCEEDED / FAILED / STALE / HIDDEN` 投影状态，以及 `PENDING / RUNNING / SUCCEEDED / FAILED / CANCELLED` 请求状态；列表、版本详情和管理操作均返回并展示相关状态。
+- 已限制只有人工授权且仍为 `PENDING` 的请求可以启动 LLM；重复投递不重复执行，僵死任务仅在原请求上限内恢复，目标版本变化或删除后的晚到结果会取消并撤下。
+- Chat/Agent 流程保持不变：`retrieve_enterprise_relationships` 直接查询全局有效图谱并沿用 OpenSearch 融合/回退，不增加图谱文档数量或覆盖率查询。
+
 ### 阶段 10：管理后台与 Chat UI（已完成）
 
 任务：
@@ -2147,18 +2199,101 @@ eval-golden
 - 已实现 HTTP/Celery Trace ID 传播，以及 BM25、Embedding、Dense、图检索、Rerank、查询改写、流式生成和阶段 11 评测的 Span/Generation/Score。
 - 已实现统一日志/Trace 敏感字段脱敏、模型首 Token 耗时、Token/成本与应用 Trace 关联；Provider Response ID 不再冒充 Trace ID。
 - 已增加 Worker/Beat 心跳、队列深度、Langfuse 与 Provider 配置状态，并在管理后台系统页展示非敏感状态。
+- Celery 子进程在 fork 后使用独立 Langfuse exporter；所有任务在 `task_postrun` 后有限时 flush，子进程退出时 shutdown，并通过 Redis TTL 快照暴露 Worker 侧最近 flush 状态，避免 API 健康掩盖 Worker 遥测失败。
 - Celery 已启用 Late Ack、Worker Lost 重投和单任务预取；恢复扫描增加数据库行锁与 `skip_locked`。
 - 已新增并应用 Alembic `20260818_0012`，修复阶段 11 评测字段声明差异；本机 PostgreSQL 的模型与迁移一致性检查通过。
 - 已新增阶段 12 操作与故障处理手册 `docs/STAGE12_OBSERVABILITY.md`。
 - 本机尚未配置 Langfuse Cloud 凭据，因此真实 Cloud Trace 上报、内容复核和 Cloud 故障演练仍待凭据完成后验收。
 
-### 阶段 13：最终验收
+### 阶段 13：LangGraph Agentic RAG 改造
+
+目标：
+
+- 将阶段 8 当前固定的 `Query Rewrite → Hybrid + Rerank → Grounded Generation` 流水线改造为简化、受控的 LangGraph Agentic RAG 状态图。
+- 由绑定受控工具的 Agent LLM 根据服务端对话历史自主决定直接回答、调用企业文档检索或调用企业关系检索；不在 Agent 前增加 `fast_path`，也不维护独立的问候/闲聊意图分类器。
+- 保留现有 Retrieval、Text-to-Cypher、引用、持久化、Responses API、AI SDK UI Message Stream 和 Langfuse 能力，LangGraph 只负责在线 Chat 编排，不成为新的业务事实来源。
+
+目标状态图：
+
+```text
+START
+  → Agent（LLM + 受控 Tools）
+      ├─ 普通文本 → Direct Response → END
+      ├─ retrieve_enterprise_documents
+      │    → OpenSearch Hybrid + Rerank
+      │         ├─ 有来源 → Grounded Generation → END
+      │         └─ 无来源 → Deterministic Refusal → END
+      └─ retrieve_enterprise_relationships
+           → OpenSearch + 受控 Text-to-Cypher + Rerank
+                ├─ 有来源 → Grounded Generation → END
+                └─ 无来源 → Deterministic Refusal → END
+```
+
+为降低首版复杂度、延迟和外部模型故障面，在线主流程不使用 Context Grader，也不在检索后形成 LLM 评分与 Query Rewrite 循环。Context Grader 的重新设计保留在 `docs/CONTEXT_GRADER_REDESIGN_PLAN.md`，后续只有在黄金集和影子评测证明存在稳定净收益时才单独立项。
+
+Agent 决策原则：
+
+- 问候、感谢、能力介绍和不涉及企业事实的普通交流由 Agent 直接回答，不调用检索工具。
+- 涉及企业制度、文档、人员、项目、产品、系统、流程或其他企业事实时必须调用工具，不得用模型记忆直接回答。
+- 普通事实、定义、日期、操作说明和全文内容优先调用 `retrieve_enterprise_documents`。
+- 实体关系、依赖链、归属关系、影响范围和 2～3 跳问题调用 `retrieve_enterprise_relationships`。
+- Agent 不直接接收或执行 Cypher；Text-to-Cypher 仍只能在阶段 9 的受控网关内运行，并继续经过只读白名单、Schema、路径深度、`LIMIT`、`EXPLAIN`、超时和结果大小校验。
+- 条件边只读取 LLM 是否产生 Tool Call 及受控 Tool 名称，不在代码中重复实现业务意图分类。
+- Agent 决策失败、输出非法 Tool Call 或无法确定是否涉及企业事实时，安全回退企业文档检索；图谱检索失败时回退企业文档检索。
+
+任务：
+
+- 使用实施时最新稳定版 LangGraph 1.2.11，并将兼容的 LangChain Core 加入后端正式依赖；同步升级阶段 11 的 LangChain 评测依赖，通过 Ragas、Python、Pydantic、Langfuse 和 LLM Contract Test 后锁定完整依赖树，防止漂移。
+- 扩展当前 Responses-compatible Provider 的 Agent 能力，支持 `tools`、`tool_choice`、函数参数 Structured Output、Tool Call 结果回传和对应 Token/错误契约；Grounded Answer 继续复用现有流式 Provider。若使用 LangChain ChatModel Adapter，适配层不得改变 Base URL、Bearer 鉴权、准确模型 ID 和后端凭据边界。
+- 新增类型化 `AgentState`，至少包含会话/消息 ID、服务端历史、原始问题、独立检索问题、Agent Action、Tool Call、Retrieval Response、Sources、工具调用次数、Warnings 和最终回答。
+- 实现单一 Agent 决策节点并绑定 `retrieve_enterprise_documents` 与 `retrieve_enterprise_relationships` 两个受控领域工具；工具入参只接受规范化自然语言 Query 和服务端限制内的检索参数，不暴露任意 OpenSearch DSL、Cypher、索引名或数据库连接参数。
+- 为 Retrieval Service 增加请求级图谱策略，使文档工具明确跳过 Text-to-Cypher，关系工具复用 OpenSearch + Graph 候选融合；不能再仅依赖全局 `GRAPH_QUERY_ENABLED` 对所有 Hybrid 问题无差别执行图查询。
+- Agent 在 Tool Call 中使用有限、可信的服务端历史生成完整、可独立检索的 Query；Agentic 流程不再增加独立的检索后 Query Rewrite 节点。
+- 单 Turn 只执行一次 Agent 决策和最多一次受控检索，不形成 Agent 循环；保留硬性 `recursion_limit` 和总上下文预算作为工程保护。
+- 检索有来源时直接进入 Grounded Generation；无来源时不再调用其他 LLM，返回确定性的信息不足响应。
+- Grounded Generation 继续只使用带来源的最终 Context，继续执行文档指令隔离、信息不足拒答、`[S1]` 引用、Citation 快照和回答语言跟随；Direct Response 不得陈述未经工具检索的企业事实。
+- 将 LangGraph 事件转换为现有 AI SDK UI Message Stream，补充 `data-agent-status` 和 `data-tool-status`；普通用户只看到可理解的阶段状态，内部 Prompt、Tool 原始参数、完整 Cypher 和敏感错误仅进入受控 Trace。
+- PostgreSQL 中的 Conversation、Message、RetrievalTrace、GraphQueryTrace、ModelInvocation 和 Citation 继续作为业务与审计事实来源。首版 Agent Graph 使用单次请求内 State，不启用持久化 Checkpointer，避免与现有会话存储形成双重事实来源；只有引入人工中断恢复或跨请求长流程时再单独评审 PostgreSQL Checkpointer。
+- 为 Agent 节点、Tool Call、文档检索、图谱检索、Grounded Generation 和回退建立 Langfuse Span/Generation；记录动作类型、Tool 名、模型、Prompt/Graph 版本、Token、成本、耗时、重试、回退原因和脱敏后的状态摘要。
+- 通过 `AGENTIC_RAG_ENABLED` 进行可回退发布；关闭时保留当前固定 RAG 流程，启用时同一 Chat API 和前端协议切换到 Agent Graph。稳定期结束前不得删除旧流程。
+- 扩展黄金集，增加 `expected_action`、`expected_tool`、`expected_answerable` 和多轮历史，覆盖纯问候、混合问候与知识问题、企业事实、实体关系、多跳、指代、省略、范围外、知识库无答案、Tool 故障和 Prompt Injection。
+- 增加单元、集成、SSE 和可选真实模型 Contract Test；默认测试使用确定性的 Fake Agent Model 和 Fake Tools，不调用外部模型、Voyage、OpenSearch、Neo4j 或 Langfuse Cloud。
+
+验收：
+
+- “你好”“谢谢”“你能做什么”等输入由 Agent LLM 直接回答，RetrievalTrace 和 GraphQueryTrace 均不产生，且没有 Embedding、Rerank 或 Text-to-Cypher 调用。
+- “你好，请问公司的请假制度是什么？”不会因包含问候而直接回答，Agent 必须调用企业文档检索并返回可定位引用。
+- 普通企业文档问题只调用文档工具，不产生 GraphQueryTrace；实体关系和多跳问题选择关系工具，并保留 Text-to-Cypher 安全 Trace 与来源引用。
+- 多轮“它什么时候生效？”等问题只使用服务端历史生成独立 Tool Query；浏览器伪造的历史不能影响 Agent 决策。
+- 检索无来源时稳定结束并返回确定性的信息不足响应，不进行检索后的 LLM 评分或循环改写。
+- Agent 未调用工具时不能生成企业事实；所有 Grounded Answer 的主要企业事实继续满足来源约束，无上下文或上下文不足时不会用模型记忆补全。
+- 非法 Tool、Provider 超时、OpenSearch/Voyage/Reranker 故障、Neo4j/Text-to-Cypher 故障和 Langfuse 故障均按既定策略回退或失败，消息状态、SSE、数据库记录与 Trace 一致。
+- 黄金集报告包含 Agent Action/Tool 选择准确率、应检索却直接回答率、文档/图谱 Tool 混淆率、无来源拒答准确率、首 Token/总延迟、Token/成本、引用和答案指标；“应检索却直接回答”作为阻塞发布的高风险指标单独设门槛。
+- `AGENTIC_RAG_ENABLED=false` 时现有阶段 8 固定 RAG 回归测试继续通过；启用后 Chat 历史、流式回答、停止、重新生成、来源抽屉和管理员 Trace 的前端行为保持兼容。
+
+实施进展（2026-08-19）：
+
+- 已锁定最新稳定版 LangGraph 1.2.11，并升级到兼容的 LangChain 1.3.15、LangChain Core 1.5.6、LangChain Community 0.4.2 与 LangChain OpenAI 1.5.1；Ragas 0.2.15 回归通过。
+- 已实现 `Agent → 可选 Retrieval Tool → Grounded Generation/Deterministic Refusal` 类型化状态图；Agent LLM 直接通过 Tool Call 自主选择 Direct、Documents 或 Relationships，没有新增 `fast_path` 或独立意图分类器。
+- 已扩展 Responses-compatible Provider 的 Tool Call 请求/响应契约，并实现文档与关系两个受控领域工具；文档工具明确跳过图查询，关系工具才启用受控 Text-to-Cypher。
+- 已实现无来源确定性拒答、单次 Agent 决策、最多一次受控检索和 LangGraph 递归上限；非法工具或 Agent 决策失败安全回退文档检索。
+- 已接入现有 Conversation、Message、RetrievalTrace、GraphQueryTrace、ModelInvocation、Citation 与 Langfuse 观测链路，不启用第二套 Checkpointer。
+- 已增加 `data-agent-status`、`data-tool-status` SSE 事件和前端状态展示；Direct Response 不产生 RetrievalTrace。
+- 已将 Agent 执行延后到 HTTP 流生命周期内，Responses API 的 Direct Response Token 通过 LangGraph custom stream 实时转发；Tool Call 在完成事件中解析后继续受控检索，并记录 Agent 首 Token 耗时、流中断和部分回答终态。
+- 已修复服务端历史只按 `created_at` 排序导致同一 Turn User/Assistant 顺序不稳定的问题；查询和会话输出同时使用完成时间确定同时间戳内的消息顺序，并增加 User → Assistant → 当前 User 回归测试。
+- 已新增 `agent-routing-v1` 黄金路由集和确定性 Fake Provider 测试，覆盖 Direct、文档、关系、多轮、无答案和 Prompt Injection 场景定义。
+- 已移除在线 Context Grader、检索后 Query Rewrite、相关配置和 SSE；改造方案保留在 `docs/CONTEXT_GRADER_REDESIGN_PLAN.md`，不作为当前发布前提。
+- `AGENTIC_RAG_ENABLED` 默认保持关闭，完成目标模型的真实 Tool Call Contract Test 和黄金路由基线后再逐环境开启。
+- 本机质量门禁通过：后端 140 passed、1 skipped、覆盖率 82.94%；前端 17 passed，生产构建通过。
+
+### 阶段 14：最终验收
 
 任务：
 
 - 用真实 50 个初始文件跑完整入库。
 - 人工复核解析、Dingo、Chunk 和引用。
 - 人工复核图谱 Schema、实体归一化、关系证据和多跳回答。
+- 人工复核 Agent 的 Direct Response、文档 Tool、关系 Tool、无来源拒答和回退决策。
 - 完成黄金集基线。
 - 修复高优先级失败样本。
 - 固化运行、备份和恢复文档。
@@ -2170,6 +2305,7 @@ eval-golden
 - 检索与回答指标达到团队确认的首版基线。
 - 软删除、版本切换、重建和恢复通过演练。
 - 图谱浏览、人工修正、Text-to-Cypher 防护、回退和 Neo4j 重建通过演练。
+- LangGraph Agent 在直接回答、文档检索、关系检索、多轮指代、知识库无答案和依赖故障样本上达到阶段 13 的发布门槛。
 
 ---
 
@@ -2181,6 +2317,8 @@ eval-golden
 - Aiven ICU、k-NN 插件状态与证书连接。
 - 目标 LLM API 对配置模型的实际映射、Bearer 鉴权与错误契约。
 - 目标 LLM API 的 Responses 流式与 Structured Output 兼容性。
+- 目标 LLM API 的 Responses Tool Call、函数参数、单次受控 Tool Call 和错误契约。
+- LangGraph、LangChain Core、Pydantic、Langfuse 与当前 Python 依赖树的兼容性，以及 AI SDK UI Message Stream 的事件转换方式。
 - MinerU 精准解析 API 的 Token、签名上传、轮询、格式范围、文件限制和结果 Zip 契约。
 - Dingo 与当前 Python 依赖树的兼容性。
 - Dingo LLM 是否可使用目标供应商的 OpenAI-compatible Endpoint。
@@ -2219,6 +2357,8 @@ eval-golden
 | Redis/Celery 长任务重复投递 | 重复计费或重复索引 | 阶段拆分、幂等、Visibility Timeout、批次状态 |
 | 真实企业数据发送第三方 | 合规风险 | 外部发送策略、未来 PrivacyScanner、接入前确认 |
 | Langfuse Cloud 上报敏感内容或不可用 | 数据外泄或可观测链路影响业务 | 默认字段白名单、本地脱敏、内容开关、异步有限队列、短超时、失败降级和本地事实来源 |
+| Agent 将企业知识问题错误地直接回答 | 无来源事实或模型记忆进入企业回答 | Tool 使用约束、应检索却直接回答门槛、Grounded Answer 校验、黄金集与 Trace 审计 |
+| Agent 返回多个、未知或非法 Tool Call | 路由不确定或越过受控工具边界 | 严格校验单一受控 Tool Call，异常时回退文档检索，状态图不设置循环边 |
 | 无认证服务被局域网访问 | 数据与密钥暴露 | 全部本机监听，不允许前端直连外部服务 |
 
 ---
@@ -2237,6 +2377,8 @@ eval-golden
 - 每条在线图谱关系具有 Schema 版本、来源证据、审核状态和稳定 ID。
 - 受控 TextToCypherRetriever 通过危险语句、Schema 越界、无界路径、LIMIT、超时和回退测试。
 - 多跳回答能够展示关系路径并引用原始文档片段。
+- LangGraph Agent 可以自主选择 Direct Response、企业文档 Tool 或企业关系 Tool；企业事实不允许未经检索直接回答，单 Turn 最多执行一次受控检索。
+- 无来源确定性拒答、图谱失败回退、Agent SSE 和端到端 Trace 通过黄金集与故障测试。
 - Voyage Embedding 与 Reranker 的调用、成本和错误可追踪。
 - 配置的 Responses-compatible 模型通过后端直连 API 稳定流式回答。
 - 回答严格基于上下文并提供可定位引用。

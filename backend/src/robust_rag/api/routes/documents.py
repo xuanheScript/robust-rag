@@ -105,6 +105,7 @@ def list_documents(
     documents = list(
         db.scalars(
             select(Document)
+            .options(selectinload(Document.current_version))
             .where(*filters)
             .order_by(Document.created_at.desc())
             .limit(limit)
@@ -125,7 +126,11 @@ def reprocess_document(
 
 @router.get("/{document_id}", response_model=DocumentRead)
 def get_document(document_id: uuid.UUID, db: DatabaseSession) -> Document:
-    document = db.get(Document, document_id)
+    document = db.scalar(
+        select(Document)
+        .options(selectinload(Document.current_version))
+        .where(Document.id == document_id)
+    )
     if document is None:
         raise AppError(code="DOCUMENT_NOT_FOUND", message="Document was not found", status_code=404)
     return document
