@@ -620,6 +620,7 @@ class FakeLLMProvider:
     ) -> None:
         self.response_text = response_text
         self.generate_text = generate_text or response_text
+        self._generate_text_explicit = generate_text is not None
         self.stream_deltas = stream_deltas
         self.failure = failure
         self.generate_responses = list(generate_responses or [])
@@ -632,8 +633,27 @@ class FakeLLMProvider:
             raise self.failure
         if self.generate_responses:
             return self.generate_responses.pop(0)
+        if (
+            request.metadata.get("purpose") == "query_rewrite"
+            and not self._generate_text_explicit
+        ):
+            latest = request.input[-1].get("content", "") if request.input else ""
+            query = str(latest)
+            text = json.dumps(
+                {
+                    "standalone_query": query,
+                    "semantic_query": query,
+                    "lexical_queries": [],
+                    "entities": [],
+                    "answer_facets": [],
+                    "filters": {},
+                },
+                ensure_ascii=False,
+            )
+        else:
+            text = self.generate_text
         return LLMResponse(
-            text=self.generate_text,
+            text=text,
             response_id="resp_fake",
             usage=LLMUsage(input_tokens=10, output_tokens=5, total_tokens=15),
             finish_reason="completed",

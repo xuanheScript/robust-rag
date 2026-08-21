@@ -32,6 +32,7 @@ TrackedStream = Callable[
     tuple[uuid.UUID, Iterator[LLMStreamEvent]],
 ]
 SourceLoader = Callable[[RetrievalSearchResponse], list[ChatSource]]
+QueryPlanner = Callable[[str, list[tuple[str, str]]], tuple[QueryRewriteResult, str | None]]
 
 
 class AgentState(TypedDict):
@@ -41,6 +42,7 @@ class AgentState(TypedDict):
     question: str
     history: list[tuple[str, str]]
     query: str
+    query_plan: QueryRewriteResult | None
     action: AgentAction
     selected_tool: str | None
     tool_call_id: str | None
@@ -52,6 +54,7 @@ class AgentState(TypedDict):
     invocation_ids: list[uuid.UUID]
     direct_invocation_id: uuid.UUID | None
     direct_usage: LLMUsage
+    rewrite_warning: str | None
 
 
 @dataclass(frozen=True)
@@ -68,6 +71,7 @@ class AgentRunResult:
     invocation_ids: tuple[uuid.UUID, ...]
     direct_invocation_id: uuid.UUID | None
     direct_usage: LLMUsage
+    rewrite_warning: str | None
 
 
 @dataclass(frozen=True)
@@ -89,6 +93,7 @@ class AgenticRAGGraph:
         *,
         retrieval_service: RetrievalService,
         source_loader: SourceLoader,
+        query_planner: QueryPlanner,
         stream_generate: TrackedStream,
         settings: Settings,
         mode: RetrievalMode,
@@ -101,6 +106,7 @@ class AgenticRAGGraph:
     ) -> None:
         self.retrieval_service = retrieval_service
         self.source_loader = source_loader
+        self.query_planner = query_planner
         self.stream_generate = stream_generate
         self.settings = settings
         self.mode = mode
@@ -112,13 +118,15 @@ class AgenticRAGGraph:
         self.assistant_message_id = assistant_message_id
         workflow = StateGraph(AgentState)
         workflow.add_node("agent", self._agent)
+        workflow.add_node("query_rewrite", self._query_rewrite)
         workflow.add_node("retrieve", self._retrieve)
         workflow.add_edge(START, "agent")
         workflow.add_conditional_edges(
             "agent",
             self._route_agent,
-            {"retrieve": "retrieve", "end": END},
+            {"retrieve": "query_rewrite", "end": END},
         )
+        workflow.add_edge("query_rewrite", "retrieve")
         workflow.add_edge("retrieve", END)
         self.graph = workflow.compile()
 
@@ -171,6 +179,7 @@ class AgenticRAGGraph:
             "question": question,
             "history": history,
             "query": question,
+            "query_plan": None,
             "action": "insufficient",
             "selected_tool": None,
             "tool_call_id": None,
@@ -182,15 +191,17 @@ class AgenticRAGGraph:
             "invocation_ids": [],
             "direct_invocation_id": None,
             "direct_usage": LLMUsage(),
+            "rewrite_warning": None,
         }
 
     @staticmethod
     def _result(final: AgentState) -> AgentRunResult:
+        result_query = final["query_plan"].query if final["query_plan"] else final["query"]
         return AgentRunResult(
             action=final["action"],
             selected_tool=final["selected_tool"],
             tool_call_id=final["tool_call_id"],
-            query=final["query"],
+            query=result_query,
             direct_answer=final["direct_answer"],
             retrieval=final["retrieval"],
             sources=final["sources"],
@@ -199,6 +210,7 @@ class AgenticRAGGraph:
             invocation_ids=tuple(final["invocation_ids"]),
             direct_invocation_id=final["direct_invocation_id"],
             direct_usage=final["direct_usage"],
+            rewrite_warning=final["rewrite_warning"],
         )
 
     def _agent(self, state: AgentState) -> dict[str, object]:
@@ -395,12 +407,13 @@ class AgenticRAGGraph:
             version=self.settings.agent_graph_version,
         ) as span:
             try:
-                rewrite = QueryRewriteResult(
+                rewrite = state["query_plan"] or QueryRewriteResult(
                     query=state["query"],
-                    strategy="agent-tool-call",
+                    strategy="agent-tool-call-fallback",
                     implementation="langgraph-agent",
                     version=self.settings.agent_graph_version,
                     changed=state["query"] != state["question"],
+                    semantic_query=state["query"],
                     metadata={"agent_action": state["action"]},
                 )
                 retrieval = self.retrieval_service.search(
@@ -446,3 +459,22 @@ class AgenticRAGGraph:
                     "tool_call_count": state["tool_call_count"] + 1,
                     "warnings": [*state["warnings"], code],
                 }
+
+    def _query_rewrite(self, state: AgentState) -> dict[str, object]:
+        """Build an additive retrieval plan only after the Agent selects retrieval."""
+
+        rewrite, warning = self.query_planner(state["query"], state["history"])
+        invocation_ids = list(state["invocation_ids"])
+        raw_invocation_id = rewrite.metadata.get("invocation_id")
+        if isinstance(raw_invocation_id, str):
+            try:
+                invocation_id = uuid.UUID(raw_invocation_id)
+            except ValueError:
+                invocation_id = None
+            if invocation_id is not None and invocation_id not in invocation_ids:
+                invocation_ids.append(invocation_id)
+        return {
+            "query_plan": rewrite,
+            "invocation_ids": invocation_ids,
+            "rewrite_warning": warning,
+        }

@@ -33,6 +33,38 @@ class FusedRank:
         }
 
 
+def fuse_query_hit_lists(
+    hit_lists: list[list[SearchHit]],
+    *,
+    rank_constant: int,
+    limit: int,
+) -> list[SearchHit]:
+    """Fuse multiple query variants within one retrieval modality.
+
+    The returned score is an explainable query-level RRF score. Keeping this
+    fusion separate lets the existing BM25/dense/graph fusion remain stable.
+    """
+
+    if not hit_lists:
+        return []
+    scores: dict[str, float] = {}
+    best_rank: dict[str, int] = {}
+    for hits in hit_lists:
+        for hit in hits:
+            scores[hit.node_id] = scores.get(hit.node_id, 0.0) + 1 / (
+                rank_constant + hit.rank
+            )
+            best_rank[hit.node_id] = min(best_rank.get(hit.node_id, hit.rank), hit.rank)
+    ordered = sorted(
+        scores,
+        key=lambda node_id: (-scores[node_id], best_rank[node_id], node_id),
+    )[:limit]
+    return [
+        SearchHit(node_id=node_id, score=scores[node_id], rank=index)
+        for index, node_id in enumerate(ordered, start=1)
+    ]
+
+
 def reciprocal_rank_fusion(
     bm25_hits: list[SearchHit],
     dense_hits: list[SearchHit],

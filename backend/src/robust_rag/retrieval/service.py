@@ -45,7 +45,12 @@ from robust_rag.indexing.rate_limit import (
 )
 from robust_rag.indexing.service import get_opensearch_adapter
 from robust_rag.retrieval.context import assemble_context
-from robust_rag.retrieval.fusion import FusedRank, diversify_candidates, reciprocal_rank_fusion
+from robust_rag.retrieval.fusion import (
+    FusedRank,
+    diversify_candidates,
+    fuse_query_hit_lists,
+    reciprocal_rank_fusion,
+)
 from robust_rag.retrieval.query import (
     IdentityQueryRewriter,
     QueryRewriter,
@@ -161,6 +166,8 @@ class RetrievalService:
             request.query, max_chars=self.settings.retrieval_query_max_chars
         )
         rewrite = rewrite_override or self.query_rewriter.rewrite(normalized)
+        lexical_queries = rewrite.lexical_search_queries(normalized)
+        dense_queries = rewrite.dense_search_queries(normalized)
         budget = min(
             request.context_budget_tokens or self.settings.retrieval_context_max_tokens,
             self.settings.retrieval_context_max_tokens,
@@ -205,7 +212,8 @@ class RetrievalService:
                 with observe(
                     "retrieval.lexical_dense_fanout",
                     input={
-                        "query": rewrite.query,
+                        "lexical_queries": lexical_queries,
+                        "dense_queries": dense_queries,
                         "bm25_top_k": self.settings.retrieval_bm25_top_k,
                         "dense_top_k": self.settings.retrieval_dense_top_k,
                     },
@@ -218,11 +226,11 @@ class RetrievalService:
                     ) as executor:
                         dense_future = executor.submit(
                             dense_context.run,
-                            self._run_dense_stage,
-                            rewrite.query,
+                            self._run_dense_queries,
+                            dense_queries,
                             trace_id,
                         )
-                        bm25_result = self._run_bm25_stage(rewrite.query, trace_id)
+                        bm25_result = self._run_bm25_queries(lexical_queries, trace_id)
                         dense_result = dense_future.result()
                     fanout_latency_ms = _elapsed_ms(fanout_started)
                     estimated_savings_ms = round(
@@ -245,13 +253,14 @@ class RetrievalService:
                 latency["lexical_dense_fanout"] = fanout_latency_ms
                 latency["parallel_savings_estimate"] = estimated_savings_ms
             elif needs_bm25:
-                bm25_result = self._run_bm25_stage(rewrite.query, trace_id)
+                bm25_result = self._run_bm25_queries(lexical_queries, trace_id)
             elif needs_dense:
-                dense_result = self._run_dense_stage(rewrite.query, trace_id)
+                dense_result = self._run_dense_queries(dense_queries, trace_id)
 
             if bm25_result is not None:
                 bm25_hits = bm25_result.hits
                 usage["bm25_retries"] = bm25_result.retries
+                usage["bm25_query_count"] = len(lexical_queries)
                 latency["bm25"] = bm25_result.latency_ms
 
             if dense_result is not None:
@@ -260,6 +269,7 @@ class RetrievalService:
                 usage["query_embedding_tokens"] = embedding.total_tokens
                 usage["query_embedding_retries"] = dense_result.embedding_retries
                 usage["dense_retries"] = dense_result.dense_retries
+                usage["dense_query_count"] = len(dense_queries)
                 latency["query_embedding"] = dense_result.embedding_latency_ms
                 latency["dense"] = dense_result.dense_latency_ms
                 latency["dense_pipeline"] = dense_result.latency_ms
@@ -316,7 +326,10 @@ class RetrievalService:
                 graph_weight=self.settings.graph_rrf_weight,
                 limit=self.settings.retrieval_rrf_top_k,
             )
-            candidates = self._hydrate_candidates(fused, rewrite.query)
+            candidates = self._hydrate_candidates(
+                fused,
+                [normalized, rewrite.query, rewrite.semantic_query or rewrite.query],
+            )
             diversified, excluded = diversify_candidates(
                 candidates,
                 max_per_document=self.settings.retrieval_max_children_per_document,
@@ -413,7 +426,16 @@ class RetrievalService:
             )
             latency["context_assembly"] = _elapsed_ms(started)
             latency["total"] = _elapsed_ms(total_started)
-            stage_values = {
+            stage_values: dict[str, list[dict[str, object]]] = {
+                "queries": [
+                    {
+                        "original": normalized,
+                        "standalone": rewrite.query,
+                        "semantic": rewrite.semantic_query or rewrite.query,
+                        "lexical": lexical_queries,
+                        "dense": dense_queries,
+                    }
+                ],
                 "bm25": [_hit_snapshot(hit) for hit in bm25_hits],
                 "dense": [_hit_snapshot(hit) for hit in dense_hits],
                 "graph": [hit.snapshot() for hit in graph_hits],
@@ -491,6 +513,26 @@ class RetrievalService:
             )
         return Bm25StageResult(hits=hits, retries=retries, latency_ms=latency_ms)
 
+    def _run_bm25_queries(
+        self, queries: list[str], trace_id: uuid.UUID
+    ) -> Bm25StageResult:
+        started = time.perf_counter()
+        results = [self._run_bm25_stage(query, trace_id) for query in queries]
+        hits = (
+            results[0].hits
+            if len(results) == 1
+            else fuse_query_hit_lists(
+                [result.hits for result in results],
+                rank_constant=self.settings.retrieval_rrf_rank_constant,
+                limit=self.settings.retrieval_bm25_top_k,
+            )
+        )
+        return Bm25StageResult(
+            hits=hits,
+            retries=sum(result.retries for result in results),
+            latency_ms=_elapsed_ms(started),
+        )
+
     def _run_dense_stage(self, query: str, trace_id: uuid.UUID) -> DenseStageResult:
         pipeline_started = time.perf_counter()
         with observe(
@@ -566,6 +608,36 @@ class RetrievalService:
             latency_ms=pipeline_latency_ms,
         )
 
+    def _run_dense_queries(
+        self, queries: list[str], trace_id: uuid.UUID
+    ) -> DenseStageResult:
+        started = time.perf_counter()
+        results = [self._run_dense_stage(query, trace_id) for query in queries]
+        hits = (
+            results[0].hits
+            if len(results) == 1
+            else fuse_query_hit_lists(
+                [result.hits for result in results],
+                rank_constant=self.settings.retrieval_rrf_rank_constant,
+                limit=self.settings.retrieval_dense_top_k,
+            )
+        )
+        token_values = [result.embedding.total_tokens for result in results]
+        total_tokens = (
+            sum(value for value in token_values if value is not None)
+            if all(value is not None for value in token_values)
+            else None
+        )
+        return DenseStageResult(
+            hits=hits,
+            embedding=EmbeddingResponse(vectors=[], total_tokens=total_tokens),
+            embedding_retries=sum(result.embedding_retries for result in results),
+            dense_retries=sum(result.dense_retries for result in results),
+            embedding_latency_ms=sum(result.embedding_latency_ms for result in results),
+            dense_latency_ms=sum(result.dense_latency_ms for result in results),
+            latency_ms=_elapsed_ms(started),
+        )
+
     def _create_trace(
         self,
         request: RetrievalSearchRequest,
@@ -628,7 +700,7 @@ class RetrievalService:
             db.flush()
             return trace.id
 
-    def _hydrate_candidates(self, fused: list[FusedRank], query: str) -> list[Candidate]:
+    def _hydrate_candidates(self, fused: list[FusedRank], queries: list[str]) -> list[Candidate]:
         node_ids: list[uuid.UUID] = []
         for value in fused:
             try:
@@ -683,7 +755,7 @@ class RetrievalService:
                     graph_score=rank.graph_score,
                     graph_path=rank.graph_path,
                     rrf_score=rank.rrf_score,
-                    exact_match=_is_exact_match(query, node),
+                    exact_match=any(_is_exact_match(query, node) for query in queries),
                 )
             )
         return candidates

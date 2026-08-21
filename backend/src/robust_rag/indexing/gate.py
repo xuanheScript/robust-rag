@@ -17,7 +17,13 @@ from robust_rag.db.enums import (
 )
 from robust_rag.db.models import ChunkingRun, IngestionJob, RetrievalNode, StageRun
 
-NODE_GATE_VERSION = "stage6-retrieval-node-gate-v1"
+NODE_GATE_VERSION = "stage6-retrieval-node-gate-v2"
+
+_TABLE_KINDS_WITHOUT_COLUMN_HEADERS = {
+    "key_value",
+    "sectioned_key_value",
+    "complex",
+}
 
 
 class RetrievalNodeGateService:
@@ -82,7 +88,7 @@ class RetrievalNodeGateService:
                 job_id=job.id,
                 stage_name=StageName.CHUNK_EVALUATING,
                 implementation_name="retrieval-node-quality-gate",
-                implementation_version="1.0.0",
+                implementation_version="2.0.0",
                 config_version=NODE_GATE_VERSION,
                 config_snapshot={
                     "checks": [
@@ -91,7 +97,7 @@ class RetrievalNodeGateService:
                         "source_traceability",
                         "retrieval_text_hash",
                         "quality_decision",
-                        "table_header_propagation",
+                        "table_shape_semantics",
                     ]
                 },
                 status=StageRunStatus.SUCCEEDED,
@@ -134,7 +140,7 @@ class RetrievalNodeGateService:
                 code = "NODE_QUALITY_BLOCKED"
             elif node.node_level is RetrievalNodeLevel.CHILD and node.parent_node_id not in parents:
                 code = "NODE_PARENT_MISSING"
-            elif node.attributes_json.get("table") and not node.attributes_json.get("table_header"):
+            elif _table_header_missing(node.attributes_json):
                 code = "TABLE_HEADER_MISSING"
             if code:
                 issues.append({"code": code, "node_id": str(node.id)})
@@ -151,3 +157,15 @@ class RetrievalNodeGateService:
         job.finished_at = None
         job.updated_at = now
         job.document_version.status = VersionStatus.EMBEDDING
+
+
+def _table_header_missing(attributes: dict[str, object]) -> bool:
+    """Require column headers only for table shapes that retrieve by records or rows."""
+
+    if attributes.get("table") is not True or attributes.get("table_header"):
+        return False
+    raw_kind = attributes.get("table_kind")
+    if not isinstance(raw_kind, str):
+        profile = attributes.get("table_profile")
+        raw_kind = profile.get("kind") if isinstance(profile, dict) else None
+    return raw_kind not in _TABLE_KINDS_WITHOUT_COLUMN_HEADERS

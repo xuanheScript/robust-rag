@@ -9,6 +9,7 @@ from typing import Any
 
 from robust_rag.cleaning.schemas import CleaningIssue, CleaningIssueSeverity
 from robust_rag.parsing.schemas import BlockType, CanonicalBlock, CanonicalDocument, SourceType
+from robust_rag.parsing.tables import ensure_table_model
 
 CONTAINER_TYPES = {
     BlockType.DOCUMENT,
@@ -393,29 +394,56 @@ class LanguageDetector(CleaningOperator):
 
 class TableHeaderPreparation(CleaningOperator):
     name = "table-header-preparation"
-    version = "1.0.0"
+    version = "2.0.0"
 
     def apply(self, document: CanonicalDocument) -> list[CleaningIssue]:
         issues: list[CleaningIssue] = []
         for block in document.blocks:
             if block.block_type not in TABLE_TYPES:
                 continue
-            rows = block.attributes.get("rows") or block.attributes.get("display_values")
-            if not isinstance(rows, list) or not rows or not isinstance(rows[0], list):
-                continue
-            header = ["" if value is None else str(value).strip() for value in rows[0]]
+            before_profile = block.attributes.get("table_profile")
+            model = ensure_table_model(block.attributes, block.normalized_text)
+            profile = model.get("profile", {})
+            block.attributes["table_model"] = model
+            block.attributes["table_profile"] = profile
             cleaning = _cleaning_metadata(block)
-            if cleaning.get("table_header") == header:
+            grid = model.get("grid", [])
+            kind = str(profile.get("kind", "complex")) if isinstance(profile, dict) else "complex"
+            header = (
+                [str(value).strip() for value in grid[0]]
+                if kind in {"record_table", "matrix"}
+                and isinstance(grid, list)
+                and grid
+                and isinstance(grid[0], list)
+                else []
+            )
+            if header:
+                cleaning["table_header"] = header
+                cleaning["header_source"] = "shape_analyzer"
+            else:
+                cleaning.pop("table_header", None)
+                cleaning["header_source"] = "not_applicable"
+            cleaning["table_kind"] = kind
+            cleaning["profile_confidence"] = profile.get("confidence", 0)
+            cleaning["data_row_count"] = max(0, len(grid) - len(profile.get("header_rows", [])))
+            if before_profile == profile and cleaning.get("table_header") == header:
                 continue
-            cleaning["table_header"] = header
-            cleaning["header_source"] = "first_row_candidate"
-            cleaning["data_row_count"] = max(0, len(rows) - 1)
             issues.append(
                 self.issue(
-                    code="TABLE_HEADER_CANDIDATE_PREPARED",
-                    message="The first table row was prepared as a header candidate for chunking",
+                    code=(
+                        "TABLE_HEADER_CANDIDATE_PREPARED"
+                        if header
+                        else "TABLE_SHAPE_PROFILE_PREPARED"
+                    ),
+                    message=(
+                        "Table shape and applicable header semantics were prepared for chunking"
+                    ),
                     block_ids=[block.id],
-                    details={"column_count": len(header)},
+                    details={
+                        "kind": kind,
+                        "confidence": profile.get("confidence", 0),
+                        "column_count": profile.get("column_count", len(header)),
+                    },
                 )
             )
         return issues

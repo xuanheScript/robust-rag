@@ -13,6 +13,7 @@ from robust_rag.chunking.schemas import RetrievalNodeData
 from robust_rag.db.enums import RetrievalNodeLevel
 from robust_rag.parsing.canonicalizer import Canonicalizer
 from robust_rag.parsing.schemas import BlockType, CanonicalBlock, CanonicalDocument, SourceLocator
+from robust_rag.parsing.tables import ensure_table_model, semantic_table_units
 from robust_rag.quality.schemas import QualityDecision
 
 NODE_ID_NAMESPACE = uuid.UUID("e68aa9f6-e141-4dde-97eb-6efb3001dcbe")
@@ -30,7 +31,7 @@ TABLE_TYPES = {BlockType.TABLE, BlockType.LOGICAL_TABLE}
 class ChunkingConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    config_version: str = "stage5-parent-child-v1"
+    config_version: str = "stage5-parent-child-v2"
     parent_target_tokens: int = Field(default=1800, ge=1)
     parent_max_tokens: int = Field(default=2500, ge=1)
     child_target_tokens: int = Field(default=500, ge=1)
@@ -70,6 +71,8 @@ class _Fragment:
     heading_path: list[str]
     language: str | None
     table_header: list[str] = field(default_factory=list)
+    table_profile: dict[str, Any] = field(default_factory=dict)
+    table_child_contents: list[str] = field(default_factory=list)
 
     @property
     def token_count(self) -> int:
@@ -96,11 +99,13 @@ class _ParentDraft:
     language: str | None
     group_kind: str
     table_header: list[str] = field(default_factory=list)
+    table_profile: dict[str, Any] = field(default_factory=dict)
+    table_child_contents: list[str] = field(default_factory=list)
 
 
 class StructureAwareChunker:
     name = "structure-aware-parent-child-chunker"
-    version = "1.0.0"
+    version = "2.0.0"
 
     def __init__(self, config: ChunkingConfig | None = None) -> None:
         self.config = config or ChunkingConfig()
@@ -209,40 +214,84 @@ class StructureAwareChunker:
         return [self._fragment(block, piece) for piece in pieces]
 
     def _table_fragments(self, block: CanonicalBlock) -> list[_Fragment]:
-        header = _table_header(block)
-        lines = [line.strip() for line in block.normalized_text.splitlines() if line.strip()]
-        header_line = "\t".join(header)
-        if header and lines and _normalized_row(lines[0]) == _normalized_row(header_line):
-            data_lines = lines[1:]
-        else:
-            data_lines = lines
-        if not header:
-            header = _row_values(lines[0]) if lines else ["table"]
-            header_line = "\t".join(header)
-            data_lines = lines[1:] if lines else []
-
+        model = ensure_table_model(block.attributes, block.normalized_text)
+        profile = model.get("profile", {})
+        header = _table_header(block, profile=profile, model=model)
+        child_contents = [
+            child
+            for unit in semantic_table_units(model)
+            for child in self._split_table_unit(unit)
+            if child.strip()
+        ]
         fragments: list[_Fragment] = []
-        current_rows: list[str] = []
-        for row in data_lines:
-            candidate = "\n".join([header_line, *current_rows, row])
+        current_children: list[str] = []
+        for child in child_contents:
+            candidate = "\n\n".join([*current_children, child])
             if (
-                current_rows
+                current_children
                 and Canonicalizer.estimate_tokens(candidate) > self.config.parent_max_tokens
             ):
                 fragments.append(
-                    self._fragment(block, "\n".join([header_line, *current_rows]), header)
+                    self._fragment(
+                        block,
+                        "\n\n".join(current_children),
+                        header,
+                        table_profile=profile,
+                        table_child_contents=current_children,
+                    )
                 )
-                current_rows = [row]
+                current_children = [child]
             else:
-                current_rows.append(row)
-        table_text = "\n".join([header_line, *current_rows])
-        if current_rows or header_line:
-            fragments.append(self._fragment(block, table_text, header))
+                current_children.append(child)
+        if current_children:
+            fragments.append(
+                self._fragment(
+                    block,
+                    "\n\n".join(current_children),
+                    header,
+                    table_profile=profile,
+                    table_child_contents=current_children,
+                )
+            )
+        if not fragments and block.normalized_text.strip():
+            fragments.append(
+                self._fragment(
+                    block,
+                    block.normalized_text,
+                    header,
+                    table_profile=profile,
+                    table_child_contents=[block.normalized_text],
+                )
+            )
         return fragments
+
+    def _split_table_unit(self, unit: str) -> list[str]:
+        if Canonicalizer.estimate_tokens(unit) <= self.config.child_max_tokens:
+            return [unit]
+        lines = [line.strip() for line in unit.splitlines() if line.strip()]
+        if len(lines) < 2:
+            return self._text_child_contents(unit)
+        prefix = "\n".join(lines[:-1])
+        prefix_tokens = Canonicalizer.estimate_tokens(prefix)
+        available = self.config.child_max_tokens - prefix_tokens
+        if available <= self.config.child_overlap_tokens + 1:
+            return self._text_child_contents(unit)
+        pieces = _split_text(
+            lines[-1],
+            available,
+            overlap_tokens=min(self.config.child_overlap_tokens, max(available // 5, 0)),
+            target_tokens=min(self.config.child_target_tokens, available),
+        )
+        return [f"{prefix}\n{piece}" for piece in pieces]
 
     @staticmethod
     def _fragment(
-        block: CanonicalBlock, text: str, table_header: list[str] | None = None
+        block: CanonicalBlock,
+        text: str,
+        table_header: list[str] | None = None,
+        *,
+        table_profile: dict[str, Any] | None = None,
+        table_child_contents: list[str] | None = None,
     ) -> _Fragment:
         return _Fragment(
             text=text,
@@ -252,6 +301,8 @@ class StructureAwareChunker:
             heading_path=_effective_heading_path(block),
             language=block.language,
             table_header=table_header or [],
+            table_profile=table_profile or {},
+            table_child_contents=list(table_child_contents or []),
         )
 
     def _pack_parent_fragments(
@@ -339,8 +390,10 @@ class StructureAwareChunker:
             retrieval_text_hash=_sha256(retrieval_text),
             attributes={
                 "group_kind": draft.group_kind,
-                "table": bool(draft.table_header),
+                "table": bool(draft.table_profile or draft.table_header),
                 "table_header": draft.table_header,
+                "table_profile": draft.table_profile,
+                "table_child_contents": draft.table_child_contents,
             },
         )
 
@@ -390,6 +443,9 @@ class StructureAwareChunker:
                 "child_ordinal": ordinal,
                 "table": parent.attributes.get("table", False),
                 "table_header": parent.attributes.get("table_header", []),
+                "table_kind": parent.attributes.get("table_profile", {}).get(
+                    "kind", "complex"
+                ),
             },
         )
 
@@ -402,6 +458,9 @@ class StructureAwareChunker:
         )
 
     def _table_child_contents(self, parent: RetrievalNodeData) -> list[str]:
+        prepared = parent.attributes.get("table_child_contents")
+        if isinstance(prepared, list) and all(isinstance(value, str) for value in prepared):
+            return [value for value in prepared if value.strip()]
         header = [str(value) for value in parent.attributes.get("table_header", [])]
         header_line = "\t".join(header)
         lines = [line.strip() for line in parent.content.splitlines() if line.strip()]
@@ -472,6 +531,9 @@ def _combine_fragments(group_kind: str, fragments: list[_Fragment]) -> _ParentDr
     table_header = next(
         (fragment.table_header for fragment in fragments if fragment.table_header), []
     )
+    table_profile = next(
+        (fragment.table_profile for fragment in fragments if fragment.table_profile), {}
+    )
     return _ParentDraft(
         content="\n\n".join(fragment.text for fragment in fragments),
         source_block_ids=_unique(
@@ -489,16 +551,33 @@ def _combine_fragments(group_kind: str, fragments: list[_Fragment]) -> _ParentDr
         ),
         group_kind=group_kind,
         table_header=list(table_header),
+        table_profile=dict(table_profile),
+        table_child_contents=[
+            child
+            for fragment in fragments
+            for child in fragment.table_child_contents
+        ],
     )
 
 
-def _table_header(block: CanonicalBlock) -> list[str]:
+def _table_header(
+    block: CanonicalBlock,
+    *,
+    profile: object | None = None,
+    model: dict[str, Any] | None = None,
+) -> list[str]:
+    if isinstance(profile, dict) and profile.get("kind") not in {"record_table", "matrix"}:
+        return []
     cleaning = block.attributes.get("cleaning", {})
     if isinstance(cleaning, dict):
         value = cleaning.get("table_header", [])
         if isinstance(value, list) and value:
             return [str(item) for item in value]
-    rows = block.attributes.get("display_values") or block.attributes.get("rows")
+    rows = (
+        (model or {}).get("grid")
+        or block.attributes.get("display_values")
+        or block.attributes.get("rows")
+    )
     if isinstance(rows, list) and rows and isinstance(rows[0], list):
         return ["" if value is None else str(value) for value in rows[0]]
     lines = [line for line in block.normalized_text.splitlines() if line.strip()]

@@ -46,7 +46,12 @@ from robust_rag.generation.provider import (
     ResponsesAPIProvider,
 )
 from robust_rag.generation.schemas import ChatRequest, ChatSource
-from robust_rag.retrieval.query import QueryError, QueryRewriteResult, normalize_query
+from robust_rag.retrieval.query import (
+    QueryError,
+    QueryRewriteResult,
+    normalize_query,
+    parse_query_plan,
+)
 from robust_rag.retrieval.schemas import RetrievalSearchRequest, RetrievalSearchResponse
 from robust_rag.retrieval.service import RetrievalError, RetrievalService, get_retrieval_service
 
@@ -259,6 +264,7 @@ class ChatService:
                 "tool_call_count": result.tool_call_count,
                 "agent_invocation_ids": [str(value) for value in result.invocation_ids],
                 "warnings": list(result.warnings),
+                "rewrite_warning": result.rewrite_warning,
             },
         )
         return replace(
@@ -268,7 +274,7 @@ class ChatService:
             retrieval=result.retrieval,
             sources=result.sources,
             generation_request=generation_request,
-            rewrite_warning=None,
+            rewrite_warning=result.rewrite_warning,
             direct_answer=result.direct_answer,
             direct_usage=result.direct_usage,
             agent_action=result.action,
@@ -301,6 +307,7 @@ class ChatService:
         graph = AgenticRAGGraph(
             retrieval_service=self.retrieval_service,
             source_loader=self._load_sources,
+            query_planner=self._rewrite,
             stream_generate=self._start_tracked_stream,
             settings=self.settings,
             mode=pending.mode,
@@ -456,7 +463,8 @@ class ChatService:
                     "data": {
                         "code": prepared.rewrite_warning,
                         "message": (
-                            "Conversation rewrite was unavailable; the latest question was used."
+                            "Query planning was unavailable; retrieval continued with the "
+                            "tool query unchanged."
                         ),
                     },
                 }
@@ -790,18 +798,6 @@ class ChatService:
     def _rewrite(
         self, question: str, history: list[tuple[str, str]]
     ) -> tuple[QueryRewriteResult, str | None]:
-        if not history:
-            return (
-                QueryRewriteResult(
-                    query=question,
-                    strategy="conversation-aware",
-                    implementation="identity-without-history",
-                    version="1.0.0",
-                    changed=False,
-                    metadata={"history_message_count": 0},
-                ),
-                None,
-            )
         request = rewrite_request(
             question,
             history,
@@ -855,9 +851,18 @@ class ChatService:
                             elapsed_ms=round((time.perf_counter() - started) * 1000, 3),
                         )
                         self._sleep(retry_count)
-                rewritten = normalize_query(
-                    response.text.strip().strip("\"'"),
+                rewrite = parse_query_plan(
+                    response.text,
+                    original_query=question,
                     max_chars=self.settings.retrieval_query_max_chars,
+                    strategy="retrieval-query-plan",
+                    implementation="llm-query-planner",
+                    version="2.0.0",
+                    metadata={
+                        "history_message_count": len(history),
+                        "prompt_version": self.settings.query_rewrite_prompt_version,
+                        "invocation_id": str(invocation_id),
+                    },
                 )
                 latency_ms = round((time.perf_counter() - started) * 1000, 3)
                 self._complete_invocation(
@@ -869,7 +874,7 @@ class ChatService:
                     latency_ms=latency_ms,
                 )
                 generation.update(
-                    output=rewritten,
+                    output=rewrite.snapshot(),
                     metadata={"latency_ms": latency_ms, "retry_count": retry_count},
                     usage_details=_usage_details(response.usage),
                     cost_details=_cost_details(self._estimated_cost(response.usage)),
@@ -884,21 +889,7 @@ class ChatService:
                     total_tokens=response.usage.total_tokens,
                     finish_reason=response.finish_reason,
                 )
-                return (
-                    QueryRewriteResult(
-                        query=rewritten,
-                        strategy="conversation-aware",
-                        implementation="llm-query-rewriter",
-                        version="1.0.0",
-                        changed=rewritten != question,
-                        metadata={
-                            "history_message_count": len(history),
-                            "prompt_version": self.settings.query_rewrite_prompt_version,
-                            "invocation_id": str(invocation_id),
-                        },
-                    ),
-                    None,
-                )
+                return rewrite, None
             except (LLMProviderError, QueryError) as exc:
                 latency_ms = round((time.perf_counter() - started) * 1000, 3)
                 code = exc.code
@@ -928,14 +919,16 @@ class ChatService:
                 return (
                     QueryRewriteResult(
                         query=question,
-                        strategy="conversation-aware-fallback",
-                        implementation="llm-query-rewriter",
-                        version="1.0.0",
+                        strategy="retrieval-query-plan-fallback",
+                        implementation="llm-query-planner",
+                        version="2.0.0",
                         changed=False,
+                        semantic_query=question,
                         metadata={
                             "history_message_count": len(history),
                             "prompt_version": self.settings.query_rewrite_prompt_version,
                             "fallback_reason": code,
+                            "invocation_id": str(invocation_id),
                         },
                     ),
                     code,

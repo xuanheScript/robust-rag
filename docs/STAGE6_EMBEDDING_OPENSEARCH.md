@@ -49,9 +49,10 @@ Chunk Mapping 使用：
 
 - `icu_analyzer` 作为中英混合主分析器，同时提供 `.icu`、`.standard` 和必要的 `.keyword` 子字段。
 - `embedding` 使用 1024 维 `knn_vector`、Faiss HNSW 和 cosine space。
-- 文档、版本、Parent/相邻节点、来源定位、质量、Embedding 模型和更新时间均为严格字段；未知字段会被拒绝。
+- 文档、版本、分块运行、Parent/相邻节点、来源定位、质量、Embedding 模型和更新时间均为严格字段；未知字段会被拒绝。
 - 读别名带 `is_active=true` 过滤器。批量写入和数量核对完成前，新投影不可见。
 - `_id` 使用稳定的 Version ID 或 Node ID，重复执行覆盖已有文档，不创建重复记录。
+- 同一文档版本重新处理时，节点按本次 `chunking_run_id` 单独计数和激活，再清理旧分块运行的投影，避免新旧节点被合并计数或同时参与检索。
 
 Adapter 提供 BM25 与 Dense 低层检索契约供验收和阶段 7 复用；RRF、查询改写、多样性和 Reranker 仍属于阶段 7。
 
@@ -92,7 +93,7 @@ OPENSEARCH_URL
 OPENSEARCH_USERNAME
 OPENSEARCH_PASSWORD
 OPENSEARCH_CA_CERT
-OPENSEARCH_INDEX_CONFIG_VERSION=stage6-opensearch-v1
+OPENSEARCH_INDEX_CONFIG_VERSION=stage6-opensearch-v2
 ```
 
 缺少 Voyage Key 或 OpenSearch URL 时，Worker 不会伪造成功，也不会静默跳过；Job 会保存明确的不可重试配置错误。

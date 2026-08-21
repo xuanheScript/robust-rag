@@ -175,6 +175,7 @@ def _agent_debug(metadata: dict[str, object]) -> dict[str, object] | None:
         "tool_call_count",
         "agent_invocation_ids",
         "warnings",
+        "rewrite_warning",
     }
     return {key: value for key, value in metadata.items() if key in keys}
 

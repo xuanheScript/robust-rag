@@ -25,6 +25,7 @@ from robust_rag.parsing.schemas import (
     SourceLocator,
     SourceType,
 )
+from robust_rag.parsing.tables import linearize_table, table_model_from_html
 from robust_rag.quality.schemas import QualityDecision
 from robust_rag.quality.service import QualityService
 from robust_rag.storage.local import LocalFileStorage
@@ -233,6 +234,65 @@ def test_table_children_always_repeat_header_and_preserve_sheet_range() -> None:
         and child.source_locators[0].cell_range == "A1:B11"
         for child in result.children
     )
+
+
+def test_sectioned_key_value_table_chunks_inherit_entity_anchor() -> None:
+    html = (
+        "<table><tr><td>岗位名称</td><td colspan='3'>会计岗</td></tr>"
+        "<tr><td>所在部门</td><td>财务部</td><td>岗位定员</td><td>1人</td></tr>"
+        "<tr><td colspan='4'>岗位职责</td></tr>"
+        "<tr><td colspan='4'>1.负责编制财务报表;2.推进年度决算;"
+        "3.对接年度审计并推进问题整改;4.负责税务风险防控。</td></tr>"
+        "<tr><td colspan='4'>任职资格</td></tr>"
+        "<tr><td colspan='4'>大学本科及以上,财务、审计、税务等相关专业,"
+        "累计三年以上财务工作经历。</td></tr></table>"
+    )
+    model = table_model_from_html(html)
+    document = CanonicalDocument(
+        document_id=str(uuid.uuid4()),
+        document_version_id=str(uuid.uuid4()),
+        title="住众公司竞聘公告",
+        language="zh",
+        root_node_id="root",
+        blocks=[
+            _block("root", BlockType.DOCUMENT, "", parent_id=None, order=0),
+            _block(
+                "job-table",
+                BlockType.TABLE,
+                linearize_table(model),
+                parent_id="root",
+                order=1,
+                locator=SourceLocator(source_type=SourceType.PDF, page_number=1),
+                attributes={
+                    "table_model": model,
+                    "table_profile": model["profile"],
+                    "rows": model["grid"],
+                },
+            ),
+        ],
+    )
+    result = StructureAwareChunker(
+        ChunkingConfig(
+            parent_target_tokens=160,
+            parent_max_tokens=220,
+            child_target_tokens=80,
+            child_max_tokens=100,
+            child_overlap_tokens=10,
+        )
+    ).chunk(
+        document,
+        canonical_document_id=uuid.uuid4(),
+        quality_status=QualityDecision.PASSED,
+        quality_summary={},
+    )
+
+    assert result.parents[0].attributes["table_profile"]["kind"] == (
+        "sectioned_key_value"
+    )
+    assert any("岗位职责" in child.content for child in result.children)
+    assert any("任职资格" in child.content for child in result.children)
+    assert all("会计岗" in child.content for child in result.children)
+    assert all("财务部" in child.content for child in result.children)
 
 
 def build_chunking_service(

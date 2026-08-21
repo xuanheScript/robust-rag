@@ -177,7 +177,7 @@ class Settings(BaseSettings):
     dingo_llm_max_chars: int = Field(default=30000, ge=1000, validation_alias="DINGO_LLM_MAX_CHARS")
 
     chunking_config_version: str = Field(
-        default="stage5-parent-child-v1", validation_alias="CHUNKING_CONFIG_VERSION"
+        default="stage5-parent-child-v2", validation_alias="CHUNKING_CONFIG_VERSION"
     )
     chunking_parent_target_tokens: int = Field(
         default=1800, ge=1, validation_alias="CHUNKING_PARENT_TARGET_TOKENS"
@@ -256,7 +256,7 @@ class Settings(BaseSettings):
         default=30, gt=0, validation_alias="OPENSEARCH_TIMEOUT_SECONDS"
     )
     opensearch_index_config_version: str = Field(
-        default="stage6-opensearch-v1", validation_alias="OPENSEARCH_INDEX_CONFIG_VERSION"
+        default="stage6-opensearch-v2", validation_alias="OPENSEARCH_INDEX_CONFIG_VERSION"
     )
     opensearch_documents_index: str = Field(
         default="rag-documents-v1", validation_alias="OPENSEARCH_DOCUMENTS_INDEX"
@@ -434,14 +434,14 @@ class Settings(BaseSettings):
         default="stage8-grounded-rag-v2-zh", validation_alias="GENERATION_PROMPT_VERSION"
     )
     query_rewrite_prompt_version: str = Field(
-        default="stage8-conversation-rewrite-v2-zh",
+        default="stage8-retrieval-query-plan-v1-zh",
         validation_alias="QUERY_REWRITE_PROMPT_VERSION",
     )
     query_rewrite_history_messages: int = Field(
         default=6, ge=0, le=20, validation_alias="QUERY_REWRITE_HISTORY_MESSAGES"
     )
     query_rewrite_max_output_tokens: int = Field(
-        default=200, ge=1, le=1000, validation_alias="QUERY_REWRITE_MAX_OUTPUT_TOKENS"
+        default=500, ge=1, le=1000, validation_alias="QUERY_REWRITE_MAX_OUTPUT_TOKENS"
     )
     citation_excerpt_max_chars: int = Field(
         default=500, ge=50, le=5000, validation_alias="CITATION_EXCERPT_MAX_CHARS"
@@ -449,7 +449,7 @@ class Settings(BaseSettings):
 
     agentic_rag_enabled: bool = Field(default=False, validation_alias="AGENTIC_RAG_ENABLED")
     agent_graph_version: str = Field(
-        default="stage13-langgraph-agentic-rag-v1", validation_alias="AGENT_GRAPH_VERSION"
+        default="stage13-langgraph-agentic-rag-v2", validation_alias="AGENT_GRAPH_VERSION"
     )
     agent_prompt_version: str = Field(
         default="stage13-agent-decision-v3-zh", validation_alias="AGENT_PROMPT_VERSION"

@@ -9,8 +9,8 @@ SSE 转换为 AI SDK UI Message Stream v1。浏览器只访问 FastAPI，不直�
 AI SDK useChat
   → POST /api/v1/chat
   → 持久化 Conversation / User Message / Assistant Message
-  → 多轮 Query Rewrite（失败时降级为当前问题）
-  → 阶段 7 Hybrid + Rerank 与上下文组装
+  → 结构化 Query Plan（失败时降级为当前问题）
+  → 原查询与有界扩展查询并行召回、RRF、Rerank 与上下文组装
   → 无上下文：服务端确定性拒答
   → 有上下文：Grounded Prompt → 配置的 Responses API
   → Responses typed SSE → UI Message Stream v1
@@ -38,12 +38,14 @@ AI SDK useChat
 - 回答完成后只把实际出现的来源标签保存为 Citation；引用保存快照，因此来源后续删除不会
   破坏历史回答的可解释性。
 
-## 多轮 Query Rewrite
+## 结构化 Query Rewrite
 
 - 只从服务端已保存的最近对话消息构造改写输入，不信任浏览器提交的历史回答。
-- 无历史时使用当前规范化问题，不调用模型。
-- 有历史时让模型只解决指代和省略，返回单一可检索问题；原问题、改写问题、历史条数、Prompt
-  版本和调用 ID 均进入 Retrieval Trace。
+- 无论是否有历史都生成 Query Plan；历史只用于指代消解，首轮短查询仍会执行检索优化。
+- Query Plan 包含 standalone、semantic、最多两个 lexical 查询、实体、答案维度和显式过滤条件。
+- 原问题永远保留在召回集合中；BM25 和 Dense 分别融合自己的多查询结果，再进入跨模态 RRF，
+  Rerank 使用 standalone query。
+- 原问题、完整 Query Plan、历史条数、Prompt 版本和调用 ID 均进入 Retrieval Trace。
 - 改写调用失败、超时或返回非法问题时自动降级为当前问题，并通过 `data-warning` 显示降级。
 
 ## UI Message Stream
@@ -106,8 +108,9 @@ LLM_REASONING_EFFORT=medium
 LLM_TIMEOUT_SECONDS=120
 LLM_MAX_RETRIES=1
 GENERATION_PROMPT_VERSION=stage8-grounded-rag-v2-zh
-QUERY_REWRITE_PROMPT_VERSION=stage8-conversation-rewrite-v2-zh
+QUERY_REWRITE_PROMPT_VERSION=stage8-retrieval-query-plan-v1-zh
 QUERY_REWRITE_HISTORY_MESSAGES=6
+QUERY_REWRITE_MAX_OUTPUT_TOKENS=500
 ```
 
 模型价格不硬编码；只有显式配置输入/输出 Token 单价时才保存估算成本。

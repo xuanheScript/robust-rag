@@ -19,7 +19,7 @@ def test_settings_defaults_are_local_only() -> None:
     assert settings.quality_sparse_extraction_min_chars_per_mb == 100
     assert settings.dingo_enabled is False
     assert settings.dingo_llm_enabled is False
-    assert settings.chunking_config_version == "stage5-parent-child-v1"
+    assert settings.chunking_config_version == "stage5-parent-child-v2"
     assert settings.chunking_parent_target_tokens == 1800
     assert settings.chunking_child_overlap_tokens == 64
     assert settings.voyage_embedding_model == "voyage-4"
@@ -48,7 +48,7 @@ def test_settings_defaults_are_local_only() -> None:
     assert settings.llm_base_url == "https://api.openai.com/v1"
     assert settings.llm_model == "gpt-5.4"
     assert settings.agentic_rag_enabled is False
-    assert settings.agent_graph_version == "stage13-langgraph-agentic-rag-v1"
+    assert settings.agent_graph_version == "stage13-langgraph-agentic-rag-v2"
     assert settings.agent_reasoning_effort == "none"
     assert settings.langfuse_enabled is True
     assert settings.langfuse_base_url == "https://cloud.langfuse.com"

@@ -12,15 +12,15 @@
 START
   → Agent（LLM + 受控 Tools）
       ├─ 普通文本 → Direct Response → END
-      ├─ retrieve_enterprise_documents → Hybrid + Rerank
+      ├─ retrieve_enterprise_documents → Query Rewrite → Hybrid + Rerank
       │    ├─ 有来源 → Grounded Generation → END
       │    └─ 无来源 → Deterministic Refusal → END
-      └─ retrieve_enterprise_relationships → Hybrid + Graph + Rerank
+      └─ retrieve_enterprise_relationships → Query Rewrite → Hybrid + Graph + Rerank
            ├─ 有来源 → Grounded Generation → END
            └─ 无来源 → Deterministic Refusal → END
 ```
 
-这里没有 `fast_path`，也没有独立的问候/闲聊分类器。Agent LLM 根据服务端保存的对话历史自行决定直接回答还是调用工具；条件边只读取普通文本或一个受控 Tool Call。Agent 在 Tool Call 中直接生成完整、可独立检索的 Query，不再增加检索后的 LLM 评分和循环改写节点。
+这里没有 `fast_path`，也没有独立的问候/闲聊分类器。Agent LLM 根据服务端保存的对话历史自行决定直接回答还是调用工具；条件边只读取普通文本或一个受控 Tool Call。选择检索后进入独立的结构化 Query Rewrite 节点；Direct Response 跳过该节点。Query Rewrite 只执行一次，不增加检索后的 LLM 评分或循环改写。
 
 ## 3. 工具边界
 
@@ -36,6 +36,7 @@ START
 - 无来源时不再调用其他 LLM，直接返回确定性的信息不足响应。
 - 有来源时进入 Grounded Generation，由现有 Grounded Prompt 负责只依据来源回答、部分回答或说明信息不足。
 - Agent 产生的 Tool Query 可以使用有限、可信的服务端历史消解指代。
+- Query Rewrite 保留 Tool Query，并补充有界 semantic/lexical 查询；失败时回退 Tool Query。
 - 历史消息按 `created_at`、`finished_at` 和角色进行确定性排序；同一事务创建的 User/Assistant 消息即使 `created_at` 相同，也必须按 User → Assistant 顺序传入 Agent。
 - Direct Response 由 Agent Prompt 限定为问候、感谢、能力说明和普通交流，不允许陈述未经工具检索的企业事实。
 - Context Grader 改造方案作为独立设计文档保留，但当前代码、配置、SSE 和发布门槛均不依赖它。
@@ -44,7 +45,7 @@ START
 
 ```dotenv
 AGENTIC_RAG_ENABLED=false
-AGENT_GRAPH_VERSION=stage13-langgraph-agentic-rag-v1
+AGENT_GRAPH_VERSION=stage13-langgraph-agentic-rag-v2
 AGENT_PROMPT_VERSION=stage13-agent-decision-v3-zh
 AGENT_MAX_OUTPUT_TOKENS=500
 AGENT_REASONING_EFFORT=none

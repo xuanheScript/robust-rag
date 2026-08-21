@@ -297,7 +297,9 @@ def test_agent_document_tool_skips_graph_and_generates_grounded_answer(
     assert any(event["type"] == "data-tool-status" for event in events)
     assert provider.stream_requests[0].tools
     assert provider.stream_requests[0].text_format is None
-    assert provider.generate_requests == []
+    assert len(provider.generate_requests) == 1
+    assert provider.generate_requests[0].metadata["purpose"] == "query_rewrite"
+    assert provider.generate_requests[0].reasoning_effort == "none"
     assert len(provider.stream_requests) == 2
     with session_factory() as db:
         assistant = db.get(Message, prepared.assistant_message_id)
@@ -308,6 +310,51 @@ def test_agent_document_tool_skips_graph_and_generates_grounded_answer(
         assert trace.config_snapshot["graph_requested"] is False
         assert trace.graph_query_trace_id is None
         assert assistant.metadata_json["selected_tool"] == ("retrieve_enterprise_documents")
+
+
+def test_query_rewrite_failure_is_not_reported_as_agent_fallback(
+    session_factory: sessionmaker[Session],
+    storage: LocalFileStorage,
+) -> None:
+    class RewriteFailureProvider(FakeLLMProvider):
+        def generate(self, request: LLMRequest) -> LLMResponse:
+            self.generate_requests.append(request)
+            raise LLMProviderError(
+                "LLM_INCOMPLETE_RESPONSE",
+                "Generation service returned an incomplete response (max_output_tokens)",
+                retryable=False,
+            )
+
+    _, _, adapter = _ready_search_fixture(session_factory, storage)
+    provider = RewriteFailureProvider(
+        response_text="Grounded answer [S1]",
+        generate_responses=[_response(tool="retrieve_enterprise_documents")],
+    )
+    service = _service(session_factory, adapter, provider)
+
+    prepared, chunks = _chunks(service, _request("Policy"))
+    warnings = [
+        cast(dict[str, object], event["data"])
+        for event in _events(chunks)
+        if event["type"] == "data-warning"
+    ]
+
+    assert _answer(chunks) == "Grounded answer [S1]"
+    assert warnings == [
+        {
+            "code": "LLM_INCOMPLETE_RESPONSE",
+            "message": (
+                "Query planning was unavailable; retrieval continued with the tool query unchanged."
+            ),
+        }
+    ]
+    assert provider.generate_requests[0].max_output_tokens == 500
+    with session_factory() as db:
+        assistant = db.get(Message, prepared.assistant_message_id)
+        assert assistant is not None
+        assert assistant.metadata_json["rewrite_warning"] == "LLM_INCOMPLETE_RESPONSE"
+        assert assistant.metadata_json["warnings"] == []
+        assert len(cast(list[object], assistant.metadata_json["agent_invocation_ids"])) == 2
 
 
 def test_agent_mixed_output_prefers_tool_without_leaking_decision_text(

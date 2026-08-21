@@ -224,6 +224,83 @@ def test_mineru_content_list_mapping_and_zip_validation(tmp_path: Path) -> None:
     assert ppt.blocks[1].source_locators[0].slide_number == 1
 
 
+def test_mineru_raw_table_schema_preserves_spans_and_semantic_shape(tmp_path: Path) -> None:
+    pdf_path = tmp_path / "jobs.pdf"
+    pdf_path.write_bytes(b"%PDF-1.7\nfixture")
+    table_html = (
+        "<table><tr><td>岗位名称</td><td colspan='3'>会计岗</td></tr>"
+        "<tr><td>所在部门</td><td>财务部</td><td>岗位定员</td><td>1人</td></tr>"
+        "<tr><td colspan='4'>岗位职责</td></tr>"
+        "<tr><td colspan='4'>负责编制财务报表并推进年度决算和审计整改工作。</td></tr>"
+        "<tr><td colspan='4'>任职资格</td></tr>"
+        "<tr><td colspan='4'>大学本科及以上,累计三年以上财务相关工作经历。</td>"
+        "</tr></table>"
+    )
+    artifact = MinerUParser.from_content_list(
+        [
+            {
+                "type": "table",
+                "html": table_html,
+                "image_path": "table.jpg",
+                "page_idx": 0,
+                "bbox": [57, 150, 556, 590],
+            }
+        ],
+        metadata(pdf_path, "application/pdf"),
+    )
+
+    table = next(block for block in artifact.blocks if block.block_type is BlockType.TABLE)
+    model = table.attributes["table_model"]
+    assert artifact.metadata["mineru_output_schema"] == "mineru-raw-block-list/1"
+    assert model["profile"]["kind"] == "sectioned_key_value"
+    assert model["grid"][0] == ["岗位名称", "会计岗", "会计岗", "会计岗"]
+    assert model["rows"][0]["cells"][1]["colspan"] == 3
+    assert "岗位名称\t会计岗" in table.original_text
+    assert table.attributes["mineru"]["raw_payload"]["html"] == table_html
+
+
+def test_mineru_output_discovery_falls_back_from_incomplete_v2_table() -> None:
+    complete_html = "<table><tr><td>Name</td><td>Value</td></tr></table>"
+    payload = io.BytesIO()
+    with zipfile.ZipFile(payload, "w") as archive:
+        archive.writestr(
+            "report/report_content_list_v2.json",
+            json.dumps(
+                [
+                    [
+                        {
+                            "type": "table",
+                            "content": {
+                                "html": "",
+                                "image_source": {"path": ""},
+                                "table_caption": [],
+                                "table_footnote": [],
+                            },
+                            "bbox": [0, 0, 100, 100],
+                        }
+                    ]
+                ]
+            ),
+        )
+        archive.writestr(
+            "report/report_content_list.json",
+            json.dumps(
+                [
+                    {
+                        "type": "table",
+                        "table_body": complete_html,
+                        "page_idx": 0,
+                    }
+                ]
+            ),
+        )
+
+    decoded, _ = MinerUParser._extract_best_output(payload.getvalue())
+
+    assert decoded.schema == "mineru-content-list/1"
+    assert decoded.items[0]["table_body"] == complete_html
+
+
 def test_mineru_precision_api_signed_upload_poll_and_download(tmp_path: Path) -> None:
     pdf_path = tmp_path / "report.pdf"
     pdf_bytes = b"%PDF-1.7\nprecision"

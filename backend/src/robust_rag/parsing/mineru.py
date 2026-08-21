@@ -10,9 +10,16 @@ from pathlib import Path
 from typing import Any, BinaryIO
 
 import httpx
-from bs4 import BeautifulSoup
 
 from robust_rag.parsing.base import FileMetadata, ParseError
+from robust_rag.parsing.mineru_decoders import (
+    ContentListV2Decoder,
+    DecodedMinerUOutput,
+    FlatContentListDecoder,
+    MiddleJsonDecoder,
+    MinerUOutputDecoder,
+    output_quality,
+)
 from robust_rag.parsing.native import HtmlParser
 from robust_rag.parsing.schemas import (
     BlockType,
@@ -21,6 +28,7 @@ from robust_rag.parsing.schemas import (
     SourceLocator,
     SourceType,
 )
+from robust_rag.parsing.tables import linearize_table, table_model_from_html
 
 PRECISION_EXTENSIONS = {".pdf", ".doc", ".docx", ".ppt", ".pptx", ".htm", ".html"}
 TERMINAL_STATES = {"done", "failed"}
@@ -32,7 +40,7 @@ class MinerUParser:
     """Parse supported documents through MinerU's token-authenticated precision API."""
 
     name = "mineru-precision"
-    version = "api-v4-content-list-v1"
+    version = "api-v4-versioned-output-v2"
     mode = "precision-cloud"
 
     def __init__(
@@ -145,11 +153,12 @@ class MinerUParser:
         except (httpx.HTTPError, OSError) as exc:
             raise ParseError("MINERU_REQUEST_FAILED", str(exc), retryable=True) from exc
 
+        decoded: DecodedMinerUOutput | None = None
         if metadata.extension in {".htm", ".html"}:
             artifact, files = self._artifact_from_html_zip(archive_response.content, metadata)
         else:
-            content_list, files = self._extract_content_list(archive_response.content)
-            artifact = self.from_content_list(content_list, metadata)
+            decoded, files = self._extract_best_output(archive_response.content)
+            artifact = self.from_decoded_output(decoded, metadata)
 
         return artifact.model_copy(
             update={
@@ -160,6 +169,10 @@ class MinerUParser:
                     "mineru_data_id": data_id,
                     "mineru_trace_id": result_trace_id or create_trace_id,
                     "mineru_model_version": model_version,
+                    "mineru_output_schema": decoded.schema if decoded else None,
+                    "mineru_output_backend": decoded.backend if decoded else None,
+                    "mineru_output_version": decoded.version if decoded else None,
+                    "mineru_output_warnings": list(decoded.warnings) if decoded else [],
                     "result_files": files,
                 }
             }
@@ -317,6 +330,92 @@ class MinerUParser:
             raise ParseError("MINERU_OUTPUT_INVALID", "MinerU content_list must be a JSON array")
         return value, names
 
+    @staticmethod
+    def _extract_best_output(payload: bytes) -> tuple[DecodedMinerUOutput, list[str]]:
+        """Discover, validate, and select the most complete structured MinerU artifact."""
+
+        try:
+            with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+                names = archive.namelist()
+                candidates: list[DecodedMinerUOutput] = []
+                specs: list[tuple[MinerUOutputDecoder, list[str]]] = [
+                    (
+                        ContentListV2Decoder(),
+                        [
+                            name
+                            for name in names
+                            if name == "content_list_v2.json"
+                            or name.endswith("_content_list_v2.json")
+                            or name.endswith("/content_list_v2.json")
+                        ],
+                    ),
+                    (
+                        FlatContentListDecoder(),
+                        [
+                            name
+                            for name in names
+                            if name == "content_list.json"
+                            or name.endswith("_content_list.json")
+                            or name.endswith("/content_list.json")
+                        ],
+                    ),
+                    (
+                        MiddleJsonDecoder(),
+                        [
+                            name
+                            for name in names
+                            if name == "middle.json"
+                            or name.endswith("_middle.json")
+                            or name.endswith("/middle.json")
+                        ],
+                    ),
+                ]
+                decode_warnings: list[str] = []
+                for decoder, matched_names in specs:
+                    if not matched_names:
+                        continue
+                    member = sorted(matched_names)[0]
+                    try:
+                        value = MinerUParser._read_json_member(archive, member)
+                        candidates.append(decoder.decode(value))
+                    except (ValueError, json.JSONDecodeError) as exc:
+                        decode_warnings.append(
+                            f"MINERU_OUTPUT_DECODER_FAILED:{decoder.schema}:{type(exc).__name__}"
+                        )
+        except zipfile.BadZipFile as exc:
+            raise ParseError("MINERU_OUTPUT_INVALID", "MinerU did not return a valid ZIP") from exc
+
+        if not candidates:
+            raise ParseError(
+                "MINERU_OUTPUT_INVALID",
+                "MinerU result did not contain a supported structured output",
+            )
+        ranked: list[tuple[int, int, DecodedMinerUOutput, list[str]]] = []
+        for priority, candidate in enumerate(candidates):
+            score, warnings = output_quality(candidate)
+            ranked.append((score, -priority, candidate, warnings))
+        _, _, selected, quality_warnings = max(ranked, key=lambda value: (value[0], value[1]))
+        selected = DecodedMinerUOutput(
+            schema=selected.schema,
+            backend=selected.backend,
+            version=selected.version,
+            items=selected.items,
+            warnings=tuple(
+                dict.fromkeys([*selected.warnings, *quality_warnings, *decode_warnings])
+            ),
+        )
+        return selected, names
+
+    @staticmethod
+    def _read_json_member(archive: zipfile.ZipFile, member: str) -> object:
+        info = archive.getinfo(member)
+        if info.flag_bits & 0x1:
+            raise ValueError("Encrypted MinerU ZIP members are not supported")
+        if info.file_size > 100 * 1024 * 1024:
+            raise ValueError("MinerU structured output is unexpectedly large")
+        with archive.open(info) as source:
+            return json.load(source)
+
     @classmethod
     def _artifact_from_html_zip(
         cls, payload: bytes, metadata: FileMetadata
@@ -362,13 +461,23 @@ class MinerUParser:
     def from_content_list(
         cls, content_list: list[dict[str, Any]], metadata: FileMetadata
     ) -> ParseArtifact:
+        try:
+            decoded = FlatContentListDecoder().decode(content_list)
+        except ValueError as exc:
+            raise ParseError("MINERU_OUTPUT_INVALID", str(exc)) from exc
+        return cls.from_decoded_output(decoded, metadata)
+
+    @classmethod
+    def from_decoded_output(
+        cls, decoded: DecodedMinerUOutput, metadata: FileMetadata
+    ) -> ParseArtifact:
         blocks: list[ParsedBlock] = []
         container_refs: dict[int, str] = {}
         discarded = {"header", "footer", "page_number", "aside_text"}
         title: str | None = None
         sequence = 0
         source_type, container_type, count_key = cls._source_context(metadata.extension)
-        for item in content_list:
+        for item in decoded.items:
             item_type = str(item.get("type", "text"))
             if item_type in discarded:
                 continue
@@ -389,11 +498,19 @@ class MinerUParser:
             sequence += 1
             parent_ref = container_refs[source_number]
             block_ref = f"mineru-{sequence:05d}"
+            source_metadata = {
+                "source_schema": item.get("_mineru_source_schema", decoded.schema),
+                "backend": decoded.backend,
+                "version": decoded.version,
+                "raw_payload": item.get("raw_payload", item),
+            }
             if item_type == "text":
                 text = str(item.get("text", ""))
                 level = int(item.get("text_level", 0) or 0)
                 block_type = BlockType.HEADING if level > 0 else BlockType.PARAGRAPH
-                attributes: dict[str, Any] = {"level": level} if level else {}
+                attributes: dict[str, Any] = {"mineru": source_metadata}
+                if level:
+                    attributes["level"] = level
                 if title is None and level == 1 and text.strip():
                     title = text.strip()
                 blocks.append(
@@ -408,14 +525,36 @@ class MinerUParser:
                 )
             elif item_type == "table":
                 body = str(item.get("table_body", ""))
-                table_text = BeautifulSoup(body, "html.parser").get_text("\t", strip=True)
+                captions = cls._string_values(item.get("table_caption"))
+                footnotes = cls._string_values(item.get("table_footnote"))
+                image_ref = str(item.get("img_path") or "") or None
+                table_model = table_model_from_html(
+                    body,
+                    captions=captions,
+                    footnotes=footnotes,
+                    image_ref=image_ref,
+                )
+                table_text = linearize_table(table_model)
+                parse_status = str(table_model.get("parse_status", "unknown"))
+                if not table_text:
+                    table_text = "表格内容未成功解析"
                 blocks.append(
                     ParsedBlock(
                         ref=block_ref,
                         parent_ref=parent_ref,
                         block_type=BlockType.TABLE,
                         original_text=table_text,
-                        attributes={"table_html": body},
+                        attributes={
+                            "table_html": body,
+                            "table_model": table_model,
+                            "table_profile": table_model.get("profile", {}),
+                            "rows": table_model.get("grid", []),
+                            "table_type": item.get("table_type"),
+                            "table_nest_level": item.get("table_nest_level"),
+                            "parse_status": parse_status,
+                            "degraded": parse_status != "ok",
+                            "mineru": source_metadata,
+                        },
                         source_locators=[locator],
                     )
                 )
@@ -427,7 +566,10 @@ class MinerUParser:
                         parent_ref=parent_ref,
                         block_type=BlockType.FORMULA,
                         original_text=str(item.get("text", "")),
-                        attributes={"format": item.get("text_format")},
+                        attributes={
+                            "format": item.get("text_format"),
+                            "mineru": source_metadata,
+                        },
                         source_locators=[locator],
                     )
                 )
@@ -438,7 +580,10 @@ class MinerUParser:
                         parent_ref=parent_ref,
                         block_type=BlockType.CODE,
                         original_text=str(item.get("code_body", item.get("text", ""))),
-                        attributes={"sub_type": item.get("sub_type")},
+                        attributes={
+                            "sub_type": item.get("sub_type"),
+                            "mineru": source_metadata,
+                        },
                         source_locators=[locator],
                     )
                 )
@@ -450,7 +595,11 @@ class MinerUParser:
                         parent_ref=parent_ref,
                         block_type=BlockType.LIST,
                         original_text="\n".join(str(value) for value in items),
-                        attributes={"sub_type": item.get("sub_type"), "items": items},
+                        attributes={
+                            "sub_type": item.get("sub_type"),
+                            "items": items,
+                            "mineru": source_metadata,
+                        },
                         source_locators=[locator],
                     )
                 )
@@ -461,19 +610,51 @@ class MinerUParser:
                         parent_ref=parent_ref,
                         block_type=BlockType.FOOTNOTE,
                         original_text=str(item.get("text", "")),
+                        attributes={"mineru": source_metadata},
                         source_locators=[locator],
                     )
                 )
             elif item_type in {"image", "chart"}:
                 cls._append_captions(blocks, item, item_type, parent_ref, locator, sequence)
+            elif item_type == "unknown":
+                text = str(item.get("text", "")).strip()
+                if text:
+                    blocks.append(
+                        ParsedBlock(
+                            ref=block_ref,
+                            parent_ref=parent_ref,
+                            block_type=BlockType.NOTE,
+                            original_text=text,
+                            attributes={
+                                "unknown_mineru_type": True,
+                                "mineru": source_metadata,
+                            },
+                            source_locators=[locator],
+                        )
+                    )
         return ParseArtifact(
             parser_name=cls.name,
             parser_version=cls.version,
             parser_mode=cls.mode,
             title=title or Path(metadata.filename).stem,
-            metadata={"filename": metadata.filename, count_key: len(container_refs)},
+            metadata={
+                "filename": metadata.filename,
+                count_key: len(container_refs),
+                "mineru_output_schema": decoded.schema,
+                "mineru_output_backend": decoded.backend,
+                "mineru_output_version": decoded.version,
+                "mineru_output_warnings": list(decoded.warnings),
+            },
             blocks=blocks,
         )
+
+    @staticmethod
+    def _string_values(value: object) -> list[str]:
+        if isinstance(value, str):
+            return [value] if value.strip() else []
+        if isinstance(value, list):
+            return [str(item) for item in value if str(item).strip()]
+        return []
 
     @staticmethod
     def _source_context(extension: str) -> tuple[SourceType, BlockType, str]:

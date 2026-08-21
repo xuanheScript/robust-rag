@@ -79,6 +79,12 @@ export function DocumentsPage() {
     ?? quality.data?.[0]?.document_version_id
     ?? versions.data?.[0]?.id
     ?? null;
+  const latestJob = jobs.data?.items.find(
+    (job) => job.document_version_id === detailVersionId,
+  );
+  const selectedDocumentId = selected?.id;
+  const latestJobId = latestJob?.id;
+  const latestJobUpdatedAt = latestJob?.updated_at;
   const graphRuns = useQuery({
     queryKey: ["document-graph-runs", selected?.id, detailVersionId],
     queryFn: ({ signal }) => getDocumentGraphRuns(
@@ -116,6 +122,20 @@ export function DocumentsPage() {
     ),
     enabled: Boolean(detailVersionId),
   });
+  useEffect(() => {
+    if (!selectedDocumentId || !latestJobId) return;
+    void Promise.all([
+      queryClient.invalidateQueries({ queryKey: ["documents"] }),
+      queryClient.invalidateQueries({ queryKey: ["document-versions", selectedDocumentId] }),
+      queryClient.invalidateQueries({ queryKey: ["document-quality", selectedDocumentId] }),
+      queryClient.invalidateQueries({
+        queryKey: ["document-quality-review-actions", selectedDocumentId],
+      }),
+      queryClient.invalidateQueries({
+        queryKey: ["document-chunking-runs", selectedDocumentId, detailVersionId],
+      }),
+    ]);
+  }, [detailVersionId, latestJobId, latestJobUpdatedAt, queryClient, selectedDocumentId]);
   const action = useMutation({
     mutationFn: (value: Action) => value.run(),
     onSuccess: async (_data, value) => {
@@ -188,6 +208,8 @@ export function DocumentsPage() {
     : latestReviewAction?.action === "reject"
       ? "rejected"
       : latestAssessment?.decision;
+  const chunkGateQuarantined = latestJob?.status === "quarantined"
+    && latestJob.current_stage === "chunk_evaluating";
   const graphIsBusy = ["pending", "running"].includes(currentVersion?.graph_status ?? "");
 
   if (documents.isPending) return <Loading label="正在读取文档" />;
@@ -366,11 +388,26 @@ export function DocumentsPage() {
             </section>
             <section className="detail-section quality-section">
               <div className="section-title"><h4>质量评估</h4></div>
+              {chunkGateQuarantined ? (
+                <div className="quality-summary-card">
+                  <div className="quality-score"><strong>!</strong><span>分块门禁</span></div>
+                  <div className="quality-summary-copy">
+                    <div><StatusBadge value="quarantined" /><strong>最新处理在分块质量评估阶段被隔离</strong></div>
+                    <p>{latestJob.error_message ?? "检索节点未通过结构完整性检查。"} 这不是下面显示的文档级质量报告。</p>
+                  </div>
+                  <button
+                    className="primary-button"
+                    onClick={() => { setDebugStage("chunk"); setDebugOpen(true); }}
+                  >
+                    检查最新分块 →
+                  </button>
+                </div>
+              ) : null}
               {quality.isPending ? <Loading /> : quality.data?.length ? (
                 <div className="quality-summary-card">
                   <div className="quality-score"><strong>{Math.round((quality.data[0].overall_score ?? 0) * 100)}</strong><span>综合分</span></div>
                   <div className="quality-summary-copy">
-                    <div><StatusBadge value={effectiveQualityStatus} /><strong>{quality.data[0].issues_json.length} 个质量问题</strong></div>
+                    <div><StatusBadge value={effectiveQualityStatus} /><strong>{chunkGateQuarantined ? "上一次文档级评估" : `${quality.data[0].issues_json.length} 个质量问题`}</strong></div>
                     <p>{latestReviewAction?.action === "release" ? "该文档已人工放行；原始隔离结论和审核依据均已保留。" : latestReviewAction?.action === "reject" ? "该文档已经人工驳回，不会进入知识库检索。" : quality.data[0].decision === "quarantined" ? "该文档已暂停处理，需要完成独立质量审核后才能继续。" : "查看本次评估的维度、问题和检测证据。"}</p>
                   </div>
                   <button

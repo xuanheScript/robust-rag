@@ -88,14 +88,22 @@ class IndexingService:
             "chunks_read_alias": self.settings.opensearch_chunks_read_alias,
             "chunks_write_alias": self.settings.opensearch_chunks_write_alias,
             "bulk_actions": self.settings.opensearch_bulk_actions,
-            "mapping": "stage6-strict-icu-faiss-hnsw-cosine-v1",
+            "mapping": "stage6-strict-icu-faiss-hnsw-cosine-v2",
         }
 
     def execute(self, job_id: uuid.UUID) -> str:
         prepared = self._prepare(job_id)
         if isinstance(prepared, str):
             return prepared
-        run_id, stage_id, version_id, old_version_id, document_projection, nodes = prepared
+        (
+            run_id,
+            stage_id,
+            version_id,
+            chunking_run_id,
+            old_version_id,
+            document_projection,
+            nodes,
+        ) = prepared
         projection_ready = False
         try:
             capabilities = self._retry(self.adapter.capabilities)
@@ -121,21 +129,30 @@ class IndexingService:
                     chunks_write_alias=self.settings.opensearch_chunks_write_alias,
                 )
             )
-            self._upsert_batches(self.settings.opensearch_documents_index, [document_projection])
             self._upsert_batches(self.settings.opensearch_chunks_index, nodes)
             expected_documents = 1
             expected_nodes = len(nodes)
+            actual_nodes = self.adapter.count_chunking_run(
+                self.settings.opensearch_chunks_index,
+                str(version_id),
+                str(chunking_run_id),
+            )
+            if actual_nodes != expected_nodes:
+                raise OpenSearchAdapterError(
+                    "OPENSEARCH_COUNT_MISMATCH",
+                    f"Expected {expected_nodes} projections for chunking run "
+                    f"{chunking_run_id} but found {actual_nodes}",
+                    retryable=True,
+                )
+            self._upsert_batches(self.settings.opensearch_documents_index, [document_projection])
             actual_documents = self.adapter.count_version(
                 self.settings.opensearch_documents_index, str(version_id)
             )
-            actual_nodes = self.adapter.count_version(
-                self.settings.opensearch_chunks_index, str(version_id)
-            )
-            if actual_documents != expected_documents or actual_nodes != expected_nodes:
+            if actual_documents != expected_documents:
                 raise OpenSearchAdapterError(
                     "OPENSEARCH_COUNT_MISMATCH",
-                    f"Expected {expected_documents}/{expected_nodes} projections but found "
-                    f"{actual_documents}/{actual_nodes}",
+                    f"Expected {expected_documents} document projection but found "
+                    f"{actual_documents}",
                     retryable=True,
                 )
             projection_ready = True
@@ -145,10 +162,29 @@ class IndexingService:
                 )
             )
             self._retry(
-                lambda: self.adapter.activate_version(
-                    self.settings.opensearch_chunks_index, str(version_id)
+                lambda: self.adapter.activate_chunking_run(
+                    self.settings.opensearch_chunks_index,
+                    str(version_id),
+                    str(chunking_run_id),
                 )
             )
+            self._retry(
+                lambda: self.adapter.delete_stale_chunking_runs(
+                    self.settings.opensearch_chunks_index,
+                    str(version_id),
+                    str(chunking_run_id),
+                )
+            )
+            actual_nodes = self.adapter.count_version(
+                self.settings.opensearch_chunks_index, str(version_id)
+            )
+            if actual_nodes != expected_nodes:
+                raise OpenSearchAdapterError(
+                    "OPENSEARCH_COUNT_MISMATCH",
+                    f"Expected {expected_nodes} projections after replacing stale chunking "
+                    f"runs but found {actual_nodes}",
+                    retryable=True,
+                )
             if old_version_id is not None and old_version_id != version_id:
                 self._delete_version(old_version_id)
                 if self.adapter.count_version(
@@ -162,9 +198,11 @@ class IndexingService:
                         retryable=True,
                     )
         except OpenSearchAdapterError as exc:
-            if projection_ready:
+            if projection_ready and old_version_id != version_id:
                 self._rollback_projection(version_id, old_version_id)
-            self._record_failure(job_id, run_id, stage_id, version_id, exc)
+            elif old_version_id == version_id:
+                self._restore_document_visibility(version_id)
+            self._record_failure(job_id, run_id, stage_id, version_id, chunking_run_id, exc)
             return "failed"
         if old_version_id is not None:
             self._invalidate_graph_version(old_version_id)
@@ -176,6 +214,7 @@ class IndexingService:
             old_version_id,
             capabilities.snapshot(),
             len(nodes),
+            chunking_run_id,
         )
         return "succeeded"
 
@@ -215,22 +254,45 @@ class IndexingService:
             versions = list(db.scalars(statement))
             document_values: list[dict[str, object]] = []
             node_values: list[dict[str, object]] = []
+            chunking_runs: dict[uuid.UUID, tuple[uuid.UUID, int]] = {}
             for version in versions:
-                nodes = list(
-                    db.scalars(
-                        select(RetrievalNode).where(
-                            RetrievalNode.document_version_id == version.id,
-                            RetrievalNode.embedding_status == ProjectionStatus.SUCCEEDED,
-                        )
-                    )
-                )
+                projection = self._latest_embedded_nodes(db, version.id)
+                if projection is None:
+                    continue
+                chunking_run_id, nodes = projection
                 document_values.append(self._document_projection(version))
                 node_values.extend(self._node_projection(node, version) for node in nodes)
+                chunking_runs[version.id] = (chunking_run_id, len(nodes))
         self._upsert_batches(self.settings.opensearch_documents_index, document_values)
         self._upsert_batches(self.settings.opensearch_chunks_index, node_values)
         for version in versions:
+            active_projection = chunking_runs.get(version.id)
+            if active_projection is None:
+                continue
+            chunking_run_id, expected_nodes = active_projection
+            actual_nodes = self.adapter.count_chunking_run(
+                self.settings.opensearch_chunks_index,
+                str(version.id),
+                str(chunking_run_id),
+            )
+            if actual_nodes != expected_nodes:
+                raise OpenSearchAdapterError(
+                    "OPENSEARCH_COUNT_MISMATCH",
+                    f"Expected {expected_nodes} projections for chunking run "
+                    f"{chunking_run_id} but found {actual_nodes}",
+                    retryable=True,
+                )
             self.adapter.activate_version(self.settings.opensearch_documents_index, str(version.id))
-            self.adapter.activate_version(self.settings.opensearch_chunks_index, str(version.id))
+            self.adapter.activate_chunking_run(
+                self.settings.opensearch_chunks_index,
+                str(version.id),
+                str(chunking_run_id),
+            )
+            self.adapter.delete_stale_chunking_runs(
+                self.settings.opensearch_chunks_index,
+                str(version.id),
+                str(chunking_run_id),
+            )
         return {"documents": len(document_values), "nodes": len(node_values)}
 
     def delete_document_projection(self, document_id: uuid.UUID) -> dict[str, int]:
@@ -390,9 +452,7 @@ class IndexingService:
             version = db.get(DocumentVersion, version_id)
             if version is None:
                 return
-            had_projection = bool(
-                version.graph_active or version.graph_projected_at is not None
-            )
+            had_projection = bool(version.graph_active or version.graph_projected_at is not None)
             version.graph_active = False
             version.graph_status = (
                 GraphProjectionStatus.STALE
@@ -405,6 +465,7 @@ class IndexingService:
     ) -> (
         str
         | tuple[
+            uuid.UUID,
             uuid.UUID,
             uuid.UUID,
             uuid.UUID,
@@ -498,7 +559,7 @@ class IndexingService:
                 job_id=job.id,
                 stage_name=StageName.INDEXING,
                 implementation_name="opensearch-projection",
-                implementation_version="1.0.0",
+                implementation_version="2.0.0",
                 config_version=self.settings.opensearch_index_config_version,
                 config_snapshot=self.config_snapshot,
                 status=StageRunStatus.RUNNING,
@@ -518,6 +579,7 @@ class IndexingService:
                 run.id,
                 stage.id,
                 job.document_version.id,
+                embedding_run.chunking_run_id,
                 old_version_id,
                 self._document_projection(job.document_version),
                 [self._node_projection(node, job.document_version) for node in nodes],
@@ -532,6 +594,7 @@ class IndexingService:
         old_version_id: uuid.UUID | None,
         capabilities: dict[str, object],
         node_count: int,
+        chunking_run_id: uuid.UUID,
     ) -> None:
         with self.session_factory.begin() as db:
             job = db.get(IngestionJob, job_id)
@@ -550,7 +613,11 @@ class IndexingService:
             for node in db.scalars(
                 select(RetrievalNode).where(RetrievalNode.document_version_id == version_id)
             ):
-                node.index_status = ProjectionStatus.SUCCEEDED
+                node.index_status = (
+                    ProjectionStatus.SUCCEEDED
+                    if node.chunking_run_id == chunking_run_id
+                    else ProjectionStatus.STALE
+                )
             self._mark_ready(job, version_id, old_version_id)
 
     def _record_failure(
@@ -559,6 +626,7 @@ class IndexingService:
         run_id: uuid.UUID,
         stage_id: uuid.UUID,
         version_id: uuid.UUID,
+        chunking_run_id: uuid.UUID,
         error: OpenSearchAdapterError,
     ) -> None:
         with self.session_factory.begin() as db:
@@ -582,17 +650,23 @@ class IndexingService:
                 stage.error = value
                 stage.finished_at = now
             for node in db.scalars(
-                select(RetrievalNode).where(RetrievalNode.document_version_id == version_id)
+                select(RetrievalNode).where(
+                    RetrievalNode.document_version_id == version_id,
+                    RetrievalNode.chunking_run_id == chunking_run_id,
+                )
             ):
                 node.index_status = ProjectionStatus.FAILED
             if job is not None:
                 self._fail_job(job, error.code, error.message)
 
     def _upsert_batches(self, index: str, documents: list[dict[str, object]]) -> None:
+        if not documents:
+            return
         size = self.settings.opensearch_bulk_actions
         for start in range(0, len(documents), size):
             batch = documents[start : start + size]
             self._retry(partial(self.adapter.bulk_upsert, index, batch))
+        self._retry(partial(self.adapter.refresh, index))
 
     def _retry(self, operation: Callable[[], T]) -> T:
         for retry_count in range(self.settings.opensearch_max_retries + 1):
@@ -622,6 +696,18 @@ class IndexingService:
             )
         )
 
+    def _restore_document_visibility(self, version_id: uuid.UUID) -> None:
+        """Keep the existing document visible when same-version replacement fails."""
+
+        try:
+            self._retry(
+                lambda: self.adapter.activate_version(
+                    self.settings.opensearch_documents_index, str(version_id)
+                )
+            )
+        except OpenSearchAdapterError:
+            return
+
     def _rollback_projection(self, version_id: uuid.UUID, old_version_id: uuid.UUID | None) -> None:
         """Best-effort restoration if activation or old-version removal fails."""
 
@@ -633,14 +719,10 @@ class IndexingService:
                 old_version = db.get(DocumentVersion, old_version_id)
                 if old_version is None:
                     return
-                old_nodes = list(
-                    db.scalars(
-                        select(RetrievalNode).where(
-                            RetrievalNode.document_version_id == old_version_id,
-                            RetrievalNode.embedding_status == ProjectionStatus.SUCCEEDED,
-                        )
-                    )
-                )
+                old_projection = self._latest_embedded_nodes(db, old_version_id)
+                if old_projection is None:
+                    return
+                old_chunking_run_id, old_nodes = old_projection
                 document_projection = self._document_projection(old_version)
                 node_projections = [self._node_projection(node, old_version) for node in old_nodes]
             self._upsert_batches(self.settings.opensearch_documents_index, [document_projection])
@@ -648,11 +730,43 @@ class IndexingService:
             self.adapter.activate_version(
                 self.settings.opensearch_documents_index, str(old_version_id)
             )
-            self.adapter.activate_version(
-                self.settings.opensearch_chunks_index, str(old_version_id)
+            self.adapter.activate_chunking_run(
+                self.settings.opensearch_chunks_index,
+                str(old_version_id),
+                str(old_chunking_run_id),
+            )
+            self.adapter.delete_stale_chunking_runs(
+                self.settings.opensearch_chunks_index,
+                str(old_version_id),
+                str(old_chunking_run_id),
             )
         except Exception:
             return
+
+    @staticmethod
+    def _latest_embedded_nodes(
+        db: Session, version_id: uuid.UUID
+    ) -> tuple[uuid.UUID, list[RetrievalNode]] | None:
+        embedding_run = db.scalar(
+            select(EmbeddingRun)
+            .where(
+                EmbeddingRun.document_version_id == version_id,
+                EmbeddingRun.status == ProjectionRunStatus.SUCCEEDED,
+            )
+            .order_by(EmbeddingRun.finished_at.desc())
+            .limit(1)
+        )
+        if embedding_run is None:
+            return None
+        nodes = list(
+            db.scalars(
+                select(RetrievalNode).where(
+                    RetrievalNode.chunking_run_id == embedding_run.chunking_run_id,
+                    RetrievalNode.embedding_status == ProjectionStatus.SUCCEEDED,
+                )
+            )
+        )
+        return embedding_run.chunking_run_id, nodes
 
     @staticmethod
     def _document_projection(version: DocumentVersion) -> dict[str, object]:
@@ -684,6 +798,7 @@ class IndexingService:
             "node_id": str(node.id),
             "document_id": str(node.document_id),
             "document_version_id": str(node.document_version_id),
+            "chunking_run_id": str(node.chunking_run_id),
             "parent_node_id": str(node.parent_node_id) if node.parent_node_id else None,
             "previous_node_id": str(node.previous_node_id) if node.previous_node_id else None,
             "next_node_id": str(node.next_node_id) if node.next_node_id else None,
@@ -812,12 +927,32 @@ class UnavailableOpenSearchAdapter:
         del index, documents
         self._raise()
 
+    def refresh(self, index: str) -> None:
+        del index
+        self._raise()
+
     def count_version(self, index: str, document_version_id: str) -> int:
         del index, document_version_id
         self._raise()
 
+    def count_chunking_run(self, index: str, document_version_id: str, chunking_run_id: str) -> int:
+        del index, document_version_id, chunking_run_id
+        self._raise()
+
     def activate_version(self, index: str, document_version_id: str) -> None:
         del index, document_version_id
+        self._raise()
+
+    def activate_chunking_run(
+        self, index: str, document_version_id: str, chunking_run_id: str
+    ) -> None:
+        del index, document_version_id, chunking_run_id
+        self._raise()
+
+    def delete_stale_chunking_runs(
+        self, index: str, document_version_id: str, chunking_run_id: str
+    ) -> None:
+        del index, document_version_id, chunking_run_id
         self._raise()
 
     def delete_version(self, index: str, document_version_id: str) -> None:

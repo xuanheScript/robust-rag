@@ -639,7 +639,17 @@ def test_multiturn_rewrite_is_saved_and_generation_failure_is_explainable(
 ) -> None:
     _, _, search_adapter = _ready_search_fixture(session_factory, storage)
     provider = FakeLLMProvider(
-        response_text="Initial answer [S1]", generate_text="Policy effective date"
+        response_text="Initial answer [S1]",
+        generate_text=json.dumps(
+            {
+                "standalone_query": "Policy effective date",
+                "semantic_query": "When does the Policy take effect?",
+                "lexical_queries": ["Policy effective date"],
+                "entities": ["Policy"],
+                "answer_facets": ["effective date"],
+                "filters": {},
+            }
+        ),
     )
     service = _chat_service(session_factory, search_adapter, provider)
     first = service.prepare(_request("Policy"))
@@ -648,14 +658,21 @@ def test_multiturn_rewrite_is_saved_and_generation_failure_is_explainable(
     second = service.prepare(_request("它什么时候生效\uff1f", first.conversation_id))
     assert second.rewritten_question == "Policy effective date"
     assert second.retrieval is not None
-    assert len(provider.generate_requests) == 1
+    assert len(provider.generate_requests) == 2
+    assert all(
+        request.metadata["purpose"] == "query_rewrite"
+        for request in provider.generate_requests
+    )
+    assert all(request.reasoning_effort == "none" for request in provider.generate_requests)
     with session_factory() as db:
         trace = db.get(RetrievalTrace, second.retrieval.trace_id)
         assert trace is not None
         assert trace.query_original == "它什么时候生效?"
         assert trace.query_rewritten == "Policy effective date"
         assert trace.rewrite_snapshot["history_message_count"] == 2
-        assert trace.rewrite_snapshot["prompt_version"] == ("stage8-conversation-rewrite-v2-zh")
+        assert trace.rewrite_snapshot["prompt_version"] == (
+            "stage8-retrieval-query-plan-v1-zh"
+        )
 
     provider.failure = LLMProviderError(
         "LLM_UNAVAILABLE",

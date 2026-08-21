@@ -28,7 +28,7 @@ from robust_rag.indexing.embedding import (
     VoyageEmbeddingAdapter,
 )
 from robust_rag.indexing.embedding_service import EmbeddingService
-from robust_rag.indexing.gate import RetrievalNodeGateService
+from robust_rag.indexing.gate import RetrievalNodeGateService, _table_header_missing
 from robust_rag.indexing.opensearch import MemoryOpenSearchAdapter
 from robust_rag.indexing.rate_limit import VoyageRateLimiter
 from robust_rag.indexing.service import IndexingService
@@ -70,6 +70,28 @@ class ScriptedRateLimiter:
     def reserve(self, estimated_tokens: int) -> float:
         self.reservations.append(estimated_tokens)
         return self.waits.pop(0) if self.waits else 0
+
+
+@pytest.mark.parametrize("table_kind", ["key_value", "sectioned_key_value", "complex"])
+def test_node_gate_accepts_table_shapes_without_column_headers(table_kind: str) -> None:
+    assert not _table_header_missing({"table": True, "table_header": [], "table_kind": table_kind})
+    assert not _table_header_missing(
+        {
+            "table": True,
+            "table_header": [],
+            "table_profile": {"kind": table_kind},
+        }
+    )
+
+
+@pytest.mark.parametrize("table_kind", ["record_table", "matrix", None])
+def test_node_gate_still_requires_headers_for_row_or_unknown_tables(
+    table_kind: str | None,
+) -> None:
+    attributes: dict[str, object] = {"table": True, "table_header": []}
+    if table_kind is not None:
+        attributes["table_kind"] = table_kind
+    assert _table_header_missing(attributes)
 
 
 def _prepare_chunked_job(
@@ -350,6 +372,56 @@ def test_ready_projection_supports_bm25_dense_delete_rebuild_and_alias_switch(
     assert purged.json()["status"] == "purged"
     with session_factory() as db:
         assert db.get(Document, document_id) is None
+
+
+def test_same_version_reindex_replaces_nodes_from_older_chunking_run(
+    session_factory: sessionmaker[Session], storage: LocalFileStorage
+) -> None:
+    _, version_id, job_id = _prepare_chunked_job(session_factory, storage)
+    embedding = _embedding_service(session_factory, FakeEmbeddingAdapter())
+    assert embedding.execute(job_id) == "deferred"
+    adapter = MemoryOpenSearchAdapter()
+    settings = _stage6_settings()
+    service = IndexingService(
+        session_factory=session_factory,
+        adapter=adapter,
+        settings=settings,
+        sleeper=lambda _delay: None,
+        jitter=lambda: 0,
+    )
+
+    assert service.execute(job_id) == "succeeded"
+    expected_nodes = adapter.count_version("rag-chunks-v1", str(version_id))
+    stale_node_id = uuid.uuid4()
+    adapter.indices["rag-chunks-v1"][str(stale_node_id)] = {
+        "_id": str(stale_node_id),
+        "node_id": str(stale_node_id),
+        "document_version_id": str(version_id),
+        "node_level": "child",
+        "is_active": True,
+    }
+    assert adapter.count_version("rag-chunks-v1", str(version_id)) == expected_nodes + 1
+
+    replacement = IndexingService(
+        session_factory=session_factory,
+        adapter=adapter,
+        settings=settings.model_copy(
+            update={"opensearch_index_config_version": "stage6-opensearch-test-v3"}
+        ),
+        sleeper=lambda _delay: None,
+        jitter=lambda: 0,
+    )
+
+    assert replacement.execute(job_id) == "succeeded"
+    assert adapter.count_version("rag-chunks-v1", str(version_id)) == expected_nodes
+    assert str(stale_node_id) not in adapter.indices["rag-chunks-v1"]
+    current_nodes = [
+        node
+        for node in adapter.indices["rag-chunks-v1"].values()
+        if node.get("document_version_id") == str(version_id)
+    ]
+    assert all(node.get("chunking_run_id") for node in current_nodes)
+    assert all(node.get("is_active") is True for node in current_nodes)
 
 
 def test_embedding_non_retryable_failure_is_persisted(

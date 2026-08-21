@@ -74,9 +74,10 @@ function json(value: unknown, status = 200) {
   return Promise.resolve(new Response(JSON.stringify(value), { status, headers: { "content-type": "application/json" } }));
 }
 
-function installFetch() {
+function installFetch(jobOverrides: Partial<typeof jobItem> = {}) {
   let isDocumentDeleted = false;
   let qualityReviewAction: "release" | "reject" | null = null;
+  const currentJob = { ...jobItem, ...jobOverrides };
   vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
     const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
     if (url.endsWith("/system/info")) return json({ name: "Robust RAG", version: "0.1.0", environment: "test" });
@@ -100,7 +101,7 @@ function installFetch() {
     if (url.includes("/documents/doc-1/quality")) return json([{ id: "qa-1", document_version_id: "version-1", status: "succeeded", decision: "quarantined", overall_score: 0.82, dimensions_json: [], issues_json: [{ code: "DUPLICATION_DETECTED", dimension: "duplication", severity: "warning", source: "deterministic", evaluator: "quality", evaluator_version: "1.0", message: "Duplicate content", evidence: [{ metric: "duplicate_block_ratio", value: 0.2, threshold: 0.15, block_ids: ["block-1"], details: {} }], labels: [] }], evaluator: "quality", engine_version: "1.0", started_at: "2026-08-17T01:00:00Z", finished_at: "2026-08-17T01:01:00Z", error: null }]);
     if (url.endsWith("/documents/doc-1/release") && init?.method === "POST") {
       qualityReviewAction = "release";
-      return json({ action: { action: "release" }, job: { ...jobItem, status: "pending", current_stage: "chunking" } });
+      return json({ action: { action: "release" }, job: { ...currentJob, status: "pending", current_stage: "chunking" } });
     }
     if (url.endsWith("/documents/doc-1") && !init?.method) return json(documentItem);
     if (url.endsWith("/documents/doc-1") && init?.method === "DELETE") {
@@ -116,8 +117,8 @@ function installFetch() {
       }],
       total: 1,
     });
-    if (url.includes("/jobs/job-1/retry")) return json({ ...jobItem, status: "pending" });
-    if (url.includes("/jobs?")) return json({ items: [jobItem], total: 1 });
+    if (url.includes("/jobs/job-1/retry")) return json({ ...currentJob, status: "pending" });
+    if (url.includes("/jobs?")) return json({ items: [currentJob], total: 1 });
     if (url.includes("/conversations/c1")) return json({ id: "c1", title: "测试问题", status: "active", created_at: "2026-08-17T01:00:00Z", updated_at: "2026-08-17T02:00:00Z", messages: [{ id: "m-user", role: "user", status: "completed", content: "测试问题", query_original: "测试问题", query_rewritten: null, created_at: "2026-08-17T01:00:00Z", citations: [] }, { id: "m-answer", role: "assistant", status: "completed", content: "这是答案 [S1]", query_original: "测试问题", query_rewritten: "测试问题", created_at: "2026-08-17T01:00:01Z", citations: [{ id: "cite-1", source_label: "S1", node_id: "node-1", document_name: "企业制度.pdf", heading_path: ["总则"], source_locators_json: [{ page_number: 1 }], excerpt: "引用原文" }] }] });
     if (url.includes("/conversations?")) return json([]);
     if (url.endsWith("/chat") && init?.method === "POST") {
@@ -141,7 +142,7 @@ function installFetch() {
 }
 
 describe("stage 10 application", () => {
-  beforeEach(installFetch);
+  beforeEach(() => installFetch());
   afterEach(() => vi.unstubAllGlobals());
 
   it("shows operational metrics on the overview", async () => {
@@ -196,6 +197,24 @@ describe("stage 10 application", () => {
     await user.type(within(uploadDialog).getByPlaceholderText("handbook.txt"), "员工手册");
     await user.click(within(uploadDialog).getByRole("button", { name: "开始上传" }));
     expect(await screen.findByText("文档已上传，处理任务已创建")).toBeInTheDocument();
+  });
+
+  it("distinguishes a chunk gate quarantine from the previous document assessment", async () => {
+    installFetch({
+      status: "quarantined",
+      current_stage: "chunk_evaluating",
+      error_code: "RETRIEVAL_NODE_GATE_FAILED",
+      error_message: "Retrieval node gate found 7 issue(s)",
+    });
+    const user = userEvent.setup();
+    renderApp("/documents");
+    await user.click((await screen.findByText("企业制度.pdf")).closest("button") as HTMLButtonElement);
+    const detail = await screen.findByRole("dialog", { name: "文档详情" });
+
+    expect(within(detail).getByText("最新处理在分块质量评估阶段被隔离")).toBeInTheDocument();
+    expect(within(detail).getByText("上一次文档级评估")).toBeInTheDocument();
+    await user.click(within(detail).getByRole("button", { name: "检查最新分块 →" }));
+    expect(await screen.findByRole("dialog", { name: "文档处理调试器" })).toBeInTheDocument();
   });
 
   it("updates the open document detail after soft deletion", async () => {

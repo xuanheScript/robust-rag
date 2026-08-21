@@ -70,9 +70,23 @@ class OpenSearchAdapter(Protocol):
 
     def bulk_upsert(self, index: str, documents: list[dict[str, object]]) -> None: ...
 
+    def refresh(self, index: str) -> None: ...
+
     def count_version(self, index: str, document_version_id: str) -> int: ...
 
+    def count_chunking_run(
+        self, index: str, document_version_id: str, chunking_run_id: str
+    ) -> int: ...
+
     def activate_version(self, index: str, document_version_id: str) -> None: ...
+
+    def activate_chunking_run(
+        self, index: str, document_version_id: str, chunking_run_id: str
+    ) -> None: ...
+
+    def delete_stale_chunking_runs(
+        self, index: str, document_version_id: str, chunking_run_id: str
+    ) -> None: ...
 
     def delete_version(self, index: str, document_version_id: str) -> None: ...
 
@@ -135,6 +149,15 @@ class HttpOpenSearchAdapter:
             self._request("PUT", f"/{documents_index}", json_body=_document_index_definition())
         if not self.index_exists(chunks_index):
             self._request("PUT", f"/{chunks_index}", json_body=_chunk_index_definition(dimension))
+        else:
+            # Existing v1 indexes can be upgraded in place because adding a keyword
+            # field is backward compatible. Old projections simply have no value and
+            # are therefore treated as stale when a new chunking run is activated.
+            self._request(
+                "PUT",
+                f"/{chunks_index}/_mapping",
+                json_body={"properties": {"chunking_run_id": {"type": "keyword"}}},
+            )
 
     def switch_aliases(
         self,
@@ -189,11 +212,31 @@ class HttpOpenSearchAdapter:
                 failed_ids=failed,
             )
 
+    def refresh(self, index: str) -> None:
+        self._request("POST", f"/{index}/_refresh")
+
     def count_version(self, index: str, document_version_id: str) -> int:
         result = self._request(
             "POST",
             f"/{index}/_count",
             json_body={"query": {"term": {"document_version_id": document_version_id}}},
+        )
+        return int(result.get("count", 0))
+
+    def count_chunking_run(self, index: str, document_version_id: str, chunking_run_id: str) -> int:
+        result = self._request(
+            "POST",
+            f"/{index}/_count",
+            json_body={
+                "query": {
+                    "bool": {
+                        "filter": [
+                            {"term": {"document_version_id": document_version_id}},
+                            {"term": {"chunking_run_id": chunking_run_id}},
+                        ]
+                    }
+                }
+            },
         )
         return int(result.get("count", 0))
 
@@ -204,6 +247,43 @@ class HttpOpenSearchAdapter:
             json_body={
                 "query": {"term": {"document_version_id": document_version_id}},
                 "script": {"source": "ctx._source.is_active = true", "lang": "painless"},
+            },
+        )
+
+    def activate_chunking_run(
+        self, index: str, document_version_id: str, chunking_run_id: str
+    ) -> None:
+        self._request(
+            "POST",
+            f"/{index}/_update_by_query?refresh=true&conflicts=proceed",
+            json_body={
+                "query": {
+                    "bool": {
+                        "filter": [
+                            {"term": {"document_version_id": document_version_id}},
+                            {"term": {"chunking_run_id": chunking_run_id}},
+                        ]
+                    }
+                },
+                "script": {"source": "ctx._source.is_active = true", "lang": "painless"},
+            },
+        )
+
+    def delete_stale_chunking_runs(
+        self, index: str, document_version_id: str, chunking_run_id: str
+    ) -> None:
+        if not self.index_exists(index):
+            return
+        self._request(
+            "POST",
+            f"/{index}/_delete_by_query?refresh=true&conflicts=proceed",
+            json_body={
+                "query": {
+                    "bool": {
+                        "filter": [{"term": {"document_version_id": document_version_id}}],
+                        "must_not": [{"term": {"chunking_run_id": chunking_run_id}}],
+                    }
+                }
             },
         )
 
@@ -378,9 +458,19 @@ class MemoryOpenSearchAdapter:
         for document in documents:
             values[str(document["_id"])] = dict(document)
 
+    def refresh(self, index: str) -> None:
+        del index
+
     def count_version(self, index: str, document_version_id: str) -> int:
         return sum(
             item.get("document_version_id") == document_version_id
+            for item in self.indices.get(index, {}).values()
+        )
+
+    def count_chunking_run(self, index: str, document_version_id: str, chunking_run_id: str) -> int:
+        return sum(
+            item.get("document_version_id") == document_version_id
+            and item.get("chunking_run_id") == chunking_run_id
             for item in self.indices.get(index, {}).values()
         )
 
@@ -388,6 +478,28 @@ class MemoryOpenSearchAdapter:
         for item in self.indices.get(index, {}).values():
             if item.get("document_version_id") == document_version_id:
                 item["is_active"] = True
+
+    def activate_chunking_run(
+        self, index: str, document_version_id: str, chunking_run_id: str
+    ) -> None:
+        for item in self.indices.get(index, {}).values():
+            if (
+                item.get("document_version_id") == document_version_id
+                and item.get("chunking_run_id") == chunking_run_id
+            ):
+                item["is_active"] = True
+
+    def delete_stale_chunking_runs(
+        self, index: str, document_version_id: str, chunking_run_id: str
+    ) -> None:
+        values = self.indices.get(index, {})
+        for identifier in [
+            key
+            for key, value in values.items()
+            if value.get("document_version_id") == document_version_id
+            and value.get("chunking_run_id") != chunking_run_id
+        ]:
+            del values[identifier]
 
     def delete_version(self, index: str, document_version_id: str) -> None:
         values = self.indices.get(index, {})
@@ -539,6 +651,7 @@ def _chunk_index_definition(dimension: int) -> dict[str, object]:
         "node_id": keyword,
         "document_id": keyword,
         "document_version_id": keyword,
+        "chunking_run_id": keyword,
         "parent_node_id": keyword,
         "previous_node_id": keyword,
         "next_node_id": keyword,

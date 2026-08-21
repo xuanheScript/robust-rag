@@ -20,7 +20,13 @@ from robust_rag.indexing.rate_limit import VoyageRateLimiter
 from robust_rag.indexing.service import IndexingService
 from robust_rag.retrieval.context import assemble_context
 from robust_rag.retrieval.fusion import diversify_candidates, reciprocal_rank_fusion
-from robust_rag.retrieval.query import IdentityQueryRewriter, QueryError, normalize_query
+from robust_rag.retrieval.query import (
+    IdentityQueryRewriter,
+    QueryError,
+    QueryRewriteResult,
+    normalize_query,
+    parse_query_plan,
+)
 from robust_rag.retrieval.rerank import (
     RerankAdapterError,
     RerankItem,
@@ -222,6 +228,69 @@ def test_query_normalization_rrf_and_diversity_are_deterministic() -> None:
     )
     assert [value.node_id for value in selected] == [candidates[0].node_id, candidates[2].node_id]
     assert excluded == [{"node_id": str(candidates[1].node_id), "reason": "document_limit"}]
+
+    plan = parse_query_plan(
+        json.dumps(
+            {
+                "standalone_query": "住众公司有哪些竞聘岗位?",
+                "semantic_query": "查询住众公司竞聘岗位名称、部门和岗位定员",
+                "lexical_queries": [
+                    "住众公司 竞聘 岗位名称 所在部门 岗位定员",
+                    "住众公司 招聘 职位",
+                    "这个查询应被截断",
+                ],
+                "entities": ["住众公司"],
+                "answer_facets": ["岗位名称", "所在部门", "岗位定员"],
+                "filters": {},
+            },
+            ensure_ascii=False,
+        ),
+        original_query="住众公司 竞聘 岗位",
+        max_chars=500,
+        strategy="test",
+        implementation="fake",
+        version="1",
+    )
+    assert plan.query == "住众公司有哪些竞聘岗位?"
+    assert len(plan.lexical_queries) == 2
+    assert plan.lexical_search_queries("住众公司 竞聘 岗位")[0] == (
+        "住众公司 竞聘 岗位"
+    )
+
+
+def test_query_plan_expansion_adds_recall_without_dropping_original(
+    session_factory: sessionmaker[Session], storage: LocalFileStorage
+) -> None:
+    _, _, search_adapter = _ready_search_fixture(session_factory, storage)
+    service = _retrieval_service(session_factory, search_adapter)
+    plan = QueryRewriteResult(
+        query="生效时间是什么",
+        semantic_query="企业 Policy 的生效时间是什么",
+        lexical_queries=("Policy",),
+        strategy="retrieval-query-plan",
+        implementation="test",
+        version="2",
+        changed=True,
+    )
+
+    response = service.search(
+        RetrievalSearchRequest(
+            query="生效时间是什么",
+            mode=RetrievalMode.BM25,
+            debug=True,
+        ),
+        rewrite_override=plan,
+    )
+
+    assert response.children
+    assert response.usage["bm25_query_count"] == 2
+    assert response.debug is not None
+    debug_queries = cast(list[dict[str, object]], response.debug["queries"])
+    assert debug_queries[0]["lexical"] == ["生效时间是什么", "Policy"]
+    with session_factory() as db:
+        trace = db.get(RetrievalTrace, response.trace_id)
+        assert trace is not None
+        assert trace.rewrite_snapshot["lexical_queries"] == ["Policy"]
 
 
 def test_voyage_rerank_adapter_uses_official_contract_and_validates_indices() -> None:
