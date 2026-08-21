@@ -22,7 +22,11 @@ from robust_rag.generation.provider import (
     LLMUsage,
 )
 from robust_rag.generation.schemas import ChatSource
-from robust_rag.retrieval.query import QueryError, QueryRewriteResult, normalize_query
+from robust_rag.retrieval.query import (
+    QueryError,
+    QueryRewriteResult,
+    parse_tool_query_plan,
+)
 from robust_rag.retrieval.schemas import RetrievalSearchRequest, RetrievalSearchResponse
 from robust_rag.retrieval.service import RetrievalError, RetrievalService
 
@@ -32,7 +36,6 @@ TrackedStream = Callable[
     tuple[uuid.UUID, Iterator[LLMStreamEvent]],
 ]
 SourceLoader = Callable[[RetrievalSearchResponse], list[ChatSource]]
-QueryPlanner = Callable[[str, list[tuple[str, str]]], tuple[QueryRewriteResult, str | None]]
 
 
 class AgentState(TypedDict):
@@ -54,7 +57,6 @@ class AgentState(TypedDict):
     invocation_ids: list[uuid.UUID]
     direct_invocation_id: uuid.UUID | None
     direct_usage: LLMUsage
-    rewrite_warning: str | None
 
 
 @dataclass(frozen=True)
@@ -63,6 +65,7 @@ class AgentRunResult:
     selected_tool: str | None
     tool_call_id: str | None
     query: str
+    query_plan: QueryRewriteResult | None
     direct_answer: str | None
     retrieval: RetrievalSearchResponse | None
     sources: list[ChatSource]
@@ -71,7 +74,6 @@ class AgentRunResult:
     invocation_ids: tuple[uuid.UUID, ...]
     direct_invocation_id: uuid.UUID | None
     direct_usage: LLMUsage
-    rewrite_warning: str | None
 
 
 @dataclass(frozen=True)
@@ -93,7 +95,6 @@ class AgenticRAGGraph:
         *,
         retrieval_service: RetrievalService,
         source_loader: SourceLoader,
-        query_planner: QueryPlanner,
         stream_generate: TrackedStream,
         settings: Settings,
         mode: RetrievalMode,
@@ -106,7 +107,6 @@ class AgenticRAGGraph:
     ) -> None:
         self.retrieval_service = retrieval_service
         self.source_loader = source_loader
-        self.query_planner = query_planner
         self.stream_generate = stream_generate
         self.settings = settings
         self.mode = mode
@@ -118,15 +118,13 @@ class AgenticRAGGraph:
         self.assistant_message_id = assistant_message_id
         workflow = StateGraph(AgentState)
         workflow.add_node("agent", self._agent)
-        workflow.add_node("query_rewrite", self._query_rewrite)
         workflow.add_node("retrieve", self._retrieve)
         workflow.add_edge(START, "agent")
         workflow.add_conditional_edges(
             "agent",
             self._route_agent,
-            {"retrieve": "query_rewrite", "end": END},
+            {"retrieve": "retrieve", "end": END},
         )
-        workflow.add_edge("query_rewrite", "retrieve")
         workflow.add_edge("retrieve", END)
         self.graph = workflow.compile()
 
@@ -191,7 +189,6 @@ class AgenticRAGGraph:
             "invocation_ids": [],
             "direct_invocation_id": None,
             "direct_usage": LLMUsage(),
-            "rewrite_warning": None,
         }
 
     @staticmethod
@@ -202,6 +199,7 @@ class AgenticRAGGraph:
             selected_tool=final["selected_tool"],
             tool_call_id=final["tool_call_id"],
             query=result_query,
+            query_plan=final["query_plan"],
             direct_answer=final["direct_answer"],
             retrieval=final["retrieval"],
             sources=final["sources"],
@@ -210,7 +208,6 @@ class AgenticRAGGraph:
             invocation_ids=tuple(final["invocation_ids"]),
             direct_invocation_id=final["direct_invocation_id"],
             direct_usage=final["direct_usage"],
-            rewrite_warning=final["rewrite_warning"],
         )
 
     def _agent(self, state: AgentState) -> dict[str, object]:
@@ -327,69 +324,89 @@ class AgenticRAGGraph:
                 }
 
             tool_call = response.tool_calls[0]
-            raw_query = tool_call.arguments.get("query")
-            if not isinstance(raw_query, str):
-                writer({"type": "action", "action": "documents"})
-                return {
-                    "action": "documents",
-                    "selected_tool": self.document_tool,
-                    "tool_call_id": tool_call.call_id,
-                    "invocation_ids": invocation_ids,
-                    "warnings": [*state["warnings"], "AGENT_INVALID_TOOL_ARGUMENTS"],
-                }
-            try:
-                query = normalize_query(
-                    raw_query, max_chars=self.settings.retrieval_query_max_chars
-                )
-            except QueryError:
-                writer({"type": "action", "action": "documents"})
-                return {
-                    "action": "documents",
-                    "selected_tool": self.document_tool,
-                    "tool_call_id": tool_call.call_id,
-                    "invocation_ids": invocation_ids,
-                    "warnings": [*state["warnings"], "AGENT_INVALID_TOOL_QUERY"],
-                }
             if tool_call.name == self.relationship_tool:
                 action: AgentAction = "relationships"
+                selected_tool = self.relationship_tool
             elif tool_call.name == self.document_tool:
                 action = "documents"
+                selected_tool = self.document_tool
             else:
                 action = "documents"
-                state_warnings = [*state["warnings"], "AGENT_UNKNOWN_TOOL"]
-                span.update(
-                    output={"action": action, "fallback": True},
-                    level="WARNING",
-                    status_message="AGENT_UNKNOWN_TOOL",
+                selected_tool = self.document_tool
+
+            try:
+                query_plan, plan_degraded = parse_tool_query_plan(
+                    tool_call.arguments,
+                    original_query=state["question"],
+                    max_chars=self.settings.retrieval_query_max_chars,
+                    strategy="agent-query-plan",
+                    implementation="langgraph-agent",
+                    version=self.settings.agent_prompt_version,
+                    metadata={
+                        "agent_action": action,
+                        "agent_tool": selected_tool,
+                        "prompt_version": self.settings.agent_prompt_version,
+                    },
                 )
-                writer({"type": "action", "action": action})
+            except QueryError as exc:
+                code = (
+                    "AGENT_INVALID_TOOL_ARGUMENTS"
+                    if exc.code == "QUERY_PLAN_INVALID_RESPONSE"
+                    else "AGENT_INVALID_TOOL_QUERY"
+                )
+                span.update(
+                    output={"action": "documents", "fallback": True},
+                    level="WARNING",
+                    status_message=code,
+                )
+                writer({"type": "action", "action": "documents"})
                 return {
-                    "action": action,
-                    "query": query,
+                    "action": "documents",
                     "selected_tool": self.document_tool,
                     "tool_call_id": tool_call.call_id,
                     "invocation_ids": invocation_ids,
-                    "warnings": state_warnings,
+                    "warnings": [*state["warnings"], code],
                 }
-            if mixed_output:
+
+            decision_warning: str | None = None
+            state_warnings = list(state["warnings"])
+            if tool_call.name not in {self.document_tool, self.relationship_tool}:
+                decision_warning = "AGENT_UNKNOWN_TOOL"
+                state_warnings.append(decision_warning)
+            if plan_degraded:
+                decision_warning = decision_warning or "AGENT_QUERY_PLAN_DEGRADED"
+                state_warnings.append("AGENT_QUERY_PLAN_DEGRADED")
+            if mixed_output and decision_warning is None:
+                decision_warning = "AGENT_MIXED_OUTPUT_IGNORED"
+
+            if decision_warning is not None:
                 span.update(
                     output={
                         "action": action,
-                        "tool": tool_call.name,
+                        "tool": selected_tool,
                         "ignored_text_chars": len(response.text.strip()),
+                        "query_plan": query_plan.snapshot(),
                     },
                     level="WARNING",
-                    status_message="AGENT_MIXED_OUTPUT_IGNORED",
+                    status_message=decision_warning,
                 )
             else:
-                span.update(output={"action": action, "tool": tool_call.name})
+                span.update(
+                    output={
+                        "action": action,
+                        "tool": selected_tool,
+                        "query_plan": query_plan.snapshot(),
+                    }
+                )
             writer({"type": "action", "action": action})
             return {
                 "action": action,
-                "query": query,
-                "selected_tool": tool_call.name,
+                "query": query_plan.query,
+                "query_plan": query_plan,
+                "selected_tool": selected_tool,
                 "tool_call_id": tool_call.call_id,
                 "invocation_ids": invocation_ids,
+                "warnings": state_warnings,
             }
 
     @staticmethod
@@ -418,7 +435,7 @@ class AgenticRAGGraph:
                 )
                 retrieval = self.retrieval_service.search(
                     RetrievalSearchRequest(
-                        query=state["query"],
+                        query=state["question"],
                         mode=self.mode,
                         top_k=self.top_k,
                         context_budget_tokens=self.context_budget_tokens,
@@ -459,22 +476,3 @@ class AgenticRAGGraph:
                     "tool_call_count": state["tool_call_count"] + 1,
                     "warnings": [*state["warnings"], code],
                 }
-
-    def _query_rewrite(self, state: AgentState) -> dict[str, object]:
-        """Build an additive retrieval plan only after the Agent selects retrieval."""
-
-        rewrite, warning = self.query_planner(state["query"], state["history"])
-        invocation_ids = list(state["invocation_ids"])
-        raw_invocation_id = rewrite.metadata.get("invocation_id")
-        if isinstance(raw_invocation_id, str):
-            try:
-                invocation_id = uuid.UUID(raw_invocation_id)
-            except ValueError:
-                invocation_id = None
-            if invocation_id is not None and invocation_id not in invocation_ids:
-                invocation_ids.append(invocation_id)
-        return {
-            "query_plan": rewrite,
-            "invocation_ids": invocation_ids,
-            "rewrite_warning": warning,
-        }

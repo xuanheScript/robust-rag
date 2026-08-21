@@ -1,6 +1,8 @@
 import json
 import pickle
 import uuid
+from collections.abc import Generator
+from contextlib import contextmanager
 from typing import cast
 from unittest.mock import Mock
 
@@ -532,6 +534,22 @@ def test_grounded_chat_stream_persists_citations_usage_and_trace(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    observations: list[dict[str, object]] = []
+
+    class Span:
+        def __init__(self, target: dict[str, object]) -> None:
+            self.target = target
+
+        def update(self, **kwargs: object) -> None:
+            cast(list[dict[str, object]], self.target["updates"]).append(kwargs)
+
+    @contextmanager
+    def record_observation(name: str, **kwargs: object) -> Generator[Span, None, None]:
+        target: dict[str, object] = {"name": name, "start": kwargs, "updates": []}
+        observations.append(target)
+        yield Span(target)
+
+    monkeypatch.setattr("robust_rag.generation.service.observe", record_observation)
     _, _, search_adapter = _ready_search_fixture(session_factory, storage)
     provider = FakeLLMProvider(
         response_text="The policy is documented here [S1].",
@@ -555,6 +573,22 @@ def test_grounded_chat_stream_persists_citations_usage_and_trace(
     assert any(event["type"] == "data-usage" for event in events)
     assert provider.stream_requests[0].instructions == GROUNDED_INSTRUCTIONS
     assert "<S1 " in str(provider.stream_requests[0].input[0]["content"])
+    rag_observation = next(value for value in observations if value["name"] == "llm.rag_generation")
+    rag_start = cast(dict[str, object], rag_observation["start"])
+    assert rag_start["capture_content"] is True
+    assert rag_start["unbounded_content"] is True
+    observed_input = cast(dict[str, object], rag_start["input"])
+    observed_request = cast(dict[str, object], observed_input["request"])
+    assert observed_request == provider.stream_requests[0].provider_payload(
+        model=provider.model,
+        stream=True,
+    )
+    rag_updates = cast(list[dict[str, object]], rag_observation["updates"])
+    observed_output = cast(
+        dict[str, object], next(v["output"] for v in rag_updates if "output" in v)
+    )
+    assert observed_output["text"] == "The policy is documented here [S1]."
+    assert observed_output["streamed"] is True
     started_log = next(log for log in logs if log["event"] == "llm_request_started")
     succeeded_log = next(log for log in logs if log["event"] == "llm_request_succeeded")
     assert started_log["purpose"] == "rag_generation"
@@ -660,8 +694,7 @@ def test_multiturn_rewrite_is_saved_and_generation_failure_is_explainable(
     assert second.retrieval is not None
     assert len(provider.generate_requests) == 2
     assert all(
-        request.metadata["purpose"] == "query_rewrite"
-        for request in provider.generate_requests
+        request.metadata["purpose"] == "query_rewrite" for request in provider.generate_requests
     )
     assert all(request.reasoning_effort == "none" for request in provider.generate_requests)
     with session_factory() as db:
@@ -670,9 +703,7 @@ def test_multiturn_rewrite_is_saved_and_generation_failure_is_explainable(
         assert trace.query_original == "它什么时候生效?"
         assert trace.query_rewritten == "Policy effective date"
         assert trace.rewrite_snapshot["history_message_count"] == 2
-        assert trace.rewrite_snapshot["prompt_version"] == (
-            "stage8-retrieval-query-plan-v1-zh"
-        )
+        assert trace.rewrite_snapshot["prompt_version"] == ("stage8-retrieval-query-plan-v1-zh")
 
     provider.failure = LLMProviderError(
         "LLM_UNAVAILABLE",

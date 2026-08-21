@@ -1191,10 +1191,11 @@ Query Normalize / Rewrite
   → OpenSearch: BM25 Top 100 + voyage-4 Dense Top 100 → RRF Top 60
   → Graph Router: 必要时运行受控 Text-to-Cypher → Source Node Candidates
   → 合并和去重候选
-  → 文档和 Parent 多样性控制
+  → 重复/低信息/低相关候选过滤（无文档硬配额）
   → rerank-2.5 Top 40
-  → Child Top 8～12
-  → Parent/相邻块/表头扩展
+  → Cross-Encoder/RRF/词法/Scope 相关性融合
+  → 扩大候选池 MMR
+  → Parent 自动合并/相邻窗口后选 Context Top 8～12
   → 上下文预算裁剪
   → GPT-5.6 Luna
 ```
@@ -1206,12 +1207,12 @@ Query Normalize / Rewrite
 - 参数进入配置，不能硬编码。
 - 有黄金集后使用训练/验证拆分调节权重。
 
-### 17.3 多样性
+### 17.3 候选过滤与多样性
 
-- 同一文档进入 Reranker 的 Child 默认不超过 8 个。
-- 同一 Parent 默认不超过 3 个 Child。
-- 防止单份长文档占满全部候选。
-- 保留精确编号、文件名和关键词命中结果。
+- RRF 到 Reranker 之间不设置单文档或单 Parent 的硬配额。
+- 只排除完全重复、同 Parent 高度相似、低信息 heading-only 和明确低于相关性阈值的候选。
+- Rerank 后保留并融合 RRF、词法与显式 Scope 信号，再使用相关性权重 0.85 的 MMR 抑制冗余。
+- 保留精确编号、文件名和关键词命中结果；精确命中不绕过重复与低信息过滤。
 
 ### 17.4 Rerank
 
@@ -1220,9 +1221,11 @@ Query Normalize / Rewrite
 - 保存输入候选、原始排名、重排分数、模型和耗时。
 - 失败时允许配置降级到 RRF 结果，但必须在 trace 中标记。
 
-### 17.5 Parent 扩展
+### 17.5 Parent 自动合并
 
-- Child 命中后获取 Parent。
+- 在最终 Context Top K 截断前，同一 Parent 的 Child 命中比例达到阈值时合并为完整 Parent Context。
+- 未达到 Parent 阈值但连续命中的 Child 合并为一个相邻窗口。
+- 合并后的 Parent 或窗口只占一个 Context 槽位，并保留全部 supporting Child ID。
 - 仅在正文截断、列表连续或引用跨块时补充相邻块。
 - 表格自动补充表头。
 - 去除重复文本后再进行上下文预算裁剪。
@@ -1645,7 +1648,7 @@ error_code
 - 一次 Chat Turn、一次评测样本或一次需要模型参与的异步处理作为 Trace；查询改写、BM25、Dense、图检索、融合、Rerank、上下文组装、模型生成和 Ragas Judge 作为子 Span 或 Generation。
 - `trace_id` 在 HTTP、Celery 和评测流程间传播，并与 `request_id`、`task_id`、`chat_id`、`document_version_id`、`EvaluationRun.id` 和 `ModelInvocation.id` 关联。
 - 阶段 11 的确定性指标和 Ragas 指标写入 Langfuse Score，黄金集、样本结果和正式 JSON/Markdown 报告仍保存在现有版本化数据集与 PostgreSQL 中。
-- 默认 `LANGFUSE_ENABLED=true`、`LANGFUSE_SAMPLE_RATE=1.0`、`LANGFUSE_CAPTURE_CONTENT=false` 和 `LANGFUSE_BASE_URL=https://cloud.langfuse.com`；部署时通过 `LANGFUSE_PUBLIC_KEY`、`LANGFUSE_SECRET_KEY` 注入凭据，并允许按组织的数据驻留要求切换官方 Cloud 区域。
+- 默认 `LANGFUSE_ENABLED=true`、`LANGFUSE_SAMPLE_RATE=1.0`、`LANGFUSE_CAPTURE_CONTENT=false` 和 `LANGFUSE_BASE_URL=https://cloud.langfuse.com`；`llm.rag_generation` 按显式诊断要求单独上传完整且凭据脱敏的实际 LLM 请求/响应。部署时通过 `LANGFUSE_PUBLIC_KEY`、`LANGFUSE_SECRET_KEY` 注入凭据，并允许按组织的数据驻留要求切换官方 Cloud 区域。
 - SDK 使用后台批量发送、有限队列、短超时和有限重试；Langfuse 凭据缺失、限流、超时或不可用时记录明确告警并丢弃外部 Trace，不得阻塞 Chat、入库、任务恢复或评测报告落库。
 - 应用关闭和 Worker 退出时在有限时限内 Flush；不得为了等待 Trace 上传无限阻塞进程退出。
 - 管理后台展示 Langfuse 配置、最近成功上报时间和降级状态，但不得展示 Secret Key；可从本地 `trace_id` 跳转到对应 Langfuse Trace。
@@ -1799,7 +1802,7 @@ robust-rag/
 - QualityPolicy。
 - 父子分块。
 - 表格行组转换。
-- RRF 和多样性控制。
+- RRF、候选卫生过滤与 MMR。
 - 引用定位。
 - 状态机与幂等性。
 - Query Rewrite 输入构建。
@@ -2022,7 +2025,7 @@ eval-golden
 任务：
 
 - 实现 Query Normalize 和 Query Rewrite 接口。
-- 实现 BM25、Dense、RRF 和多样性控制。
+- 实现 BM25、Dense、RRF、候选卫生过滤和 MMR。
 - 接入 `rerank-2.5`。
 - 实现 Parent/相邻块扩展和上下文预算。
 - 保存完整 Retrieval Trace。
@@ -2036,9 +2039,9 @@ eval-golden
 
 - 已实现 NFKC、零宽字符、空白和标点归一化，并定义可替换 Query Rewrite 接口；阶段 7 使用可复现的 Identity 基线，阶段 8 可接入多轮会话改写。
 - 已实现 BM25、Dense、Hybrid 和 Hybrid+Rerank 四种独立模式；Dense 查询固定使用 Voyage `input_type=query`。
-- 已实现应用层加权 RRF、稳定并列排序、单文档/单 Parent 多样性控制，以及精确正文命中的上限豁免。
+- 已实现应用层加权 RRF 和稳定并列排序；2026-08-21 移除单文档/单 Parent 硬配额，并进一步加入受控 Scope、结构关键词、Cross-Encoder/RRF/词法/Scope 混合相关性和扩大候选池 MMR。
 - 已按官方契约接入 `rerank-2.5`，保存 Token、重试、延迟和可选成本；Reranker 故障默认降级到 RRF 并明确标记 `degraded`。
-- 已实现最终 Child 的 Parent 优先扩展、同 Parent 合并、超限时 Child/相邻块回退、内容去重和服务端 Token 预算上限。
+- 已将按命中比例合并 Parent 和连续窗口提前到最终 Context 截断前，并保留单 Child/相邻块回退、内容去重和 Token 预算上限。
 - 已新增 RetrievalTrace、Alembic `20260817_0007` 迁移以及检索、Trace 列表和 Trace 详情 API；调试响应可解释从召回到最终上下文的每个阶段。
 - 在线补全只接受 PostgreSQL 中当前 READY、ACTIVE 且已成功索引的 Child，避免 OpenSearch 残留旧版本进入上下文。
 - 65 个后端测试通过，整体覆盖率 83% 以上；迁移离线编译通过，真实 Aiven/Voyage 联调等待凭据。
@@ -2248,7 +2251,7 @@ Agent 决策原则：
 - 新增类型化 `AgentState`，至少包含会话/消息 ID、服务端历史、原始问题、独立检索问题、Agent Action、Tool Call、Retrieval Response、Sources、工具调用次数、Warnings 和最终回答。
 - 实现单一 Agent 决策节点并绑定 `retrieve_enterprise_documents` 与 `retrieve_enterprise_relationships` 两个受控领域工具；工具入参只接受规范化自然语言 Query 和服务端限制内的检索参数，不暴露任意 OpenSearch DSL、Cypher、索引名或数据库连接参数。
 - 为 Retrieval Service 增加请求级图谱策略，使文档工具明确跳过 Text-to-Cypher，关系工具复用 OpenSearch + Graph 候选融合；不能再仅依赖全局 `GRAPH_QUERY_ENABLED` 对所有 Hybrid 问题无差别执行图查询。
-- Agent 在 Tool Call 中使用有限、可信的服务端历史生成完整、可独立检索的 Query；Agentic 流程不再增加独立的检索后 Query Rewrite 节点。
+- Agent 在 Tool Call 中使用有限、可信的服务端历史，一次生成完整、可独立检索的 standalone Query、semantic Query 和最多两个 lexical Query；Agentic 流程不再增加独立 Query Rewrite 节点。
 - 单 Turn 只执行一次 Agent 决策和最多一次受控检索，不形成 Agent 循环；保留硬性 `recursion_limit` 和总上下文预算作为工程保护。
 - 检索有来源时直接进入 Grounded Generation；无来源时不再调用其他 LLM，返回确定性的信息不足响应。
 - Grounded Generation 继续只使用带来源的最终 Context，继续执行文档指令隔离、信息不足拒答、`[S1]` 引用、Citation 快照和回答语言跟随；Direct Response 不得陈述未经工具检索的企业事实。
@@ -2275,6 +2278,7 @@ Agent 决策原则：
 
 - 已锁定最新稳定版 LangGraph 1.2.11，并升级到兼容的 LangChain 1.3.15、LangChain Core 1.5.6、LangChain Community 0.4.2 与 LangChain OpenAI 1.5.1；Ragas 0.2.15 回归通过。
 - 已实现 `Agent → 可选 Retrieval Tool → Grounded Generation/Deterministic Refusal` 类型化状态图；Agent LLM 直接通过 Tool Call 自主选择 Direct、Documents 或 Relationships，没有新增 `fast_path` 或独立意图分类器。
+- 已将 standalone、semantic 和 lexical 检索计划合并进 Agent Tool Call，检索分支从 Agent 直接进入 Retrieval；原始用户问题继续作为召回安全网，固定 RAG 的结构化 Query Rewrite 保持不变。
 - 已扩展 Responses-compatible Provider 的 Tool Call 请求/响应契约，并实现文档与关系两个受控领域工具；文档工具明确跳过图查询，关系工具才启用受控 Text-to-Cypher。
 - 已实现无来源确定性拒答、单次 Agent 决策、最多一次受控检索和 LangGraph 递归上限；非法工具或 Agent 决策失败安全回退文档检索。
 - 已接入现有 Conversation、Message、RetrievalTrace、GraphQueryTrace、ModelInvocation、Citation 与 Langfuse 观测链路，不启用第二套 Checkpointer。

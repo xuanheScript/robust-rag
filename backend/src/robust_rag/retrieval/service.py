@@ -14,7 +14,7 @@ from datetime import UTC, datetime
 from functools import lru_cache
 from typing import Protocol, TypeVar, cast
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from robust_rag.core.observability import observe
@@ -48,10 +48,12 @@ from robust_rag.indexing.service import get_opensearch_adapter
 from robust_rag.retrieval.context import assemble_context
 from robust_rag.retrieval.fusion import (
     FusedRank,
-    diversify_candidates,
+    filter_rerank_candidates,
     fuse_document_hit_lists,
     fuse_query_hit_lists,
+    fuse_relevance_scores,
     reciprocal_rank_fusion,
+    select_mmr_candidates,
 )
 from robust_rag.retrieval.query import (
     IdentityQueryRewriter,
@@ -68,6 +70,7 @@ from robust_rag.retrieval.rerank import (
 )
 from robust_rag.retrieval.schemas import (
     Candidate,
+    ContextNodeRead,
     NodeValue,
     RetrievalSearchRequest,
     RetrievalSearchResponse,
@@ -153,22 +156,30 @@ class RetrievalService:
             "document_weight": self.settings.retrieval_document_weight,
             "graph_enabled": self.graph_retriever is not None and self.settings.graph_query_enabled,
             "graph_weight": self.settings.graph_rrf_weight,
-            "max_children_per_document": self.settings.retrieval_max_children_per_document,
-            "max_children_per_parent": self.settings.retrieval_max_children_per_parent,
+            "sibling_duplicate_similarity_threshold": (
+                self.settings.retrieval_sibling_duplicate_similarity_threshold
+            ),
+            "min_rrf_score_ratio": self.settings.retrieval_min_rrf_score_ratio,
             "rerank_candidate_top_k": self.settings.retrieval_rerank_candidate_top_k,
             "final_child_top_k": self.settings.retrieval_final_child_top_k,
+            "mmr_lambda": self.settings.retrieval_mmr_lambda,
+            "relevance_rerank_weight": self.settings.retrieval_relevance_rerank_weight,
+            "relevance_rrf_weight": self.settings.retrieval_relevance_rrf_weight,
+            "relevance_lexical_weight": self.settings.retrieval_relevance_lexical_weight,
+            "relevance_scope_weight": self.settings.retrieval_relevance_scope_weight,
+            "context_candidate_top_k": self.settings.retrieval_context_candidate_top_k,
             "rerank_fallback_enabled": self.settings.retrieval_rerank_fallback_enabled,
             "context_max_tokens": self.settings.retrieval_context_max_tokens,
             "context_parent_max_tokens": self.settings.retrieval_context_parent_max_tokens,
             "context_neighbor_limit": self.settings.retrieval_context_neighbor_limit,
+            "parent_merge_min_children": self.settings.retrieval_parent_merge_min_children,
+            "parent_merge_ratio": self.settings.retrieval_parent_merge_ratio,
             "chunks_read_alias": self.settings.opensearch_chunks_read_alias,
             "documents_read_alias": self.settings.opensearch_documents_read_alias,
-            "chunk_lexical_fields": ["heading_path", "content"],
+            "chunk_lexical_fields": ["heading_path", "content", "retrieval_keywords"],
             "document_lexical_fields": ["title", "original_filename"],
-            "chunk_dense_text_contract": "chunk_heading_content_v2",
-            "chunk_dense_embedding_config_version": (
-                self.settings.voyage_embedding_config_version
-            ),
+            "chunk_dense_text_contract": "scoped_chunk_v3",
+            "chunk_dense_embedding_config_version": (self.settings.voyage_embedding_config_version),
         }
 
     def search(
@@ -365,22 +376,29 @@ class RetrievalService:
                 fused,
                 [normalized, rewrite.query, rewrite.semantic_query or rewrite.query],
             )
-            diversified, excluded = diversify_candidates(
+            rerank_candidates, excluded = filter_rerank_candidates(
                 candidates,
-                max_per_document=self.settings.retrieval_max_children_per_document,
-                max_per_parent=self.settings.retrieval_max_children_per_parent,
                 limit=self.settings.retrieval_rerank_candidate_top_k,
+                sibling_similarity_threshold=(
+                    self.settings.retrieval_sibling_duplicate_similarity_threshold
+                ),
+                min_rrf_score_ratio=self.settings.retrieval_min_rrf_score_ratio,
             )
-            latency["fusion_and_diversity"] = _elapsed_ms(started)
+            filtered_snapshot = [
+                *[dict(candidate.snapshot(), selected=True) for candidate in rerank_candidates],
+                *[dict(value, selected=False) for value in excluded],
+            ]
+            latency["fusion_and_candidate_filter"] = _elapsed_ms(started)
 
             reranked: list[Candidate] = []
-            if request.mode is RetrievalMode.HYBRID_RERANK and diversified:
+            rerank_query = rewrite.semantic_query or rewrite.query
+            if request.mode is RetrievalMode.HYBRID_RERANK and rerank_candidates:
                 started = time.perf_counter()
                 try:
                     with observe(
                         "retrieval.rerank",
                         as_type="retriever",
-                        input={"query": rewrite.query, "candidate_count": len(diversified)},
+                        input={"query": rerank_query, "candidate_count": len(rerank_candidates)},
                         metadata={
                             "retrieval_trace_id": str(trace_id),
                             "model": self.rerank_adapter.model,
@@ -388,10 +406,10 @@ class RetrievalService:
                         model=self.rerank_adapter.model,
                     ) as span:
                         response, rerank_retries = self._rerank_with_retry(
-                            rewrite.query,
-                            [candidate.rerank_text() for candidate in diversified],
+                            rerank_query,
+                            [candidate.rerank_text() for candidate in rerank_candidates],
                         )
-                        reranked = self._apply_rerank(diversified, response)
+                        reranked = self._apply_rerank(rerank_candidates, response)
                         span.update(
                             output={
                                 "result_count": len(reranked),
@@ -425,7 +443,7 @@ class RetrievalService:
                         raise
                     rerank_fallback_reason = exc.code
                     trace_status = RetrievalTraceStatus.DEGRADED
-                    reranked = list(diversified)
+                    reranked = list(rerank_candidates)
                     with observe(
                         "retrieval.rerank_fallback",
                         as_type="retriever",
@@ -441,24 +459,119 @@ class RetrievalService:
                         )
                 latency["rerank"] = _elapsed_ms(started)
             else:
-                reranked = list(diversified)
+                reranked = list(rerank_candidates)
+            cross_encoder_snapshot = [candidate.snapshot() for candidate in reranked]
+            started = time.perf_counter()
+            with observe(
+                "retrieval.relevance_fusion",
+                as_type="retriever",
+                input={
+                    "candidate_count": len(reranked),
+                    "entities": list(rewrite.entities),
+                },
+                metadata={
+                    "retrieval_trace_id": str(trace_id),
+                    "rerank_weight": self.settings.retrieval_relevance_rerank_weight,
+                    "rrf_weight": self.settings.retrieval_relevance_rrf_weight,
+                    "lexical_weight": self.settings.retrieval_relevance_lexical_weight,
+                    "scope_weight": self.settings.retrieval_relevance_scope_weight,
+                },
+            ) as fusion_span:
+                reranked = fuse_relevance_scores(
+                    reranked,
+                    entities=rewrite.entities,
+                    rerank_weight=self.settings.retrieval_relevance_rerank_weight,
+                    rrf_weight=self.settings.retrieval_relevance_rrf_weight,
+                    lexical_weight=self.settings.retrieval_relevance_lexical_weight,
+                    scope_weight=self.settings.retrieval_relevance_scope_weight,
+                )
+                fusion_span.update(
+                    output={
+                        "result_count": len(reranked),
+                        "top_results": [candidate.snapshot() for candidate in reranked[:20]],
+                    }
+                )
+            latency["relevance_fusion"] = _elapsed_ms(started)
+            reranked_snapshot = [candidate.snapshot() for candidate in reranked]
 
             final_limit = min(
                 request.top_k or self.settings.retrieval_final_child_top_k,
                 self.settings.retrieval_final_child_top_k,
             )
-            selected = reranked[:final_limit]
+            context_candidate_limit = min(
+                max(final_limit, self.settings.retrieval_context_candidate_top_k),
+                len(reranked),
+            )
+            started = time.perf_counter()
+            with observe(
+                "retrieval.mmr",
+                as_type="retriever",
+                input={
+                    "candidate_count": len(reranked),
+                    "limit": context_candidate_limit,
+                },
+                metadata={
+                    "retrieval_trace_id": str(trace_id),
+                    "lambda": self.settings.retrieval_mmr_lambda,
+                },
+            ) as mmr_span:
+                context_candidates = select_mmr_candidates(
+                    reranked,
+                    limit=context_candidate_limit,
+                    relevance_weight=self.settings.retrieval_mmr_lambda,
+                )
+                mmr_span.update(
+                    output={
+                        "result_count": len(context_candidates),
+                        "top_results": [candidate.snapshot() for candidate in context_candidates],
+                    }
+                )
+            latency["mmr"] = _elapsed_ms(started)
+            nodes = self._load_context_nodes(context_candidates)
+            started = time.perf_counter()
+            with observe(
+                "retrieval.context_assembly",
+                as_type="retriever",
+                input={
+                    "candidate_count": len(context_candidates),
+                    "context_limit": final_limit,
+                    "token_budget": budget,
+                },
+                metadata={"retrieval_trace_id": str(trace_id)},
+            ) as context_span:
+                context_nodes, context_used = assemble_context(
+                    context_candidates,
+                    nodes,
+                    budget_tokens=budget,
+                    parent_max_tokens=self.settings.retrieval_context_parent_max_tokens,
+                    neighbor_limit=self.settings.retrieval_context_neighbor_limit,
+                    parent_merge_min_children=self.settings.retrieval_parent_merge_min_children,
+                    parent_merge_ratio=self.settings.retrieval_parent_merge_ratio,
+                    max_context_nodes=final_limit,
+                )
+                context_span.update(
+                    output={
+                        "context_count": len(context_nodes),
+                        "used_tokens": context_used,
+                        "nodes": [
+                            {
+                                "node_id": str(value.node_id),
+                                "role": value.role,
+                                "reason": value.reason,
+                                "supporting_child_ids": [
+                                    str(child_id) for child_id in value.supporting_child_ids
+                                ],
+                                "title": value.title,
+                                "heading_path": value.heading_path,
+                            }
+                            for value in context_nodes
+                        ],
+                    }
+                )
+            selected = self._context_representatives(context_nodes, context_candidates)
             for rank, candidate in enumerate(selected, start=1):
                 candidate.final_rank = rank
-            nodes = self._load_context_nodes(selected)
-            started = time.perf_counter()
-            context_nodes, context_used = assemble_context(
-                selected,
-                nodes,
-                budget_tokens=budget,
-                parent_max_tokens=self.settings.retrieval_context_parent_max_tokens,
-                neighbor_limit=self.settings.retrieval_context_neighbor_limit,
-            )
+                candidate.selection_reasons.append("context_selected")
             latency["context_assembly"] = _elapsed_ms(started)
             latency["total"] = _elapsed_ms(total_started)
             stage_values: dict[str, list[dict[str, object]]] = {
@@ -476,11 +589,12 @@ class RetrievalService:
                 "dense": [_hit_snapshot(hit) for hit in dense_hits],
                 "graph": [hit.snapshot() for hit in graph_hits],
                 "rrf": [value.snapshot() for value in fused],
-                "diversified": [
-                    *[dict(candidate.snapshot(), selected=True) for candidate in diversified],
-                    *[dict(value, selected=False) for value in excluded],
-                ],
-                "reranked": [candidate.snapshot() for candidate in reranked],
+                # `diversified` is retained as the persisted Stage 7 field for API compatibility.
+                "filtered": filtered_snapshot,
+                "diversified": filtered_snapshot,
+                "cross_encoder": cross_encoder_snapshot,
+                "reranked": reranked_snapshot,
+                "context_candidates": [candidate.snapshot() for candidate in context_candidates],
                 "selected": [candidate.snapshot() for candidate in selected],
                 "context": [value.model_dump(mode="json") for value in context_nodes],
             }
@@ -745,6 +859,10 @@ class RetrievalService:
                         request.top_k or self.settings.retrieval_final_child_top_k,
                         self.settings.retrieval_final_child_top_k,
                     ),
+                    "effective_final_context_top_k": min(
+                        request.top_k or self.settings.retrieval_final_child_top_k,
+                        self.settings.retrieval_final_child_top_k,
+                    ),
                     "request_context_budget_tokens": request.context_budget_tokens,
                     "effective_context_budget_tokens": budget,
                     "graph_requested": graph_requested,
@@ -828,6 +946,7 @@ class RetrievalService:
                     source_locators=node.source_locators_json,
                     attributes=node.attributes_json,
                     token_count=node.token_count,
+                    embedding=node.embedding_vector,
                     document_rank=rank.document_rank,
                     document_score=rank.document_score,
                     document_rrf_score=rank.document_rrf_score,
@@ -866,8 +985,11 @@ class RetrievalService:
 
     def _load_context_nodes(self, selected: list[Candidate]) -> dict[uuid.UUID, NodeValue]:
         node_ids: set[uuid.UUID] = set()
+        parent_ids: set[uuid.UUID] = set()
         for candidate in selected:
             node_ids.add(candidate.node_id)
+            if candidate.parent_node_id is not None:
+                parent_ids.add(candidate.parent_node_id)
             node_ids.update(
                 value
                 for value in (
@@ -878,7 +1000,10 @@ class RetrievalService:
                 if value is not None
             )
         with self.session_factory() as db:
-            nodes = list(db.scalars(select(RetrievalNode).where(RetrievalNode.id.in_(node_ids))))
+            conditions = [RetrievalNode.id.in_(node_ids)]
+            if parent_ids:
+                conditions.append(RetrievalNode.parent_node_id.in_(parent_ids))
+            nodes = list(db.scalars(select(RetrievalNode).where(or_(*conditions))))
         return {
             node.id: NodeValue(
                 node_id=node.id,
@@ -973,6 +1098,23 @@ class RetrievalService:
             reranked.append(candidate)
         return reranked
 
+    @staticmethod
+    def _context_representatives(
+        context_nodes: list[ContextNodeRead], candidates: list[Candidate]
+    ) -> list[Candidate]:
+        by_id = {candidate.node_id: candidate for candidate in candidates}
+        selected: list[Candidate] = []
+        seen: set[uuid.UUID] = set()
+        for context in context_nodes:
+            representative = next(
+                (by_id[child_id] for child_id in context.supporting_child_ids if child_id in by_id),
+                None,
+            )
+            if representative is not None and representative.node_id not in seen:
+                selected.append(representative)
+                seen.add(representative.node_id)
+        return selected
+
     def _complete_trace(
         self,
         *,
@@ -1044,6 +1186,7 @@ class RetrievalService:
             chunk_rrf_score=candidate.chunk_rrf_score,
             rrf_score=candidate.rrf_score,
             rerank_score=candidate.rerank_score,
+            relevance_score=candidate.relevance_score,
             final_rank=candidate.final_rank or 0,
             exact_match=candidate.exact_match,
         )

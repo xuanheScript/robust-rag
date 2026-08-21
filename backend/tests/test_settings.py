@@ -19,12 +19,12 @@ def test_settings_defaults_are_local_only() -> None:
     assert settings.quality_sparse_extraction_min_chars_per_mb == 100
     assert settings.dingo_enabled is False
     assert settings.dingo_llm_enabled is False
-    assert settings.chunking_config_version == "stage5-parent-child-v2"
+    assert settings.chunking_config_version == "stage5-parent-child-v3"
     assert settings.chunking_parent_target_tokens == 1800
     assert settings.chunking_child_overlap_tokens == 64
     assert settings.voyage_embedding_model == "voyage-4"
     assert settings.voyage_embedding_dimension == 1024
-    assert settings.voyage_embedding_config_version == "stage6-chunk-content-v2"
+    assert settings.voyage_embedding_config_version == "stage6-scoped-chunk-v3"
     assert settings.voyage_embedding_batch_tokens == 8000
     assert settings.voyage_embedding_rate_limit_rpm == 3
     assert settings.voyage_embedding_rate_limit_tpm == 9000
@@ -36,6 +36,12 @@ def test_settings_defaults_are_local_only() -> None:
     assert settings.retrieval_document_bm25_top_k == 50
     assert settings.retrieval_document_weight == 0.5
     assert settings.retrieval_final_child_top_k == 10
+    assert settings.retrieval_sibling_duplicate_similarity_threshold == 0.96
+    assert settings.retrieval_min_rrf_score_ratio == 0.25
+    assert settings.retrieval_mmr_lambda == 0.85
+    assert settings.retrieval_relevance_rerank_weight == 0.55
+    assert settings.retrieval_context_candidate_top_k == 24
+    assert settings.retrieval_parent_merge_ratio == 0.5
     assert settings.graph_query_timeout_seconds == 3
     assert settings.graph_text_to_cypher_timeout_seconds == 8
     assert settings.graph_extractor_version == "llama-schema-v3"
@@ -50,8 +56,11 @@ def test_settings_defaults_are_local_only() -> None:
     assert settings.graph_build_max_attempts == 2
     assert settings.llm_base_url == "https://api.openai.com/v1"
     assert settings.llm_model == "gpt-5.4"
+    assert settings.generation_prompt_version == "stage8-grounded-rag-v3-zh"
     assert settings.agentic_rag_enabled is False
-    assert settings.agent_graph_version == "stage13-langgraph-agentic-rag-v2"
+    assert settings.agent_graph_version == "stage13-langgraph-agentic-rag-v3"
+    assert settings.agent_prompt_version == "stage13-agent-query-plan-v5-zh"
+    assert settings.agent_history_messages == 6
     assert settings.agent_reasoning_effort == "none"
     assert settings.langfuse_enabled is True
     assert settings.langfuse_base_url == "https://cloud.langfuse.com"

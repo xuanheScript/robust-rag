@@ -84,6 +84,8 @@ class PreparedChat:
     invocation_id: uuid.UUID | None
     question: str
     rewritten_question: str
+    semantic_query: str
+    answer_facets: tuple[str, ...]
     retrieval: RetrievalSearchResponse | None
     sources: list[ChatSource]
     generation_request: LLMRequest | None
@@ -125,7 +127,9 @@ class ChatService:
             max_chars=self.settings.retrieval_query_max_chars,
         )
         conversation_id, history, user_message_id, assistant_message_id = self._create_message_pair(
-            request.requested_conversation_id(), question
+            request.requested_conversation_id(),
+            question,
+            history_limit=self.settings.query_rewrite_history_messages,
         )
         rewrite, rewrite_warning = self._rewrite(question, history)
         try:
@@ -161,6 +165,8 @@ class ChatService:
             generation_request = grounded_request(
                 question,
                 sources,
+                semantic_query=rewrite.semantic_query or rewrite.query,
+                answer_facets=rewrite.answer_facets,
                 max_output_tokens=self.settings.llm_max_output_tokens,
                 prompt_version=self.settings.generation_prompt_version,
             )
@@ -171,6 +177,8 @@ class ChatService:
                     "conversation_id": str(conversation_id),
                     "message_id": str(assistant_message_id),
                     "retrieval_trace_id": str(retrieval.trace_id),
+                    "semantic_query": rewrite.semantic_query or rewrite.query,
+                    "answer_facets": list(rewrite.answer_facets),
                     "context_node_ids": [str(source.node_id) for source in sources],
                     "context_used_tokens": retrieval.context_used_tokens,
                 },
@@ -189,6 +197,8 @@ class ChatService:
             invocation_id=invocation_id,
             question=question,
             rewritten_question=rewrite.query,
+            semantic_query=rewrite.semantic_query or rewrite.query,
+            answer_facets=rewrite.answer_facets,
             retrieval=retrieval,
             sources=sources,
             generation_request=generation_request,
@@ -201,7 +211,9 @@ class ChatService:
             max_chars=self.settings.retrieval_query_max_chars,
         )
         conversation_id, history, user_message_id, assistant_message_id = self._create_message_pair(
-            request.requested_conversation_id(), question
+            request.requested_conversation_id(),
+            question,
+            history_limit=self.settings.agent_history_messages,
         )
         return PreparedChat(
             conversation_id=conversation_id,
@@ -210,6 +222,8 @@ class ChatService:
             invocation_id=None,
             question=question,
             rewritten_question=question,
+            semantic_query=question,
+            answer_facets=(),
             retrieval=None,
             sources=[],
             generation_request=None,
@@ -226,10 +240,18 @@ class ChatService:
     def _resolve_agent_result(self, prepared: PreparedChat, result: AgentRunResult) -> PreparedChat:
         generation_request = None
         generation_invocation_id = None
+        semantic_query = (
+            result.query_plan.semantic_query or result.query
+            if result.query_plan is not None
+            else result.query
+        )
+        answer_facets = result.query_plan.answer_facets if result.query_plan is not None else ()
         if result.sources:
             generation_request = grounded_request(
                 prepared.question,
                 result.sources,
+                semantic_query=semantic_query,
+                answer_facets=answer_facets,
                 max_output_tokens=self.settings.llm_max_output_tokens,
                 prompt_version=self.settings.generation_prompt_version,
             )
@@ -242,6 +264,8 @@ class ChatService:
                     "retrieval_trace_id": (
                         str(result.retrieval.trace_id) if result.retrieval else None
                     ),
+                    "semantic_query": semantic_query,
+                    "answer_facets": list(answer_facets),
                     "context_node_ids": [str(source.node_id) for source in result.sources],
                     "agent_action": result.action,
                     "agent_graph_version": self.settings.agent_graph_version,
@@ -264,17 +288,17 @@ class ChatService:
                 "tool_call_count": result.tool_call_count,
                 "agent_invocation_ids": [str(value) for value in result.invocation_ids],
                 "warnings": list(result.warnings),
-                "rewrite_warning": result.rewrite_warning,
             },
         )
         return replace(
             prepared,
             invocation_id=final_invocation_id,
             rewritten_question=result.query,
+            semantic_query=semantic_query,
+            answer_facets=answer_facets,
             retrieval=result.retrieval,
             sources=result.sources,
             generation_request=generation_request,
-            rewrite_warning=result.rewrite_warning,
             direct_answer=result.direct_answer,
             direct_usage=result.direct_usage,
             agent_action=result.action,
@@ -307,7 +331,6 @@ class ChatService:
         graph = AgenticRAGGraph(
             retrieval_service=self.retrieval_service,
             source_loader=self._load_sources,
-            query_planner=self._rewrite,
             stream_generate=self._start_tracked_stream,
             settings=self.settings,
             mode=pending.mode,
@@ -562,10 +585,22 @@ class ChatService:
             max_attempts=self.settings.llm_max_retries + 1,
             max_output_tokens=prepared.generation_request.max_output_tokens,
         )
+        provider_payload = prepared.generation_request.provider_payload(
+            model=self.provider.model,
+            stream=True,
+            default_reasoning_effort=getattr(self.provider, "reasoning_effort", None),
+        )
+        reasoning = provider_payload.get("reasoning")
+        reasoning_effort = reasoning.get("effort") if isinstance(reasoning, dict) else None
         with observe(
             "llm.rag_generation",
             as_type="generation",
-            input={"question": prepared.question},
+            input={
+                "provider": self.provider.provider,
+                "endpoint": self.provider.endpoint,
+                "timeout_seconds": getattr(self.provider, "timeout_seconds", None),
+                "request": provider_payload,
+            },
             metadata={
                 "conversation_id": str(prepared.conversation_id),
                 "message_id": str(prepared.assistant_message_id),
@@ -578,7 +613,15 @@ class ChatService:
             },
             version=self.settings.generation_prompt_version,
             model=self.provider.model,
-            model_parameters={"max_output_tokens": self.settings.llm_max_output_tokens},
+            model_parameters={
+                "max_output_tokens": prepared.generation_request.max_output_tokens,
+                "stream": True,
+                "reasoning_effort": (
+                    str(reasoning_effort) if reasoning_effort is not None else None
+                ),
+            },
+            capture_content=True,
+            unbounded_content=True,
         ) as generation:
             try:
                 for retry_count in range(self.settings.llm_max_retries + 1):
@@ -646,7 +689,14 @@ class ChatService:
                     citation_count=citation_count,
                 )
                 generation.update(
-                    output=answer,
+                    output={
+                        "text": answer,
+                        "response_id": response_id,
+                        "finish_reason": finish_reason,
+                        "usage": usage.snapshot(),
+                        "retry_count": retry_count,
+                        "streamed": True,
+                    },
                     metadata={
                         "latency_ms": latency_ms,
                         "first_token_ms": first_token_ms,
@@ -737,7 +787,11 @@ class ChatService:
                 yield "data: [DONE]\n\n"
 
     def _create_message_pair(
-        self, conversation_id: uuid.UUID | None, question: str
+        self,
+        conversation_id: uuid.UUID | None,
+        question: str,
+        *,
+        history_limit: int,
     ) -> tuple[uuid.UUID, list[tuple[str, str]], uuid.UUID, uuid.UUID]:
         with self.session_factory.begin() as db:
             conversation = db.get(Conversation, conversation_id) if conversation_id else None
@@ -771,7 +825,7 @@ class ChatService:
                         Message.finished_at.desc().nullslast(),
                         case((Message.role == MessageRole.ASSISTANT, 0), else_=1),
                     )
-                    .limit(self.settings.query_rewrite_history_messages)
+                    .limit(history_limit)
                 )
             )
             history = [(row.role.value, row.content) for row in reversed(history_rows)]

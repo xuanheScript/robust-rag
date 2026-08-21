@@ -178,6 +178,7 @@ class HttpOpenSearchAdapter:
                     "properties": {
                         "chunking_run_id": {"type": "keyword"},
                         "embedding_config_version": {"type": "keyword"},
+                        "retrieval_keywords": _text_mapping(keyword=True),
                     }
                 },
             )
@@ -381,10 +382,13 @@ class HttpOpenSearchAdapter:
                                     "fields": [
                                         "heading_path^3",
                                         "content^2",
+                                        "retrieval_keywords^4",
                                         "heading_path.icu^3",
                                         "content.icu",
+                                        "retrieval_keywords.icu^4",
                                         "heading_path.standard^2",
                                         "content.standard",
+                                        "retrieval_keywords.standard^3",
                                     ],
                                 }
                             }
@@ -407,9 +411,7 @@ class HttpOpenSearchAdapter:
     ) -> list[SearchHit]:
         filters: list[dict[str, object]] = [{"term": {"node_level": "child"}}]
         if embedding_config_version:
-            filters.append(
-                {"term": {"embedding_config_version": embedding_config_version}}
-            )
+            filters.append({"term": {"embedding_config_version": embedding_config_version}})
         result = self._request(
             "POST",
             f"/{alias}/_search",
@@ -621,7 +623,11 @@ class MemoryOpenSearchAdapter:
             if value.get("node_level") != "child":
                 continue
             haystack = " ".join(
-                str(value.get(field) or "") for field in ("heading_path", "content")
+                [
+                    str(value.get("heading_path") or ""),
+                    str(value.get("content") or ""),
+                    *([str(value.get("retrieval_keywords") or "")] * 4),
+                ]
             ).lower()
             score = sum(haystack.count(term) for term in terms)
             if score:
@@ -809,6 +815,7 @@ def _chunk_index_definition(dimension: int) -> dict[str, object]:
         "heading_path": _text_mapping(keyword=True),
         "content": _text_mapping(),
         "retrieval_text": _text_mapping(),
+        "retrieval_keywords": _text_mapping(keyword=True),
         "language": keyword,
         "content_types": keyword,
         "page_numbers": {"type": "integer"},

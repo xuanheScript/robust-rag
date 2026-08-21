@@ -239,7 +239,7 @@ def test_embedding_batches_retry_audit_cost_and_idempotency(
     assert response.json()[0]["batches"]
 
 
-def test_chunk_embedding_text_excludes_document_title_and_source_metadata(
+def test_chunk_embedding_text_includes_controlled_document_scope(
     session_factory: sessionmaker[Session], storage: LocalFileStorage
 ) -> None:
     _, version_id, job_id = _prepare_chunked_job(session_factory, storage)
@@ -257,9 +257,9 @@ def test_chunk_embedding_text_excludes_document_title_and_source_metadata(
     assert sorted(submitted) == sorted(expected)
     assert all(node.content.strip() in chunk_embedding_text(node) for node in nodes)
     for node in nodes:
-        if node.title and node.title not in node.content:
-            assert node.title not in chunk_embedding_text(node)
-    assert service.config_snapshot["embedding_text_contract"] == "chunk_heading_content_v2"
+        if node.title:
+            assert f"Source document: {node.title}" in chunk_embedding_text(node)
+    assert service.config_snapshot["embedding_text_contract"] == "scoped_chunk_v3"
 
 
 def test_embedding_pauses_before_over_budget_batch_and_resumes_same_run(

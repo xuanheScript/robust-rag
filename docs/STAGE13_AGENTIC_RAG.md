@@ -12,21 +12,23 @@
 START
   → Agent（LLM + 受控 Tools）
       ├─ 普通文本 → Direct Response → END
-      ├─ retrieve_enterprise_documents → Query Rewrite → Hybrid + Rerank
+      ├─ retrieve_enterprise_documents（standalone + semantic + lexical）
+      │    → Hybrid + Rerank
       │    ├─ 有来源 → Grounded Generation → END
       │    └─ 无来源 → Deterministic Refusal → END
-      └─ retrieve_enterprise_relationships → Query Rewrite → Hybrid + Graph + Rerank
+      └─ retrieve_enterprise_relationships（standalone + semantic + lexical）
+           → Hybrid + Graph + Rerank
            ├─ 有来源 → Grounded Generation → END
            └─ 无来源 → Deterministic Refusal → END
 ```
 
-这里没有 `fast_path`，也没有独立的问候/闲聊分类器。Agent LLM 根据服务端保存的对话历史自行决定直接回答还是调用工具；条件边只读取普通文本或一个受控 Tool Call。选择检索后进入独立的结构化 Query Rewrite 节点；Direct Response 跳过该节点。Query Rewrite 只执行一次，不增加检索后的 LLM 评分或循环改写。
+这里没有 `fast_path`，也没有独立的问候/闲聊分类器。Agent LLM 根据服务端保存的对话历史自行决定直接回答还是调用工具；条件边只读取普通文本或一个受控 Tool Call。Tool Call 在同一次 Agent 决策中输出 standalone、semantic 和最多两个 lexical 查询，检索分支直接进入 Retrieval，不再调用独立 Query Rewrite；Direct Response 仍跳过全部检索。
 
 ## 3. 工具边界
 
 - `retrieve_enterprise_documents`：用于制度、定义、日期、流程、操作说明和普通文档事实，显式设置本次请求不运行图查询。
 - `retrieve_enterprise_relationships`：用于归属、依赖、影响路径和多跳关系，复用阶段 9 的 OpenSearch + 受控 Text-to-Cypher 融合检索。
-- 工具只接受规范化自然语言 `query`，不接受 OpenSearch DSL、Cypher、索引名、连接参数或凭据。
+- 工具只接受规范化自然语言 `query`、`semantic_query`、最多两个 `lexical_queries`、显式 `entities` 和 `answer_facets`，不接受 OpenSearch DSL、Cypher、索引名、连接参数或凭据。
 - Agent 不直接生成或执行 Cypher；图查询仍经过只读白名单、Schema、路径深度、LIMIT、EXPLAIN、超时和结果大小限制。
 - 未知工具、多 Tool Call、非法参数或 Agent 调用失败时安全回退文档检索。
 
@@ -36,7 +38,8 @@ START
 - 无来源时不再调用其他 LLM，直接返回确定性的信息不足响应。
 - 有来源时进入 Grounded Generation，由现有 Grounded Prompt 负责只依据来源回答、部分回答或说明信息不足。
 - Agent 产生的 Tool Query 可以使用有限、可信的服务端历史消解指代。
-- Query Rewrite 保留 Tool Query，并补充有界 semantic/lexical 查询；失败时回退 Tool Query。
+- Agent Tool Call 同时生成 standalone、semantic、有界 lexical、显式 entities 和 answer facets；集合问题至少生成一个面向具体答案项的 lexical 变体。可选扩展非法时保留 standalone 并降级为单查询检索。
+- 原始用户问题始终作为召回输入保留，Agent standalone 用于图检索和重排，semantic/lexical 只做加法扩展。
 - 历史消息按 `created_at`、`finished_at` 和角色进行确定性排序；同一事务创建的 User/Assistant 消息即使 `created_at` 相同，也必须按 User → Assistant 顺序传入 Agent。
 - Direct Response 由 Agent Prompt 限定为问候、感谢、能力说明和普通交流，不允许陈述未经工具检索的企业事实。
 - Context Grader 改造方案作为独立设计文档保留，但当前代码、配置、SSE 和发布门槛均不依赖它。
@@ -45,8 +48,9 @@ START
 
 ```dotenv
 AGENTIC_RAG_ENABLED=false
-AGENT_GRAPH_VERSION=stage13-langgraph-agentic-rag-v2
-AGENT_PROMPT_VERSION=stage13-agent-decision-v3-zh
+AGENT_GRAPH_VERSION=stage13-langgraph-agentic-rag-v3
+AGENT_PROMPT_VERSION=stage13-agent-query-plan-v5-zh
+AGENT_HISTORY_MESSAGES=6
 AGENT_MAX_OUTPUT_TOKENS=500
 AGENT_REASONING_EFFORT=none
 AGENT_RECURSION_LIMIT=12

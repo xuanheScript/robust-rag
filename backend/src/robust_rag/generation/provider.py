@@ -69,6 +69,35 @@ class LLMRequest:
     tools: list[dict[str, object]] = field(default_factory=list)
     tool_choice: str | dict[str, object] | None = None
 
+    def provider_payload(
+        self,
+        *,
+        model: str,
+        stream: bool,
+        default_reasoning_effort: str | None = None,
+    ) -> dict[str, object]:
+        """Return the exact credential-free Responses API JSON body."""
+
+        payload: dict[str, object] = {
+            "model": model,
+            "instructions": self.instructions,
+            "input": self.input,
+            "max_output_tokens": self.max_output_tokens,
+            "stream": stream,
+        }
+        reasoning_effort = self.reasoning_effort or default_reasoning_effort
+        if reasoning_effort and reasoning_effort != "none":
+            payload["reasoning"] = {"effort": reasoning_effort}
+        if self.metadata:
+            payload["metadata"] = self.metadata
+        if self.text_format is not None:
+            payload["text"] = {"format": self.text_format}
+        if self.tools:
+            payload["tools"] = self.tools
+        if self.tool_choice is not None:
+            payload["tool_choice"] = self.tool_choice
+        return payload
+
 
 @dataclass(frozen=True)
 class LLMToolCall:
@@ -581,25 +610,11 @@ class ResponsesAPIProvider:
             raise error from exc
 
     def _payload(self, request: LLMRequest, *, stream: bool) -> dict[str, object]:
-        payload: dict[str, object] = {
-            "model": self.model,
-            "instructions": request.instructions,
-            "input": request.input,
-            "max_output_tokens": request.max_output_tokens,
-            "stream": stream,
-        }
-        reasoning_effort = request.reasoning_effort or self.reasoning_effort
-        if reasoning_effort != "none":
-            payload["reasoning"] = {"effort": reasoning_effort}
-        if request.metadata:
-            payload["metadata"] = request.metadata
-        if request.text_format is not None:
-            payload["text"] = {"format": request.text_format}
-        if request.tools:
-            payload["tools"] = request.tools
-        if request.tool_choice is not None:
-            payload["tool_choice"] = request.tool_choice
-        return payload
+        return request.provider_payload(
+            model=self.model,
+            stream=stream,
+            default_reasoning_effort=self.reasoning_effort,
+        )
 
 
 class FakeLLMProvider:
@@ -633,10 +648,7 @@ class FakeLLMProvider:
             raise self.failure
         if self.generate_responses:
             return self.generate_responses.pop(0)
-        if (
-            request.metadata.get("purpose") == "query_rewrite"
-            and not self._generate_text_explicit
-        ):
+        if request.metadata.get("purpose") == "query_rewrite" and not self._generate_text_explicit:
             latest = request.input[-1].get("content", "") if request.input else ""
             query = str(latest)
             text = json.dumps(

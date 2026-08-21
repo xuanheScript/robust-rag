@@ -25,13 +25,19 @@ from robust_rag.indexing.opensearch import (
 from robust_rag.indexing.rate_limit import VoyageRateLimiter
 from robust_rag.indexing.service import IndexingService
 from robust_rag.retrieval.context import assemble_context
-from robust_rag.retrieval.fusion import diversify_candidates, reciprocal_rank_fusion
+from robust_rag.retrieval.fusion import (
+    filter_rerank_candidates,
+    fuse_relevance_scores,
+    reciprocal_rank_fusion,
+    select_mmr_candidates,
+)
 from robust_rag.retrieval.query import (
     IdentityQueryRewriter,
     QueryError,
     QueryRewriteResult,
     normalize_query,
     parse_query_plan,
+    parse_tool_query_plan,
 )
 from robust_rag.retrieval.rerank import (
     RerankAdapterError,
@@ -118,9 +124,7 @@ class ParallelProbeSearchAdapter:
     ) -> list[DocumentSearchHit]:
         return self.delegate.search_document_bm25_hits(alias, query, size)
 
-    def search_chunk_bm25_hits(
-        self, alias: str, query: str, size: int = 10
-    ) -> list[SearchHit]:
+    def search_chunk_bm25_hits(self, alias: str, query: str, size: int = 10) -> list[SearchHit]:
         self.observed_parallel_start = self.embedding_started.wait(timeout=1)
         if not self.observed_parallel_start:
             raise AssertionError("dense pipeline did not start while BM25 was running")
@@ -133,9 +137,7 @@ class ParallelProbeSearchAdapter:
         size: int = 10,
         embedding_config_version: str | None = None,
     ) -> list[SearchHit]:
-        return self.delegate.search_dense_hits(
-            alias, vector, size, embedding_config_version
-        )
+        return self.delegate.search_dense_hits(alias, vector, size, embedding_config_version)
 
 
 def _retrieval_settings() -> Settings:
@@ -202,6 +204,11 @@ def _candidate(
     parent_id: uuid.UUID,
     *,
     exact: bool = False,
+    content: str = "content",
+    rrf_score: float = 1,
+    rerank_score: float | None = None,
+    embedding: list[float] | None = None,
+    content_types: list[str] | None = None,
 ) -> Candidate:
     return Candidate(
         node_id=node_id,
@@ -212,17 +219,20 @@ def _candidate(
         next_node_id=None,
         title="Title",
         heading_path=["Section"],
-        content="content",
-        retrieval_text="content",
-        content_types=["paragraph"],
+        content=content,
+        retrieval_text=content,
+        content_types=content_types or ["paragraph"],
         source_locators=[],
         attributes={},
         token_count=1,
+        embedding=embedding,
+        rrf_score=rrf_score,
+        rerank_score=rerank_score,
         exact_match=exact,
     )
 
 
-def test_query_normalization_rrf_and_diversity_are_deterministic() -> None:
+def test_query_normalization_rrf_and_candidate_filter_are_deterministic() -> None:
     query = "  \uff21\uff22\uff23-100  是什么 \uff1f "
     assert normalize_query(query, max_chars=100) == "ABC-100 是什么?"
     with pytest.raises(QueryError, match="empty"):
@@ -242,15 +252,18 @@ def test_query_normalization_rrf_and_diversity_are_deterministic() -> None:
     document_id = uuid.uuid4()
     parent_id = uuid.uuid4()
     candidates = [
-        _candidate(uuid.uuid4(), document_id, parent_id),
-        _candidate(uuid.uuid4(), document_id, parent_id),
-        _candidate(uuid.uuid4(), document_id, parent_id, exact=True),
+        _candidate(uuid.uuid4(), document_id, parent_id, content="first evidence"),
+        _candidate(uuid.uuid4(), document_id, parent_id, content="second evidence"),
+        _candidate(uuid.uuid4(), document_id, parent_id, exact=True, content="exact evidence"),
     ]
-    selected, excluded = diversify_candidates(
-        candidates, max_per_document=1, max_per_parent=1, limit=3
+    selected, excluded = filter_rerank_candidates(
+        candidates,
+        limit=3,
+        sibling_similarity_threshold=0.99,
+        min_rrf_score_ratio=0.1,
     )
-    assert [value.node_id for value in selected] == [candidates[0].node_id, candidates[2].node_id]
-    assert excluded == [{"node_id": str(candidates[1].node_id), "reason": "document_limit"}]
+    assert [value.node_id for value in selected] == [value.node_id for value in candidates]
+    assert excluded == []
 
     plan = parse_query_plan(
         json.dumps(
@@ -276,9 +289,49 @@ def test_query_normalization_rrf_and_diversity_are_deterministic() -> None:
     )
     assert plan.query == "住众公司有哪些竞聘岗位?"
     assert len(plan.lexical_queries) == 2
-    assert plan.lexical_search_queries("住众公司 竞聘 岗位")[0] == (
-        "住众公司 竞聘 岗位"
+    assert plan.lexical_search_queries("住众公司 竞聘 岗位")[0] == ("住众公司 竞聘 岗位")
+    assert plan.lexical_search_queries("住众公司 竞聘 岗位")[-1] == (
+        "住众公司有哪些竞聘岗位? 岗位名称 所在部门 岗位定员"
     )
+    assert plan.dense_search_queries("住众公司 竞聘 岗位")[-1] == (
+        "查询住众公司竞聘岗位名称、部门和岗位定员 岗位名称 所在部门 岗位定员"
+    )
+
+    tool_plan, degraded = parse_tool_query_plan(
+        {
+            "query": "它什么时候生效?",
+            "semantic_query": "合同模板 CT-2026-04 在什么时候正式生效?",
+            "lexical_queries": ["CT-2026-04 生效日期", "CT-2026-04 生效 时间"],
+            "entities": ["CT-2026-04"],
+            "answer_facets": ["生效日期"],
+        },
+        original_query="它什么时候生效?",
+        max_chars=500,
+        strategy="agent-query-plan",
+        implementation="test-agent",
+        version="1",
+    )
+    assert degraded is False
+    assert tool_plan.semantic_query == "合同模板 CT-2026-04 在什么时候正式生效?"
+    assert tool_plan.lexical_queries == (
+        "CT-2026-04 生效日期",
+        "CT-2026-04 生效 时间",
+    )
+    assert tool_plan.entities == ("CT-2026-04",)
+    assert tool_plan.answer_facets == ("生效日期",)
+
+    degraded_plan, degraded = parse_tool_query_plan(
+        {"query": "Policy"},
+        original_query="Policy",
+        max_chars=500,
+        strategy="agent-query-plan",
+        implementation="test-agent",
+        version="1",
+    )
+    assert degraded is True
+    assert degraded_plan.semantic_query == "Policy"
+    assert degraded_plan.lexical_queries == ()
+    assert degraded_plan.metadata["plan_degraded"] is True
 
 
 def test_document_prior_is_separate_and_does_not_flatten_sibling_chunk_ranks() -> None:
@@ -303,6 +356,257 @@ def test_document_prior_is_separate_and_does_not_flatten_sibling_chunk_ranks() -
     assert fused[0].rrf_score == pytest.approx(
         fused[0].chunk_rrf_score + fused[0].document_rrf_score
     )
+
+
+def test_prerank_filter_removes_only_noise_and_never_applies_a_document_quota() -> None:
+    document_id = uuid.uuid4()
+    candidates = [
+        _candidate(
+            uuid.uuid4(),
+            document_id,
+            uuid.uuid4(),
+            content=f"竞聘流程证据 {index}",
+            rrf_score=1 - index * 0.02,
+        )
+        for index in range(8)
+    ]
+    target = _candidate(
+        uuid.uuid4(),
+        document_id,
+        uuid.uuid4(),
+        content="会计岗职责及任职要求",
+        rrf_score=0.82,
+    )
+    candidates.append(target)
+
+    selected, excluded = filter_rerank_candidates(
+        candidates,
+        limit=40,
+        sibling_similarity_threshold=0.96,
+        min_rrf_score_ratio=0.25,
+    )
+
+    assert target in selected
+    assert len(selected) == 9
+    assert all(value["reason"] not in {"document_limit", "parent_limit"} for value in excluded)
+
+
+def test_prerank_filter_explains_duplicate_heading_and_low_relevance_noise() -> None:
+    document_id = uuid.uuid4()
+    parent_id = uuid.uuid4()
+    first = _candidate(
+        uuid.uuid4(),
+        document_id,
+        parent_id,
+        content="竞聘岗位公告正文",
+        rrf_score=1,
+        embedding=[1, 0],
+    )
+    duplicate = _candidate(
+        uuid.uuid4(),
+        uuid.uuid4(),
+        uuid.uuid4(),
+        content="竞聘岗位公告正文",
+        rrf_score=0.9,
+    )
+    duplicate.graph_rank = 1
+    duplicate.graph_score = 0.8
+    sibling_duplicate = _candidate(
+        uuid.uuid4(),
+        document_id,
+        parent_id,
+        content="竞聘岗位公告正文的重复切片",
+        rrf_score=0.8,
+        embedding=[1, 0],
+    )
+    heading_only = _candidate(
+        uuid.uuid4(),
+        document_id,
+        uuid.uuid4(),
+        content="附件 1",
+        rrf_score=0.7,
+        content_types=["heading"],
+    )
+    low_relevance = _candidate(
+        uuid.uuid4(),
+        document_id,
+        uuid.uuid4(),
+        content="食堂值班安排",
+        rrf_score=0.1,
+    )
+
+    selected, excluded = filter_rerank_candidates(
+        [first, duplicate, sibling_duplicate, heading_only, low_relevance],
+        limit=40,
+        sibling_similarity_threshold=0.96,
+        min_rrf_score_ratio=0.25,
+    )
+
+    assert selected == [first]
+    assert first.graph_rank == 1
+    assert "duplicate_signals_merged" in first.selection_reasons
+    assert [value["reason"] for value in excluded] == [
+        "duplicate_content",
+        "sibling_near_duplicate",
+        "low_information_heading",
+        "below_rrf_threshold",
+    ]
+
+
+def test_mmr_keeps_complementary_same_document_evidence() -> None:
+    document_id = uuid.uuid4()
+    first = _candidate(
+        uuid.uuid4(),
+        document_id,
+        uuid.uuid4(),
+        content="竞聘公告标题",
+        rerank_score=0.95,
+        embedding=[1, 0],
+    )
+    redundant = _candidate(
+        uuid.uuid4(),
+        document_id,
+        uuid.uuid4(),
+        content="附件中的竞聘公告标题",
+        rerank_score=0.9,
+        embedding=[1, 0],
+    )
+    complementary = _candidate(
+        uuid.uuid4(),
+        document_id,
+        uuid.uuid4(),
+        content="会计岗职责及任职要求",
+        rerank_score=0.8,
+        embedding=[0, 1],
+    )
+
+    selected = select_mmr_candidates(
+        [first, redundant, complementary], limit=3, relevance_weight=0.85
+    )
+
+    assert selected == [first, complementary, redundant]
+    assert complementary.max_selected_similarity == 0
+    assert all(value.mmr_score is not None for value in selected)
+
+
+def test_hybrid_relevance_preserves_scope_and_first_stage_signals() -> None:
+    target = _candidate(
+        uuid.uuid4(),
+        uuid.uuid4(),
+        uuid.uuid4(),
+        content="岗位名称: 会计岗; 所在部门: 财务部; 岗位定员: 1人",
+        rrf_score=0.8,
+        rerank_score=0.75,
+    )
+    target.title = "住众公司 2026 年度空缺岗位内部选聘公告"
+    target.heading_path = ["内部选聘岗位职责及任职要求"]
+    target.bm25_score = 0.7
+    wrong_document = _candidate(
+        uuid.uuid4(),
+        uuid.uuid4(),
+        uuid.uuid4(),
+        content="竞聘部门及岗位",
+        rrf_score=0.4,
+        rerank_score=0.9,
+    )
+    wrong_document.title = "新岸公司及棉三公司中层管理人员竞聘上岗公告"
+    wrong_document.bm25_score = 0.6
+
+    ranked = fuse_relevance_scores(
+        [wrong_document, target],
+        entities=("住众公司",),
+        rerank_weight=0.55,
+        rrf_weight=0.25,
+        lexical_weight=0.1,
+        scope_weight=0.1,
+    )
+
+    assert ranked[0] is target
+    assert target.scope_match_score == 1
+    assert wrong_document.scope_match_score == 0
+    assert target.relevance_score is not None
+    assert target.normalized_rrf_score == 1
+    assert "Source document: 住众公司" in target.rerank_text()
+
+
+def test_parent_merge_happens_before_context_slot_cutoff() -> None:
+    parent_id = uuid.uuid4()
+    first_id = uuid.uuid4()
+    second_id = uuid.uuid4()
+    answer_id = uuid.uuid4()
+    document_id = uuid.uuid4()
+    first = _candidate(first_id, document_id, parent_id, content="流程上半段")
+    second = _candidate(second_id, document_id, parent_id, content="流程下半段")
+    first.next_node_id = second_id
+    second.previous_node_id = first_id
+    answer = _candidate(answer_id, document_id, uuid.uuid4(), content="岗位名称: 会计岗")
+    nodes = {
+        parent_id: NodeValue(
+            parent_id,
+            None,
+            None,
+            None,
+            "公告",
+            ["流程"],
+            "完整流程",
+            ["paragraph"],
+            [],
+            {},
+            5,
+        ),
+        first_id: NodeValue(
+            first_id,
+            parent_id,
+            None,
+            second_id,
+            "公告",
+            ["流程"],
+            "流程上半段",
+            ["paragraph"],
+            [],
+            {"child_ordinal": 0},
+            3,
+        ),
+        second_id: NodeValue(
+            second_id,
+            parent_id,
+            first_id,
+            None,
+            "公告",
+            ["流程"],
+            "流程下半段",
+            ["paragraph"],
+            [],
+            {"child_ordinal": 1},
+            3,
+        ),
+        answer_id: NodeValue(
+            answer_id,
+            answer.parent_node_id,
+            None,
+            None,
+            "公告附件",
+            ["岗位职责及任职要求"],
+            "岗位名称: 会计岗",
+            ["table"],
+            [],
+            {},
+            4,
+        ),
+    }
+
+    context, _ = assemble_context(
+        [first, second, answer],
+        nodes,
+        budget_tokens=20,
+        parent_max_tokens=20,
+        neighbor_limit=0,
+        max_context_nodes=2,
+    )
+
+    assert [value.role for value in context] == ["parent", "child"]
+    assert context[0].supporting_child_ids == [first_id, second_id]
+    assert context[1].content == "岗位名称: 会计岗"
 
 
 def test_memory_search_keeps_document_title_out_of_chunk_bm25() -> None:
@@ -340,6 +644,7 @@ def test_memory_search_keeps_document_title_out_of_chunk_bm25() -> None:
                 "heading_path": ["Open positions"],
                 "content": "Accounting role responsibilities and qualifications",
                 "retrieval_text": "Accounting recruitment notice\nAccounting role",
+                "retrieval_keywords": ["position identifier"],
                 "is_active": True,
             },
             {
@@ -359,6 +664,9 @@ def test_memory_search_keeps_document_title_out_of_chunk_bm25() -> None:
     assert adapter.search_document_bm25_hits("documents-read", "Accounting")
     chunk_hits = adapter.search_chunk_bm25_hits("chunks-read", "Accounting")
     assert [hit.node_id for hit in chunk_hits] == ["accounting"]
+    assert [
+        hit.node_id for hit in adapter.search_chunk_bm25_hits("chunks-read", "position identifier")
+    ] == ["accounting"]
     assert adapter.search_chunk_bm25_hits("chunks-read", "recruitment notice") == []
 
 
@@ -369,9 +677,7 @@ def test_http_search_uses_disjoint_document_and_chunk_fields() -> None:
         requests.append(json.loads(request.content))
         return httpx.Response(200, json={"hits": {"hits": []}})
 
-    client = httpx.Client(
-        transport=httpx.MockTransport(handler), base_url="http://opensearch.test"
-    )
+    client = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://opensearch.test")
     adapter = HttpOpenSearchAdapter(
         base_url="http://opensearch.test",
         username=None,
@@ -395,16 +701,18 @@ def test_http_search_uses_disjoint_document_and_chunk_fields() -> None:
     assert all(not field.startswith("title") for field in chunk_fields)
     assert all(not field.startswith("retrieval_text") for field in chunk_fields)
     assert any(field.startswith("content") for field in chunk_fields)
+    assert any(field.startswith("retrieval_keywords") for field in chunk_fields)
     client.close()
 
 
-def test_rerank_text_contains_chunk_evidence_but_not_document_title() -> None:
+def test_rerank_text_separates_document_scope_hierarchy_and_evidence() -> None:
     candidate = _candidate(uuid.uuid4(), uuid.uuid4(), uuid.uuid4())
     text = candidate.rerank_text()
 
-    assert "Heading: Section" in text
+    assert "Source document: Title" in text
+    assert "Hierarchy: Section" in text
+    assert "Evidence:" in text
     assert "content" in text
-    assert "Title" not in text
 
 
 def test_query_plan_expansion_adds_recall_without_dropping_original(
@@ -548,6 +856,7 @@ def test_context_assembly_deduplicates_parent_and_uses_neighbor_when_parent_is_t
     )
     assert len(parent_context) == 1
     assert parent_context[0].role == "parent"
+    assert parent_context[0].reason == "auto_merged_parent"
     assert parent_context[0].supporting_child_ids == [first_id, second_id]
     assert used == 10
 
@@ -555,6 +864,66 @@ def test_context_assembly_deduplicates_parent_and_uses_neighbor_when_parent_is_t
         [first], nodes, budget_tokens=8, parent_max_tokens=5, neighbor_limit=1
     )
     assert [value.role for value in child_context] == ["child", "neighbor"]
+    assert used == 8
+
+
+def test_context_assembly_merges_adjacent_hits_when_parent_ratio_is_low() -> None:
+    parent_id = uuid.uuid4()
+    child_ids = [uuid.uuid4() for _ in range(4)]
+    document_id = uuid.uuid4()
+    candidates = [
+        _candidate(child_ids[1], document_id, parent_id, content="岗位名称与定员"),
+        _candidate(child_ids[2], document_id, parent_id, content="岗位职责与任职要求"),
+    ]
+    candidates[0].previous_node_id = child_ids[0]
+    candidates[0].next_node_id = child_ids[2]
+    candidates[1].previous_node_id = child_ids[1]
+    candidates[1].next_node_id = child_ids[3]
+    nodes = {
+        parent_id: NodeValue(
+            parent_id,
+            None,
+            None,
+            None,
+            "竞聘公告",
+            ["竞聘岗位"],
+            "完整但很长的 parent",
+            ["paragraph"],
+            [],
+            {},
+            20,
+        )
+    }
+    for index, child_id in enumerate(child_ids):
+        nodes[child_id] = NodeValue(
+            child_id,
+            parent_id,
+            child_ids[index - 1] if index else None,
+            child_ids[index + 1] if index + 1 < len(child_ids) else None,
+            "竞聘公告",
+            ["竞聘岗位"],
+            f"第 {index + 1} 个切片",
+            ["paragraph"],
+            [],
+            {"child_ordinal": index},
+            4,
+        )
+
+    context, used = assemble_context(
+        candidates,
+        nodes,
+        budget_tokens=20,
+        parent_max_tokens=20,
+        neighbor_limit=1,
+        parent_merge_min_children=2,
+        parent_merge_ratio=0.75,
+    )
+
+    assert len(context) == 1
+    assert context[0].role == "window"
+    assert context[0].reason == "adjacent_selected_children"
+    assert context[0].supporting_child_ids == child_ids[1:3]
+    assert context[0].content == "第 2 个切片\n\n第 3 个切片"
     assert used == 8
 
 
@@ -590,6 +959,12 @@ def test_all_retrieval_modes_and_debug_trace_are_independently_runnable(
     assert all(input_type == "query" for _, input_type in embedding.calls)
     assert len(reranker.calls) == 1
     assert responses[RetrievalMode.HYBRID_RERANK].debug
+    rerank_debug = responses[RetrievalMode.HYBRID_RERANK].debug
+    assert rerank_debug is not None
+    debug_reranked = cast(list[dict[str, object]], rerank_debug["reranked"])
+    debug_selected = cast(list[dict[str, object]], rerank_debug["selected"])
+    assert all(value["mmr_score"] is None for value in debug_reranked)
+    assert all(value["mmr_score"] is not None for value in debug_selected)
 
     with session_factory() as db:
         assert db.scalar(select(func.count()).select_from(RetrievalTrace)) == 4

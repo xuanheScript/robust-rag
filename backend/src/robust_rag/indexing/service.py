@@ -808,6 +808,7 @@ class IndexingService:
             "heading_path": node.heading_path,
             "content": node.content,
             "retrieval_text": node.retrieval_text,
+            "retrieval_keywords": node.attributes_json.get("retrieval_keywords", []),
             "language": node.language,
             "content_types": node.content_types,
             "page_numbers": _unique_ints(locators, "page_number"),

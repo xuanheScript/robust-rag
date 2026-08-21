@@ -10,11 +10,12 @@
 - 表格在 Parent 上限内保留完整逻辑表，超长表按行分片；每个 Parent/Child 均重复表头。
 - 普通 Child 只在同一 Parent 内产生重叠，不跨章节、Slide 或逻辑表。
 - 标题、标题路径、内容类型和页码/Slide/Sheet/Cell/行号上下文写入 `retrieval_text`。
+- 表格节点从表头和键值标签确定性提取 `retrieval_keywords`，不调用 LLM；关键词写入节点属性和 `retrieval_text`，供后续 BM25、Dense 与 Rerank 独立加权。
 
 默认窗口：
 
 ```dotenv
-CHUNKING_CONFIG_VERSION=stage5-parent-child-v2
+CHUNKING_CONFIG_VERSION=stage5-parent-child-v3
 CHUNKING_PARENT_TARGET_TOKENS=1800
 CHUNKING_PARENT_MAX_TOKENS=2500
 CHUNKING_CHILD_TARGET_TOKENS=500
@@ -36,6 +37,7 @@ Parent Node ID 基于 DocumentVersion、Chunker/配置版本、顺序和内容�
 - 标题路径、内容类型、语言和 Token 数。
 - 文档质量决策、质量摘要和是否人工放行。
 - `retrieval_text` 及其 SHA-256。
+- 表格结构化检索关键词 `attributes.retrieval_keywords`。
 - 待后续阶段填写的 Embedding 和索引状态。
 
 ## 持久化与状态

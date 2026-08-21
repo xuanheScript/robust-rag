@@ -144,6 +144,39 @@ def test_langfuse_observation_uses_stable_trace_and_redacted_content() -> None:
     assert client.observation.ended is True
 
 
+def test_observation_can_export_unbounded_content_for_a_single_generation() -> None:
+    client = FakeLangfuse()
+    service = ObservabilityService(_settings(), client=client)  # type: ignore[arg-type]
+    long_context = "企业上下文" * 1000
+
+    with service.observe(
+        "llm.rag_generation",
+        as_type="generation",
+        input={
+            "request": {
+                "instructions": "完整指令",
+                "input": [{"role": "user", "content": long_context}],
+                "api_key": "must-not-leak",
+            }
+        },
+        capture_content=True,
+        unbounded_content=True,
+    ) as observation:
+        observation.update(output={"text": long_context, "response_id": "resp-1"})
+
+    started_input = client.started[0]["input"]
+    assert isinstance(started_input, dict)
+    request = started_input["request"]
+    assert isinstance(request, dict)
+    assert request["api_key"] == "[REDACTED]"
+    messages = request["input"]
+    assert isinstance(messages, list)
+    assert messages[0]["content"] == long_context
+    output = client.observation.updates[0]["output"]
+    assert isinstance(output, dict)
+    assert output["text"] == long_context
+
+
 def test_nested_observations_preserve_parent_child_relationship() -> None:
     client = FakeLangfuse()
     service = ObservabilityService(_settings(), client=client)  # type: ignore[arg-type]

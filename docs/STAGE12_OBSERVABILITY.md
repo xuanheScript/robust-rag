@@ -58,7 +58,7 @@ LANGFUSE_FLUSH_INTERVAL_SECONDS=5
 - `graph.neo4j.query`：实际查询耗时、返回行数和开发环境下的结果详情。
 - `retrieval.rerank`：候选数、结果数、模型、Token 与重试。
 - `llm.query_rewrite`：Prompt 版本、模型、Token、成本、耗时和降级。
-- `llm.rag_generation`：模型、Token、估算成本、总耗时、首 Token 耗时、重试和引用数量。
+- `llm.rag_generation`：上传实际 Responses API JSON Body 对应的完整安全参数，包括 model、instructions、完整 input/context、max output、reasoning、metadata、tools/text format/tool choice（若存在），以及完整聚合响应、Usage、重试、引用和耗时。
 
 `ModelInvocation.trace_id` 保存应用 Trace ID；上游 Provider 的 `response_id` 保存在 `response_snapshot`，两者不得混用。
 所有子 Observation 显式继承当前 Observation ID，HTTP Trace 应形成一棵连续的父子树，
@@ -75,11 +75,13 @@ worker Context 中恢复生成器时出现 `Failed to detach context`。
 
 ## 5. 数据保护
 
-默认禁止上报或记录：
+除下述显式诊断例外，默认禁止上报或记录：
 
 - 完整原始文档、完整检索上下文、完整 Prompt 和回答。
 - `Authorization`、Cookie、Password、Secret、API Key、Access/Refresh Token。
 - PostgreSQL、Redis 和其他带凭据的连接串。
+
+`llm.rag_generation` 是显式诊断例外：即使全局 `LANGFUSE_CAPTURE_CONTENT=false`，也会完整上传该次模型调用的 Prompt、来源 Context 和回答，以便核对实际模型参数。API Key、Authorization、Cookie、Password、Secret、Token 和带凭据连接串仍在应用进程内强制脱敏，且不会进入请求快照。
 
 脱敏在应用进程内、数据进入 Langfuse SDK 和日志 Renderer 前执行。浏览器只读取状态、Base URL、采样率、最近 Trace 时间、错误类别和丢弃计数，不读取任何 Langfuse 凭据。
 
@@ -165,5 +167,5 @@ pnpm build
 1. 调用 `/health/observability?remote=true`，期望 `status=ok`。
 2. 发起一次 Chat、一次人工图谱生成和一次小样本评测。
 3. 在 Langfuse 确认 `graph.extract` 下存在逐 Parent 的 `llm.graph_extraction` Generation，并核对 Trace 层级、Token/成本、首 Token 耗时和 Score。
-4. 确认 Trace 中不存在完整文档、完整上下文、密钥、Cookie 和连接串。
+4. 确认除 `llm.rag_generation` 的显式完整 Prompt/Context 外，其他 Trace 遵循内容采集配置；所有 Observation 均不得出现密钥、Cookie 和带凭据连接串。
 5. 临时配置错误 Base URL，确认 Chat、入库和本地评测报告仍成功，仅产生观测降级告警。

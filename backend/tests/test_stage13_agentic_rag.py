@@ -45,8 +45,24 @@ def _response(
     *,
     tool: str | None = None,
     query: str = "Policy",
+    semantic_query: str | None = None,
+    lexical_queries: list[str] | None = None,
+    entities: list[str] | None = None,
+    answer_facets: list[str] | None = None,
+    arguments: dict[str, object] | None = None,
 ) -> LLMResponse:
-    calls = (LLMToolCall(call_id="call-1", name=tool, arguments={"query": query}),) if tool else ()
+    tool_arguments: dict[str, object] = (
+        arguments
+        if arguments is not None
+        else {
+            "query": query,
+            "semantic_query": semantic_query or query,
+            "lexical_queries": lexical_queries or [],
+            "entities": entities or [],
+            "answer_facets": answer_facets or [],
+        }
+    )
+    calls = (LLMToolCall(call_id="call-1", name=tool, arguments=tool_arguments),) if tool else ()
     return LLMResponse(
         text=text,
         response_id="resp-agent",
@@ -286,7 +302,16 @@ def test_agent_document_tool_skips_graph_and_generates_grounded_answer(
     _, _, adapter = _ready_search_fixture(session_factory, storage)
     provider = FakeLLMProvider(
         response_text="Grounded answer [S1]",
-        generate_responses=[_response(tool="retrieve_enterprise_documents")],
+        generate_responses=[
+            _response(
+                tool="retrieve_enterprise_documents",
+                query="Policy effective date",
+                semantic_query="When does Policy take effect?",
+                lexical_queries=["Policy", "Policy effective date"],
+                entities=["Policy"],
+                answer_facets=["effective date"],
+            )
+        ],
     )
     service = _service(session_factory, adapter, provider)
 
@@ -297,38 +322,57 @@ def test_agent_document_tool_skips_graph_and_generates_grounded_answer(
     assert any(event["type"] == "data-tool-status" for event in events)
     assert provider.stream_requests[0].tools
     assert provider.stream_requests[0].text_format is None
-    assert len(provider.generate_requests) == 1
-    assert provider.generate_requests[0].metadata["purpose"] == "query_rewrite"
-    assert provider.generate_requests[0].reasoning_effort == "none"
+    assert provider.generate_requests == []
+    tool = provider.stream_requests[0].tools[0]
+    parameters = cast(dict[str, object], tool["parameters"])
+    assert parameters["required"] == [
+        "query",
+        "semantic_query",
+        "lexical_queries",
+        "entities",
+        "answer_facets",
+    ]
     assert len(provider.stream_requests) == 2
+    generation_input = str(provider.stream_requests[1].input[0]["content"])
+    assert "用户原始问题" in generation_input and "Policy" in generation_input
+    assert (
+        "语义检索目标" in generation_input and "When does Policy take effect?" in generation_input
+    )
+    assert "需要核对的信息维度" in generation_input and "effective date" in generation_input
     with session_factory() as db:
         assistant = db.get(Message, prepared.assistant_message_id)
         assert assistant is not None
         assert assistant.retrieval_trace_id is not None
         trace = db.get(RetrievalTrace, assistant.retrieval_trace_id)
         assert trace is not None
+        assert trace.query_original == "Policy"
+        assert trace.query_rewritten == "Policy effective date"
+        assert trace.rewrite_snapshot["standalone_query"] == "Policy effective date"
+        assert trace.rewrite_snapshot["semantic_query"] == "When does Policy take effect?"
+        assert trace.rewrite_snapshot["lexical_queries"] == [
+            "Policy",
+            "Policy effective date",
+        ]
+        assert trace.rewrite_snapshot["entities"] == ["Policy"]
+        assert trace.rewrite_snapshot["answer_facets"] == ["effective date"]
         assert trace.config_snapshot["graph_requested"] is False
         assert trace.graph_query_trace_id is None
         assert assistant.metadata_json["selected_tool"] == ("retrieve_enterprise_documents")
 
 
-def test_query_rewrite_failure_is_not_reported_as_agent_fallback(
+def test_agent_query_plan_degrades_optional_expansions_without_an_extra_model_call(
     session_factory: sessionmaker[Session],
     storage: LocalFileStorage,
 ) -> None:
-    class RewriteFailureProvider(FakeLLMProvider):
-        def generate(self, request: LLMRequest) -> LLMResponse:
-            self.generate_requests.append(request)
-            raise LLMProviderError(
-                "LLM_INCOMPLETE_RESPONSE",
-                "Generation service returned an incomplete response (max_output_tokens)",
-                retryable=False,
-            )
-
     _, _, adapter = _ready_search_fixture(session_factory, storage)
-    provider = RewriteFailureProvider(
+    provider = FakeLLMProvider(
         response_text="Grounded answer [S1]",
-        generate_responses=[_response(tool="retrieve_enterprise_documents")],
+        generate_responses=[
+            _response(
+                tool="retrieve_enterprise_documents",
+                arguments={"query": "Policy"},
+            )
+        ],
     )
     service = _service(session_factory, adapter, provider)
 
@@ -342,19 +386,23 @@ def test_query_rewrite_failure_is_not_reported_as_agent_fallback(
     assert _answer(chunks) == "Grounded answer [S1]"
     assert warnings == [
         {
-            "code": "LLM_INCOMPLETE_RESPONSE",
-            "message": (
-                "Query planning was unavailable; retrieval continued with the tool query unchanged."
-            ),
+            "code": "AGENT_QUERY_PLAN_DEGRADED",
+            "message": "Agentic RAG used a safe fallback.",
         }
     ]
-    assert provider.generate_requests[0].max_output_tokens == 500
+    assert provider.generate_requests == []
     with session_factory() as db:
         assistant = db.get(Message, prepared.assistant_message_id)
         assert assistant is not None
-        assert assistant.metadata_json["rewrite_warning"] == "LLM_INCOMPLETE_RESPONSE"
-        assert assistant.metadata_json["warnings"] == []
-        assert len(cast(list[object], assistant.metadata_json["agent_invocation_ids"])) == 2
+        assert assistant.metadata_json["warnings"] == ["AGENT_QUERY_PLAN_DEGRADED"]
+        assert "rewrite_warning" not in assistant.metadata_json
+        assert len(cast(list[object], assistant.metadata_json["agent_invocation_ids"])) == 1
+        assert assistant.retrieval_trace_id is not None
+        trace = db.get(RetrievalTrace, assistant.retrieval_trace_id)
+        assert trace is not None
+        assert trace.rewrite_snapshot["semantic_query"] == "Policy"
+        assert trace.rewrite_snapshot["lexical_queries"] == []
+        assert trace.rewrite_snapshot["plan_degraded"] is True
 
 
 def test_agent_mixed_output_prefers_tool_without_leaking_decision_text(

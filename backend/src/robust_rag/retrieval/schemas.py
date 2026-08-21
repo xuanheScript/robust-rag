@@ -27,6 +27,7 @@ class Candidate:
     source_locators: list[dict[str, object]]
     attributes: dict[str, object]
     token_count: int
+    embedding: list[float] | None = None
     document_rank: int | None = None
     document_score: float | None = None
     document_rrf_score: float = 0
@@ -40,6 +41,13 @@ class Candidate:
     chunk_rrf_score: float = 0
     rrf_score: float = 0
     rerank_score: float | None = None
+    rerank_rank: int | None = None
+    normalized_rrf_score: float | None = None
+    normalized_lexical_score: float | None = None
+    scope_match_score: float | None = None
+    relevance_score: float | None = None
+    mmr_score: float | None = None
+    max_selected_similarity: float | None = None
     exact_match: bool = False
     final_rank: int | None = None
     selection_reasons: list[str] = field(default_factory=list)
@@ -63,21 +71,45 @@ class Candidate:
             "chunk_rrf_score": self.chunk_rrf_score,
             "rrf_score": self.rrf_score,
             "rerank_score": self.rerank_score,
+            "rerank_rank": self.rerank_rank,
+            "normalized_rrf_score": self.normalized_rrf_score,
+            "normalized_lexical_score": self.normalized_lexical_score,
+            "scope_match_score": self.scope_match_score,
+            "relevance_score": self.relevance_score,
+            "mmr_score": self.mmr_score,
+            "max_selected_similarity": self.max_selected_similarity,
             "exact_match": self.exact_match,
             "final_rank": self.final_rank,
-            "selection_reasons": self.selection_reasons,
+            "selection_reasons": list(self.selection_reasons),
             "title": self.title,
             "heading_path": self.heading_path,
             "content_types": self.content_types,
         }
 
     def rerank_text(self) -> str:
+        hierarchy = list(self.heading_path)
+        if self.title and hierarchy and _same_scope_value(self.title, hierarchy[0]):
+            hierarchy = hierarchy[1:]
         values = [
-            f"Heading: {' > '.join(self.heading_path)}" if self.heading_path else "",
+            f"Source document: {self.title}" if self.title else "",
+            f"Hierarchy: {' > '.join(hierarchy)}" if hierarchy else "",
             f"Content types: {', '.join(self.content_types)}" if self.content_types else "",
+            self._keyword_line(),
+            "Evidence:",
             self.content,
         ]
         return "\n".join(value for value in values if value)
+
+    def _keyword_line(self) -> str:
+        keywords = self.attributes.get("retrieval_keywords")
+        if not isinstance(keywords, list):
+            return ""
+        values = [str(value).strip() for value in keywords if str(value).strip()]
+        return "Retrieval keywords: " + ", ".join(values) if values else ""
+
+
+def _same_scope_value(left: str, right: str) -> bool:
+    return "".join(left.casefold().split()) == "".join(right.casefold().split())
 
 
 @dataclass(frozen=True)
@@ -126,6 +158,7 @@ class RetrievedChildRead(BaseModel):
     chunk_rrf_score: float
     rrf_score: float
     rerank_score: float | None
+    relevance_score: float | None
     final_rank: int
     exact_match: bool
 

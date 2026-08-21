@@ -2,6 +2,7 @@
 
 import hashlib
 import re
+import unicodedata
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -31,7 +32,7 @@ TABLE_TYPES = {BlockType.TABLE, BlockType.LOGICAL_TABLE}
 class ChunkingConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    config_version: str = "stage5-parent-child-v2"
+    config_version: str = "stage5-parent-child-v3"
     parent_target_tokens: int = Field(default=1800, ge=1)
     parent_max_tokens: int = Field(default=2500, ge=1)
     child_target_tokens: int = Field(default=500, ge=1)
@@ -360,12 +361,18 @@ class StructureAwareChunker:
                 ]
             ),
         )
+        retrieval_keywords = _retrieval_keywords(
+            draft.content,
+            content_types=draft.content_types,
+            table_header=draft.table_header,
+        )
         retrieval_text = _retrieval_text(
             document.title,
             draft.heading_path,
             draft.content_types,
             draft.source_locators,
             draft.content,
+            retrieval_keywords,
         )
         return RetrievalNodeData(
             node_id=node_id,
@@ -394,6 +401,7 @@ class StructureAwareChunker:
                 "table_header": draft.table_header,
                 "table_profile": draft.table_profile,
                 "table_child_contents": draft.table_child_contents,
+                "retrieval_keywords": retrieval_keywords,
             },
         )
 
@@ -410,12 +418,18 @@ class StructureAwareChunker:
             NODE_ID_NAMESPACE,
             f"{parent.node_id}:{self.config.config_version}:child:{ordinal}:{content_hash}",
         )
+        retrieval_keywords = _retrieval_keywords(
+            content,
+            content_types=parent.content_types,
+            table_header=[str(value) for value in parent.attributes.get("table_header", [])],
+        )
         retrieval_text = _retrieval_text(
             document.title,
             parent.heading_path,
             parent.content_types,
             parent.source_locators,
             content,
+            retrieval_keywords,
         )
         return RetrievalNodeData(
             node_id=node_id,
@@ -443,9 +457,8 @@ class StructureAwareChunker:
                 "child_ordinal": ordinal,
                 "table": parent.attributes.get("table", False),
                 "table_header": parent.attributes.get("table_header", []),
-                "table_kind": parent.attributes.get("table_profile", {}).get(
-                    "kind", "complex"
-                ),
+                "table_kind": parent.attributes.get("table_profile", {}).get("kind", "complex"),
+                "retrieval_keywords": retrieval_keywords,
             },
         )
 
@@ -553,9 +566,7 @@ def _combine_fragments(group_kind: str, fragments: list[_Fragment]) -> _ParentDr
         table_header=list(table_header),
         table_profile=dict(table_profile),
         table_child_contents=[
-            child
-            for fragment in fragments
-            for child in fragment.table_child_contents
+            child for fragment in fragments for child in fragment.table_child_contents
         ],
     )
 
@@ -633,6 +644,7 @@ def _retrieval_text(
     content_types: list[str],
     source_locators: list[SourceLocator],
     content: str,
+    retrieval_keywords: list[str] | None = None,
 ) -> str:
     context: list[str] = []
     if title:
@@ -644,8 +656,30 @@ def _retrieval_text(
     source_labels = _source_labels(source_locators)
     if source_labels:
         context.append("source: " + "; ".join(source_labels))
+    if retrieval_keywords:
+        context.append("keywords: " + ", ".join(retrieval_keywords))
     context.append(content.strip())
     return "\n".join(value for value in context if value)
+
+
+def _retrieval_keywords(
+    content: str,
+    *,
+    content_types: list[str],
+    table_header: list[str],
+) -> list[str]:
+    if "table" not in {value.casefold() for value in content_types}:
+        return []
+    normalized_content = unicodedata.normalize("NFKC", content)
+    values = [value.strip() for value in table_header if value.strip()]
+    values.extend(
+        re.sub(r"^[\s:;,.]+|[\s:;,.]+$", "", match.group(1))
+        for match in re.finditer(
+            r"(?:^|[\n\t;])\s*([^\n\t;:]{1,32})\s*:",
+            normalized_content,
+        )
+    )
+    return _unique([value for value in values if value])[:16]
 
 
 def _source_labels(locators: list[SourceLocator]) -> list[str]:

@@ -112,13 +112,32 @@ def _normalize_trace_id(value: str) -> str:
     return trace_id_from_seed(value)
 
 
-def sanitize_payload(value: object, *, max_depth: int = 5) -> object:
+def sanitize_payload(
+    value: object,
+    *,
+    max_depth: int = 5,
+    max_string_chars: int | None = 2048,
+    max_items: int | None = 100,
+) -> object:
     """Remove known credential fields and bound exported payload size."""
 
-    return _sanitize(value, depth=0, max_depth=max_depth)
+    return _sanitize(
+        value,
+        depth=0,
+        max_depth=max_depth,
+        max_string_chars=max_string_chars,
+        max_items=max_items,
+    )
 
 
-def _sanitize(value: object, *, depth: int, max_depth: int) -> object:
+def _sanitize(
+    value: object,
+    *,
+    depth: int,
+    max_depth: int,
+    max_string_chars: int | None,
+    max_items: int | None,
+) -> object:
     if depth >= max_depth:
         return "[MAX_DEPTH]"
     if value is None or isinstance(value, bool | int | float):
@@ -126,27 +145,51 @@ def _sanitize(value: object, *, depth: int, max_depth: int) -> object:
     if isinstance(value, str):
         redacted = _bearer_value.sub("Bearer [REDACTED]", value)
         redacted = _credential_url.sub(r"\g<scheme>[REDACTED]@", redacted)
-        return redacted if len(redacted) <= 2048 else f"{redacted[:2048]}…[TRUNCATED]"
+        if max_string_chars is None or len(redacted) <= max_string_chars:
+            return redacted
+        return f"{redacted[:max_string_chars]}…[TRUNCATED]"
     if isinstance(value, Mapping):
         result: dict[str, object] = {}
         for index, (raw_key, item) in enumerate(value.items()):
-            if index >= 100:
+            if max_items is not None and index >= max_items:
                 result["_truncated"] = True
                 break
             key = str(raw_key)
             result[key] = (
                 "[REDACTED]"
                 if _sensitive_key.search(key)
-                else _sanitize(item, depth=depth + 1, max_depth=max_depth)
+                else _sanitize(
+                    item,
+                    depth=depth + 1,
+                    max_depth=max_depth,
+                    max_string_chars=max_string_chars,
+                    max_items=max_items,
+                )
             )
         return result
     if isinstance(value, (list, tuple, set, frozenset)):
         items = list(value)
-        sanitized = [_sanitize(item, depth=depth + 1, max_depth=max_depth) for item in items[:100]]
-        if len(items) > 100:
+        bounded_items = items if max_items is None else items[:max_items]
+        sanitized = [
+            _sanitize(
+                item,
+                depth=depth + 1,
+                max_depth=max_depth,
+                max_string_chars=max_string_chars,
+                max_items=max_items,
+            )
+            for item in bounded_items
+        ]
+        if max_items is not None and len(items) > max_items:
             sanitized.append("[TRUNCATED]")
         return sanitized
-    return _sanitize(str(value), depth=depth + 1, max_depth=max_depth)
+    return _sanitize(
+        str(value),
+        depth=depth + 1,
+        max_depth=max_depth,
+        max_string_chars=max_string_chars,
+        max_items=max_items,
+    )
 
 
 def _content_summary(value: object) -> object:
@@ -196,12 +239,22 @@ class ObservabilityHealth:
 class Observation:
     """Exception-safe facade over a Langfuse observation."""
 
-    def __init__(self, service: ObservabilityService, raw: Any | None, trace_id: str) -> None:
+    def __init__(
+        self,
+        service: ObservabilityService,
+        raw: Any | None,
+        trace_id: str,
+        *,
+        capture_content: bool | None = None,
+        unbounded_content: bool = False,
+    ) -> None:
         self._service = service
         self._raw = raw
         self._has_status_message = False
         self.trace_id = trace_id
         self.id = str(getattr(raw, "id", "")) or None
+        self._capture_content = capture_content
+        self._unbounded_content = unbounded_content
 
     @property
     def has_status_message(self) -> bool:
@@ -222,7 +275,11 @@ class Observation:
             return
         payload: dict[str, object] = {}
         if output is not None:
-            payload["output"] = self._service.prepare_content(output)
+            payload["output"] = self._service.prepare_content(
+                output,
+                capture_content=self._capture_content,
+                unbounded=self._unbounded_content,
+            )
         if metadata is not None:
             payload["metadata"] = sanitize_payload(metadata)
         if level is not None:
@@ -293,13 +350,32 @@ class ObservabilityService:
             except Exception as exc:
                 self._record_failure("client_initialization", exc)
 
-    def prepare_content(self, value: object) -> object:
-        if self.settings.langfuse_capture_content:
-            return sanitize_payload(value)
+    def prepare_content(
+        self,
+        value: object,
+        *,
+        capture_content: bool | None = None,
+        unbounded: bool = False,
+    ) -> object:
+        should_capture = (
+            self.settings.langfuse_capture_content if capture_content is None else capture_content
+        )
+        if should_capture:
+            return sanitize_payload(
+                value,
+                max_depth=50 if unbounded else 5,
+                max_string_chars=None if unbounded else 2048,
+                max_items=None if unbounded else 100,
+            )
         return _content_summary(value)
 
     def _mask(self, *, data: Any, **_: Any) -> Any:
-        return sanitize_payload(data)
+        return sanitize_payload(
+            data,
+            max_depth=50,
+            max_string_chars=None,
+            max_items=None,
+        )
 
     @contextmanager
     def observe(
@@ -313,12 +389,20 @@ class ObservabilityService:
         version: str | None = None,
         model: str | None = None,
         model_parameters: Mapping[str, str | int | float | bool | list[str] | None] | None = None,
+        capture_content: bool | None = None,
+        unbounded_content: bool = False,
     ) -> Iterator[Observation]:
         resolved_trace_id = _normalize_trace_id(
             trace_id or _current_observation_trace_id.get() or current_trace_id() or name
         )
         if self._client is None:
-            yield Observation(self, None, resolved_trace_id)
+            yield Observation(
+                self,
+                None,
+                resolved_trace_id,
+                capture_content=capture_content,
+                unbounded_content=unbounded_content,
+            )
             return
         raw: Any | None = None
         observation_token: Token[str | None] | None = None
@@ -332,7 +416,11 @@ class ObservabilityService:
                 trace_context=trace_context,
                 name=name,
                 as_type=as_type,
-                input=self.prepare_content(input),
+                input=self.prepare_content(
+                    input,
+                    capture_content=capture_content,
+                    unbounded=unbounded_content,
+                ),
                 metadata=sanitize_payload(metadata or {}),
                 version=version,
                 model=model,
@@ -342,10 +430,22 @@ class ObservabilityService:
                 self._last_trace_at = datetime.now(UTC)
         except Exception as exc:
             self._record_failure("span_start", exc)
-            yield Observation(self, None, resolved_trace_id)
+            yield Observation(
+                self,
+                None,
+                resolved_trace_id,
+                capture_content=capture_content,
+                unbounded_content=unbounded_content,
+            )
             return
 
-        observation = Observation(self, raw, resolved_trace_id)
+        observation = Observation(
+            self,
+            raw,
+            resolved_trace_id,
+            capture_content=capture_content,
+            unbounded_content=unbounded_content,
+        )
         observation_trace_token = _current_observation_trace_id.set(resolved_trace_id)
         if observation.id:
             observation_token = _current_observation_id.set(observation.id)
@@ -498,6 +598,8 @@ def observe(
     version: str | None = None,
     model: str | None = None,
     model_parameters: Mapping[str, str | int | float | bool | list[str] | None] | None = None,
+    capture_content: bool | None = None,
+    unbounded_content: bool = False,
 ) -> Iterator[Observation]:
     with get_observability_service().observe(
         name,
@@ -508,5 +610,7 @@ def observe(
         version=version,
         model=model,
         model_parameters=model_parameters,
+        capture_content=capture_content,
+        unbounded_content=unbounded_content,
     ) as observation:
         yield observation

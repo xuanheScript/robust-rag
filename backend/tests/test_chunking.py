@@ -286,13 +286,13 @@ def test_sectioned_key_value_table_chunks_inherit_entity_anchor() -> None:
         quality_summary={},
     )
 
-    assert result.parents[0].attributes["table_profile"]["kind"] == (
-        "sectioned_key_value"
-    )
+    assert result.parents[0].attributes["table_profile"]["kind"] == ("sectioned_key_value")
     assert any("岗位职责" in child.content for child in result.children)
     assert any("任职资格" in child.content for child in result.children)
     assert all("会计岗" in child.content for child in result.children)
     assert all("财务部" in child.content for child in result.children)
+    assert all("岗位名称" in child.attributes["retrieval_keywords"] for child in result.children)
+    assert all("岗位名称" in child.retrieval_text for child in result.children)
 
 
 def build_chunking_service(

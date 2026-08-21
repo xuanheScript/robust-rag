@@ -177,7 +177,7 @@ class Settings(BaseSettings):
     dingo_llm_max_chars: int = Field(default=30000, ge=1000, validation_alias="DINGO_LLM_MAX_CHARS")
 
     chunking_config_version: str = Field(
-        default="stage5-parent-child-v2", validation_alias="CHUNKING_CONFIG_VERSION"
+        default="stage5-parent-child-v3", validation_alias="CHUNKING_CONFIG_VERSION"
     )
     chunking_parent_target_tokens: int = Field(
         default=1800, ge=1, validation_alias="CHUNKING_PARENT_TARGET_TOKENS"
@@ -206,7 +206,7 @@ class Settings(BaseSettings):
         default=1024, ge=1, validation_alias="VOYAGE_EMBEDDING_DIMENSION"
     )
     voyage_embedding_config_version: str = Field(
-        default="stage6-chunk-content-v2", validation_alias="VOYAGE_EMBEDDING_CONFIG_VERSION"
+        default="stage6-scoped-chunk-v3", validation_alias="VOYAGE_EMBEDDING_CONFIG_VERSION"
     )
     voyage_embedding_batch_items: int = Field(
         default=128, ge=1, validation_alias="VOYAGE_EMBEDDING_BATCH_ITEMS"
@@ -363,7 +363,7 @@ class Settings(BaseSettings):
     )
 
     retrieval_config_version: str = Field(
-        default="stage7-hierarchical-v2", validation_alias="RETRIEVAL_CONFIG_VERSION"
+        default="stage7-hierarchical-v4", validation_alias="RETRIEVAL_CONFIG_VERSION"
     )
     retrieval_query_max_chars: int = Field(
         default=2000, ge=1, validation_alias="RETRIEVAL_QUERY_MAX_CHARS"
@@ -390,17 +390,38 @@ class Settings(BaseSettings):
     retrieval_document_weight: float = Field(
         default=0.5, ge=0, validation_alias="RETRIEVAL_DOCUMENT_WEIGHT"
     )
-    retrieval_max_children_per_document: int = Field(
-        default=8, ge=1, validation_alias="RETRIEVAL_MAX_CHILDREN_PER_DOCUMENT"
+    retrieval_sibling_duplicate_similarity_threshold: float = Field(
+        default=0.96,
+        ge=0,
+        le=1,
+        validation_alias="RETRIEVAL_SIBLING_DUPLICATE_SIMILARITY_THRESHOLD",
     )
-    retrieval_max_children_per_parent: int = Field(
-        default=3, ge=1, validation_alias="RETRIEVAL_MAX_CHILDREN_PER_PARENT"
+    retrieval_min_rrf_score_ratio: float = Field(
+        default=0.25, ge=0, le=1, validation_alias="RETRIEVAL_MIN_RRF_SCORE_RATIO"
     )
     retrieval_rerank_candidate_top_k: int = Field(
         default=40, ge=1, le=1000, validation_alias="RETRIEVAL_RERANK_CANDIDATE_TOP_K"
     )
     retrieval_final_child_top_k: int = Field(
         default=10, ge=1, le=100, validation_alias="RETRIEVAL_FINAL_CHILD_TOP_K"
+    )
+    retrieval_mmr_lambda: float = Field(
+        default=0.85, ge=0, le=1, validation_alias="RETRIEVAL_MMR_LAMBDA"
+    )
+    retrieval_relevance_rerank_weight: float = Field(
+        default=0.55, ge=0, validation_alias="RETRIEVAL_RELEVANCE_RERANK_WEIGHT"
+    )
+    retrieval_relevance_rrf_weight: float = Field(
+        default=0.25, ge=0, validation_alias="RETRIEVAL_RELEVANCE_RRF_WEIGHT"
+    )
+    retrieval_relevance_lexical_weight: float = Field(
+        default=0.1, ge=0, validation_alias="RETRIEVAL_RELEVANCE_LEXICAL_WEIGHT"
+    )
+    retrieval_relevance_scope_weight: float = Field(
+        default=0.1, ge=0, validation_alias="RETRIEVAL_RELEVANCE_SCOPE_WEIGHT"
+    )
+    retrieval_context_candidate_top_k: int = Field(
+        default=24, ge=1, le=1000, validation_alias="RETRIEVAL_CONTEXT_CANDIDATE_TOP_K"
     )
     retrieval_rerank_fallback_enabled: bool = Field(
         default=True, validation_alias="RETRIEVAL_RERANK_FALLBACK_ENABLED"
@@ -413,6 +434,12 @@ class Settings(BaseSettings):
     )
     retrieval_context_neighbor_limit: int = Field(
         default=1, ge=0, le=2, validation_alias="RETRIEVAL_CONTEXT_NEIGHBOR_LIMIT"
+    )
+    retrieval_parent_merge_min_children: int = Field(
+        default=2, ge=2, validation_alias="RETRIEVAL_PARENT_MERGE_MIN_CHILDREN"
+    )
+    retrieval_parent_merge_ratio: float = Field(
+        default=0.5, gt=0, le=1, validation_alias="RETRIEVAL_PARENT_MERGE_RATIO"
     )
 
     llm_base_url: str = Field(default="https://api.openai.com/v1", validation_alias="LLM_BASE_URL")
@@ -437,7 +464,7 @@ class Settings(BaseSettings):
         default=None, ge=0, validation_alias="LLM_PRICE_PER_MILLION_OUTPUT_TOKENS"
     )
     generation_prompt_version: str = Field(
-        default="stage8-grounded-rag-v2-zh", validation_alias="GENERATION_PROMPT_VERSION"
+        default="stage8-grounded-rag-v3-zh", validation_alias="GENERATION_PROMPT_VERSION"
     )
     query_rewrite_prompt_version: str = Field(
         default="stage8-retrieval-query-plan-v1-zh",
@@ -455,10 +482,13 @@ class Settings(BaseSettings):
 
     agentic_rag_enabled: bool = Field(default=False, validation_alias="AGENTIC_RAG_ENABLED")
     agent_graph_version: str = Field(
-        default="stage13-langgraph-agentic-rag-v2", validation_alias="AGENT_GRAPH_VERSION"
+        default="stage13-langgraph-agentic-rag-v3", validation_alias="AGENT_GRAPH_VERSION"
     )
     agent_prompt_version: str = Field(
-        default="stage13-agent-decision-v3-zh", validation_alias="AGENT_PROMPT_VERSION"
+        default="stage13-agent-query-plan-v5-zh", validation_alias="AGENT_PROMPT_VERSION"
+    )
+    agent_history_messages: int = Field(
+        default=6, ge=0, le=20, validation_alias="AGENT_HISTORY_MESSAGES"
     )
     agent_max_output_tokens: int = Field(
         default=500, ge=1, le=4000, validation_alias="AGENT_MAX_OUTPUT_TOKENS"

@@ -32,6 +32,8 @@ AI SDK useChat
 ## Grounded RAG、拒答与引用
 
 - 文档上下文放在明确的来源边界内，Prompt 要求把来源视为不可信数据，不执行文档中的指令。
+- Grounded Generation 同时接收用户原始问题、`semantic_query` 和 `answer_facets`；后两者是回答目标而不是事实来源。
+- 集合问题必须从具体正文、表格或附件中列出实际项目，不得用部门、类别、流程或标题替代具体项目。
 - 回答只能使用提供的企业知识库上下文，并要求主要事实使用 `[S1]` 形式引用。
 - 没有最终上下文时不调用模型，按问题语言返回确定性拒答。
 - 来源 Data Part 包含文档名、标题路径、Node ID、页码/幻灯片/Sheet/Cell/行号和截断原文。
@@ -107,7 +109,7 @@ LLM_API_STYLE=responses
 LLM_REASONING_EFFORT=medium
 LLM_TIMEOUT_SECONDS=120
 LLM_MAX_RETRIES=1
-GENERATION_PROMPT_VERSION=stage8-grounded-rag-v2-zh
+GENERATION_PROMPT_VERSION=stage8-grounded-rag-v3-zh
 QUERY_REWRITE_PROMPT_VERSION=stage8-retrieval-query-plan-v1-zh
 QUERY_REWRITE_HISTORY_MESSAGES=6
 QUERY_REWRITE_MAX_OUTPUT_TOKENS=500

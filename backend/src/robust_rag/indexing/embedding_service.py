@@ -98,7 +98,7 @@ class EmbeddingService:
             "rate_limit_fallback_seconds": self.rate_limit_fallback_seconds,
             "price_per_million_tokens": self.price_per_million_tokens,
             "input_type": "document",
-            "embedding_text_contract": "chunk_heading_content_v2",
+            "embedding_text_contract": "scoped_chunk_v3",
         }
 
     def execute(self, job_id: uuid.UUID) -> str:
@@ -593,18 +593,30 @@ class EmbeddingService:
 
 
 def chunk_embedding_text(node: RetrievalNode) -> str:
-    """Build the Chunk-only semantic representation.
+    """Build a scope-aware semantic representation for precise child retrieval."""
 
-    Document title and source metadata deliberately stay out of this text. They
-    are document/context signals and must not make sibling chunks look equally
-    relevant to a query that happens to match the document title.
-    """
-
+    hierarchy = list(node.heading_path)
+    if node.title and hierarchy and _same_scope_value(node.title, hierarchy[0]):
+        hierarchy = hierarchy[1:]
     values = [
-        f"Heading: {' > '.join(node.heading_path)}" if node.heading_path else "",
+        f"Source document: {node.title}" if node.title else "",
+        f"Hierarchy: {' > '.join(hierarchy)}" if hierarchy else "",
+        _keyword_line(node.attributes_json),
         node.content.strip(),
     ]
     return "\n".join(value for value in values if value)
+
+
+def _same_scope_value(left: str, right: str) -> bool:
+    return "".join(left.casefold().split()) == "".join(right.casefold().split())
+
+
+def _keyword_line(attributes: dict[str, object]) -> str:
+    keywords = attributes.get("retrieval_keywords")
+    if not isinstance(keywords, list):
+        return ""
+    values = [str(value).strip() for value in keywords if str(value).strip()]
+    return "Retrieval keywords: " + ", ".join(values) if values else ""
 
 
 class UnavailableEmbeddingAdapter:
