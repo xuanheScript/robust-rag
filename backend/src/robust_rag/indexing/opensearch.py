@@ -33,6 +33,14 @@ class SearchHit:
     node_id: str
     score: float
     rank: int
+    document_id: str | None = None
+
+
+@dataclass(frozen=True)
+class DocumentSearchHit:
+    document_id: str
+    score: float
+    rank: int
 
 
 class OpenSearchAdapterError(Exception):
@@ -100,8 +108,18 @@ class OpenSearchAdapter(Protocol):
 
     def search_bm25_hits(self, alias: str, query: str, size: int = 10) -> list[SearchHit]: ...
 
+    def search_document_bm25_hits(
+        self, alias: str, query: str, size: int = 10
+    ) -> list[DocumentSearchHit]: ...
+
+    def search_chunk_bm25_hits(self, alias: str, query: str, size: int = 10) -> list[SearchHit]: ...
+
     def search_dense_hits(
-        self, alias: str, vector: list[float], size: int = 10
+        self,
+        alias: str,
+        vector: list[float],
+        size: int = 10,
+        embedding_config_version: str | None = None,
     ) -> list[SearchHit]: ...
 
 
@@ -156,7 +174,12 @@ class HttpOpenSearchAdapter:
             self._request(
                 "PUT",
                 f"/{chunks_index}/_mapping",
-                json_body={"properties": {"chunking_run_id": {"type": "keyword"}}},
+                json_body={
+                    "properties": {
+                        "chunking_run_id": {"type": "keyword"},
+                        "embedding_config_version": {"type": "keyword"},
+                    }
+                },
             )
 
     def switch_aliases(
@@ -313,6 +336,36 @@ class HttpOpenSearchAdapter:
         return [hit.node_id for hit in self.search_bm25_hits(alias, query, size)]
 
     def search_bm25_hits(self, alias: str, query: str, size: int = 10) -> list[SearchHit]:
+        """Backward-compatible alias for content-only Chunk BM25."""
+
+        return self.search_chunk_bm25_hits(alias, query, size)
+
+    def search_document_bm25_hits(
+        self, alias: str, query: str, size: int = 10
+    ) -> list[DocumentSearchHit]:
+        result = self._request(
+            "POST",
+            f"/{alias}/_search",
+            json_body={
+                "size": size,
+                "query": {
+                    "multi_match": {
+                        "query": query,
+                        "fields": [
+                            "title^4",
+                            "original_filename^2",
+                            "title.icu^4",
+                            "original_filename.icu^2",
+                            "title.standard^3",
+                            "original_filename.standard",
+                        ],
+                    }
+                },
+            },
+        )
+        return _document_search_hits(result)
+
+    def search_chunk_bm25_hits(self, alias: str, query: str, size: int = 10) -> list[SearchHit]:
         result = self._request(
             "POST",
             f"/{alias}/_search",
@@ -326,14 +379,11 @@ class HttpOpenSearchAdapter:
                                 "multi_match": {
                                     "query": query,
                                     "fields": [
-                                        "title^4",
                                         "heading_path^3",
-                                        "retrieval_text^2",
-                                        "content",
-                                        "title.icu^4",
-                                        "retrieval_text.icu^2",
+                                        "content^2",
+                                        "heading_path.icu^3",
                                         "content.icu",
-                                        "title.standard^3",
+                                        "heading_path.standard^2",
                                         "content.standard",
                                     ],
                                 }
@@ -348,7 +398,18 @@ class HttpOpenSearchAdapter:
     def search_dense(self, alias: str, vector: list[float], size: int = 10) -> list[str]:
         return [hit.node_id for hit in self.search_dense_hits(alias, vector, size)]
 
-    def search_dense_hits(self, alias: str, vector: list[float], size: int = 10) -> list[SearchHit]:
+    def search_dense_hits(
+        self,
+        alias: str,
+        vector: list[float],
+        size: int = 10,
+        embedding_config_version: str | None = None,
+    ) -> list[SearchHit]:
+        filters: list[dict[str, object]] = [{"term": {"node_level": "child"}}]
+        if embedding_config_version:
+            filters.append(
+                {"term": {"embedding_config_version": embedding_config_version}}
+            )
         result = self._request(
             "POST",
             f"/{alias}/_search",
@@ -356,7 +417,7 @@ class HttpOpenSearchAdapter:
                 "size": size,
                 "query": {
                     "bool": {
-                        "filter": [{"term": {"node_level": "child"}}],
+                        "filter": filters,
                         "must": [{"knn": {"embedding": {"vector": vector, "k": size}}}],
                     }
                 },
@@ -529,31 +590,79 @@ class MemoryOpenSearchAdapter:
         return [hit.node_id for hit in self.search_bm25_hits(alias, query, size)]
 
     def search_bm25_hits(self, alias: str, query: str, size: int = 10) -> list[SearchHit]:
+        return self.search_chunk_bm25_hits(alias, query, size)
+
+    def search_document_bm25_hits(
+        self, alias: str, query: str, size: int = 10
+    ) -> list[DocumentSearchHit]:
         terms = [term for term in query.lower().split() if term]
         scored: list[tuple[int, str]] = []
+        for value in self.visible(alias):
+            document_id = value.get("document_id")
+            if not document_id:
+                continue
+            haystack = " ".join(
+                str(value.get(field) or "") for field in ("title", "original_filename")
+            ).lower()
+            score = sum(haystack.count(term) for term in terms)
+            if score:
+                scored.append((score, str(document_id)))
+        return [
+            DocumentSearchHit(document_id=identifier, score=float(score), rank=rank)
+            for rank, (score, identifier) in enumerate(
+                sorted(scored, key=lambda value: (-value[0], value[1]))[:size], start=1
+            )
+        ]
+
+    def search_chunk_bm25_hits(self, alias: str, query: str, size: int = 10) -> list[SearchHit]:
+        terms = [term for term in query.lower().split() if term]
+        scored: list[tuple[int, str, str | None]] = []
         for value in self.visible(alias):
             if value.get("node_level") != "child":
                 continue
             haystack = " ".join(
-                str(value.get(field) or "")
-                for field in ("title", "heading_path", "content", "retrieval_text")
+                str(value.get(field) or "") for field in ("heading_path", "content")
             ).lower()
             score = sum(haystack.count(term) for term in terms)
             if score:
-                scored.append((score, str(value.get("node_id"))))
+                scored.append(
+                    (
+                        score,
+                        str(value.get("node_id")),
+                        str(value["document_id"]) if value.get("document_id") else None,
+                    )
+                )
         return [
-            SearchHit(node_id=identifier, score=float(score), rank=rank)
-            for rank, (score, identifier) in enumerate(sorted(scored, reverse=True)[:size], start=1)
+            SearchHit(
+                node_id=identifier,
+                score=float(score),
+                rank=rank,
+                document_id=document_id,
+            )
+            for rank, (score, identifier, document_id) in enumerate(
+                sorted(scored, key=lambda value: (-value[0], value[1]))[:size], start=1
+            )
         ]
 
     def search_dense(self, alias: str, vector: list[float], size: int = 10) -> list[str]:
         return [hit.node_id for hit in self.search_dense_hits(alias, vector, size)]
 
-    def search_dense_hits(self, alias: str, vector: list[float], size: int = 10) -> list[SearchHit]:
-        scored: list[tuple[float, str]] = []
+    def search_dense_hits(
+        self,
+        alias: str,
+        vector: list[float],
+        size: int = 10,
+        embedding_config_version: str | None = None,
+    ) -> list[SearchHit]:
+        scored: list[tuple[float, str, str | None]] = []
         query_norm = math.sqrt(sum(value * value for value in vector))
         for value in self.visible(alias):
             if value.get("node_level") != "child":
+                continue
+            if (
+                embedding_config_version
+                and value.get("embedding_config_version") != embedding_config_version
+            ):
                 continue
             candidate = value.get("embedding")
             if not isinstance(candidate, list) or len(candidate) != len(vector):
@@ -567,10 +676,23 @@ class MemoryOpenSearchAdapter:
                 if denominator
                 else 0.0
             )
-            scored.append((score, str(value.get("node_id"))))
+            scored.append(
+                (
+                    score,
+                    str(value.get("node_id")),
+                    str(value["document_id"]) if value.get("document_id") else None,
+                )
+            )
         return [
-            SearchHit(node_id=identifier, score=score, rank=rank)
-            for rank, (score, identifier) in enumerate(sorted(scored, reverse=True)[:size], start=1)
+            SearchHit(
+                node_id=identifier,
+                score=score,
+                rank=rank,
+                document_id=document_id,
+            )
+            for rank, (score, identifier, document_id) in enumerate(
+                sorted(scored, key=lambda value: (-value[0], value[1]))[:size], start=1
+            )
         ]
 
 
@@ -603,6 +725,33 @@ def _search_hits(result: object) -> list[SearchHit]:
             hits.append(
                 SearchHit(
                     node_id=str(source["node_id"]),
+                    score=float(score) if isinstance(score, (int, float)) else 0.0,
+                    rank=rank,
+                    document_id=(str(source["document_id"]) if source.get("document_id") else None),
+                )
+            )
+    return hits
+
+
+def _document_search_hits(result: object) -> list[DocumentSearchHit]:
+    if not isinstance(result, dict):
+        return []
+    hits_value = result.get("hits")
+    if not isinstance(hits_value, dict):
+        return []
+    items = hits_value.get("hits")
+    if not isinstance(items, list):
+        return []
+    hits: list[DocumentSearchHit] = []
+    for rank, item in enumerate(items, start=1):
+        if not isinstance(item, dict):
+            continue
+        source = item.get("_source")
+        if isinstance(source, dict) and source.get("document_id"):
+            score = item.get("_score")
+            hits.append(
+                DocumentSearchHit(
+                    document_id=str(source["document_id"]),
                     score=float(score) if isinstance(score, (int, float)) else 0.0,
                     rank=rank,
                 )
@@ -670,6 +819,7 @@ def _chunk_index_definition(dimension: int) -> dict[str, object]:
         "quality_score": {"type": "float"},
         "quality_flags": keyword,
         "embedding_model": keyword,
+        "embedding_config_version": keyword,
         "embedding": {
             "type": "knn_vector",
             "dimension": dimension,

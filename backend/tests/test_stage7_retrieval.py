@@ -15,7 +15,13 @@ from robust_rag.core.settings import Settings
 from robust_rag.db.enums import RetrievalMode, RetrievalTraceStatus
 from robust_rag.db.models import RetrievalTrace
 from robust_rag.indexing.embedding import EmbeddingAdapterError, EmbeddingResponse
-from robust_rag.indexing.opensearch import MemoryOpenSearchAdapter, OpenSearchAdapter, SearchHit
+from robust_rag.indexing.opensearch import (
+    DocumentSearchHit,
+    HttpOpenSearchAdapter,
+    MemoryOpenSearchAdapter,
+    OpenSearchAdapter,
+    SearchHit,
+)
 from robust_rag.indexing.rate_limit import VoyageRateLimiter
 from robust_rag.indexing.service import IndexingService
 from robust_rag.retrieval.context import assemble_context
@@ -107,24 +113,41 @@ class ParallelProbeSearchAdapter:
         self.embedding_started = embedding_started
         self.observed_parallel_start = False
 
-    def search_bm25_hits(self, alias: str, query: str, size: int = 10) -> list[SearchHit]:
+    def search_document_bm25_hits(
+        self, alias: str, query: str, size: int = 10
+    ) -> list[DocumentSearchHit]:
+        return self.delegate.search_document_bm25_hits(alias, query, size)
+
+    def search_chunk_bm25_hits(
+        self, alias: str, query: str, size: int = 10
+    ) -> list[SearchHit]:
         self.observed_parallel_start = self.embedding_started.wait(timeout=1)
         if not self.observed_parallel_start:
             raise AssertionError("dense pipeline did not start while BM25 was running")
-        return self.delegate.search_bm25_hits(alias, query, size)
+        return self.delegate.search_chunk_bm25_hits(alias, query, size)
 
-    def search_dense_hits(self, alias: str, vector: list[float], size: int = 10) -> list[SearchHit]:
-        return self.delegate.search_dense_hits(alias, vector, size)
+    def search_dense_hits(
+        self,
+        alias: str,
+        vector: list[float],
+        size: int = 10,
+        embedding_config_version: str | None = None,
+    ) -> list[SearchHit]:
+        return self.delegate.search_dense_hits(
+            alias, vector, size, embedding_config_version
+        )
 
 
 def _retrieval_settings() -> Settings:
     return _stage6_settings().model_copy(
         update={
             "retrieval_bm25_top_k": 20,
+            "retrieval_document_bm25_top_k": 10,
             "retrieval_dense_top_k": 20,
             "retrieval_rrf_top_k": 20,
             "retrieval_rerank_candidate_top_k": 10,
             "retrieval_final_child_top_k": 5,
+            "retrieval_document_weight": 0.5,
             "retrieval_context_max_tokens": 1000,
             "retrieval_context_parent_max_tokens": 500,
             "voyage_rerank_max_retries": 0,
@@ -256,6 +279,132 @@ def test_query_normalization_rrf_and_diversity_are_deterministic() -> None:
     assert plan.lexical_search_queries("住众公司 竞聘 岗位")[0] == (
         "住众公司 竞聘 岗位"
     )
+
+
+def test_document_prior_is_separate_and_does_not_flatten_sibling_chunk_ranks() -> None:
+    document_id = str(uuid.uuid4())
+    fused = reciprocal_rank_fusion(
+        [
+            SearchHit("relevant", 9, 1, document_id),
+            SearchHit("irrelevant", 5, 2, document_id),
+        ],
+        [],
+        rank_constant=60,
+        bm25_weight=1,
+        dense_weight=1,
+        document_hits=[DocumentSearchHit(document_id, 12, 1)],
+        document_weight=0.5,
+        limit=10,
+    )
+
+    assert [value.node_id for value in fused] == ["relevant", "irrelevant"]
+    assert fused[0].document_rrf_score == fused[1].document_rrf_score
+    assert fused[0].chunk_rrf_score > fused[1].chunk_rrf_score
+    assert fused[0].rrf_score == pytest.approx(
+        fused[0].chunk_rrf_score + fused[0].document_rrf_score
+    )
+
+
+def test_memory_search_keeps_document_title_out_of_chunk_bm25() -> None:
+    adapter = MemoryOpenSearchAdapter()
+    adapter.ensure_indexes("documents", "chunks", 2)
+    adapter.switch_aliases(
+        documents_index="documents",
+        chunks_index="chunks",
+        documents_read_alias="documents-read",
+        chunks_read_alias="chunks-read",
+        chunks_write_alias="chunks-write",
+    )
+    document_id = str(uuid.uuid4())
+    adapter.bulk_upsert(
+        "documents",
+        [
+            {
+                "_id": document_id,
+                "document_id": document_id,
+                "title": "Accounting recruitment notice",
+                "original_filename": "notice.pdf",
+                "is_active": True,
+            }
+        ],
+    )
+    adapter.bulk_upsert(
+        "chunks",
+        [
+            {
+                "_id": "accounting",
+                "node_id": "accounting",
+                "document_id": document_id,
+                "node_level": "child",
+                "title": "Accounting recruitment notice",
+                "heading_path": ["Open positions"],
+                "content": "Accounting role responsibilities and qualifications",
+                "retrieval_text": "Accounting recruitment notice\nAccounting role",
+                "is_active": True,
+            },
+            {
+                "_id": "cafeteria",
+                "node_id": "cafeteria",
+                "document_id": document_id,
+                "node_level": "child",
+                "title": "Accounting recruitment notice",
+                "heading_path": ["Benefits"],
+                "content": "Cafeteria and commuting benefits",
+                "retrieval_text": "Accounting recruitment notice\nCafeteria benefits",
+                "is_active": True,
+            },
+        ],
+    )
+
+    assert adapter.search_document_bm25_hits("documents-read", "Accounting")
+    chunk_hits = adapter.search_chunk_bm25_hits("chunks-read", "Accounting")
+    assert [hit.node_id for hit in chunk_hits] == ["accounting"]
+    assert adapter.search_chunk_bm25_hits("chunks-read", "recruitment notice") == []
+
+
+def test_http_search_uses_disjoint_document_and_chunk_fields() -> None:
+    requests: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(200, json={"hits": {"hits": []}})
+
+    client = httpx.Client(
+        transport=httpx.MockTransport(handler), base_url="http://opensearch.test"
+    )
+    adapter = HttpOpenSearchAdapter(
+        base_url="http://opensearch.test",
+        username=None,
+        password=None,
+        verify=False,
+        timeout_seconds=1,
+        client=client,
+    )
+
+    adapter.search_document_bm25_hits("documents-read", "Accounting")
+    adapter.search_chunk_bm25_hits("chunks-read", "Accounting")
+
+    document_query = cast(dict[str, object], requests[0]["query"])
+    document_multi = cast(dict[str, object], document_query["multi_match"])
+    document_fields = cast(list[str], document_multi["fields"])
+    chunk_bool = cast(dict[str, object], cast(dict[str, object], requests[1]["query"])["bool"])
+    chunk_must = cast(list[dict[str, object]], chunk_bool["must"])
+    chunk_multi = cast(dict[str, object], chunk_must[0]["multi_match"])
+    chunk_fields = cast(list[str], chunk_multi["fields"])
+    assert any(field.startswith("title") for field in document_fields)
+    assert all(not field.startswith("title") for field in chunk_fields)
+    assert all(not field.startswith("retrieval_text") for field in chunk_fields)
+    assert any(field.startswith("content") for field in chunk_fields)
+    client.close()
+
+
+def test_rerank_text_contains_chunk_evidence_but_not_document_title() -> None:
+    candidate = _candidate(uuid.uuid4(), uuid.uuid4(), uuid.uuid4())
+    text = candidate.rerank_text()
+
+    assert "Heading: Section" in text
+    assert "content" in text
+    assert "Title" not in text
 
 
 def test_query_plan_expansion_adds_recall_without_dropping_original(
@@ -415,6 +564,7 @@ def test_all_retrieval_modes_and_debug_trace_are_independently_runnable(
     client: TestClient,
 ) -> None:
     _, _, search_adapter = _ready_search_fixture(session_factory, storage)
+    document_title = str(search_adapter.visible("rag-documents-read")[0]["title"])
     embedding = FakeQueryEmbeddingAdapter()
     reranker = FakeRerankAdapter()
     service = _retrieval_service(
@@ -434,6 +584,7 @@ def test_all_retrieval_modes_and_debug_trace_are_independently_runnable(
     assert responses[RetrievalMode.HYBRID].children[0].rrf_score > 0
     assert responses[RetrievalMode.HYBRID_RERANK].children[0].rerank_score is not None
     assert responses[RetrievalMode.BM25].usage["bm25_retries"] == 0
+    assert responses[RetrievalMode.BM25].usage["document_bm25_retries"] == 0
     assert responses[RetrievalMode.DENSE].usage["dense_retries"] == 0
     assert len(embedding.calls) == 3
     assert all(input_type == "query" for _, input_type in embedding.calls)
@@ -450,7 +601,7 @@ def test_all_retrieval_modes_and_debug_trace_are_independently_runnable(
     api_response = client.post(
         "/api/v1/retrieval/search",
         json={
-            "query": "  Policy  ",
+            "query": f"  {document_title}  ",
             "mode": "hybrid_rerank",
             "top_k": 100,
             "context_budget_tokens": 100000,
@@ -463,6 +614,7 @@ def test_all_retrieval_modes_and_debug_trace_are_independently_runnable(
     trace_id = api_response.json()["trace_id"]
     trace_response = client.get(f"/api/v1/retrieval/traces/{trace_id}")
     assert trace_response.status_code == 200
+    assert trace_response.json()["document_candidates_json"]
     assert trace_response.json()["rrf_candidates_json"]
     assert trace_response.json()["context_nodes_json"]
     assert trace_response.json()["config_snapshot"]["request_top_k"] == 100

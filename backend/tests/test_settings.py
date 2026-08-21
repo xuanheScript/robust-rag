@@ -24,6 +24,7 @@ def test_settings_defaults_are_local_only() -> None:
     assert settings.chunking_child_overlap_tokens == 64
     assert settings.voyage_embedding_model == "voyage-4"
     assert settings.voyage_embedding_dimension == 1024
+    assert settings.voyage_embedding_config_version == "stage6-chunk-content-v2"
     assert settings.voyage_embedding_batch_tokens == 8000
     assert settings.voyage_embedding_rate_limit_rpm == 3
     assert settings.voyage_embedding_rate_limit_tpm == 9000
@@ -32,6 +33,8 @@ def test_settings_defaults_are_local_only() -> None:
     assert settings.opensearch_chunks_index == "rag-chunks-v1"
     assert settings.opensearch_chunks_read_alias == "rag-chunks-read"
     assert settings.retrieval_rrf_rank_constant == 60
+    assert settings.retrieval_document_bm25_top_k == 50
+    assert settings.retrieval_document_weight == 0.5
     assert settings.retrieval_final_child_top_k == 10
     assert settings.graph_query_timeout_seconds == 3
     assert settings.graph_text_to_cypher_timeout_seconds == 8

@@ -206,7 +206,7 @@ class Settings(BaseSettings):
         default=1024, ge=1, validation_alias="VOYAGE_EMBEDDING_DIMENSION"
     )
     voyage_embedding_config_version: str = Field(
-        default="stage6-voyage-v1", validation_alias="VOYAGE_EMBEDDING_CONFIG_VERSION"
+        default="stage6-chunk-content-v2", validation_alias="VOYAGE_EMBEDDING_CONFIG_VERSION"
     )
     voyage_embedding_batch_items: int = Field(
         default=128, ge=1, validation_alias="VOYAGE_EMBEDDING_BATCH_ITEMS"
@@ -363,13 +363,16 @@ class Settings(BaseSettings):
     )
 
     retrieval_config_version: str = Field(
-        default="stage7-hybrid-v1", validation_alias="RETRIEVAL_CONFIG_VERSION"
+        default="stage7-hierarchical-v2", validation_alias="RETRIEVAL_CONFIG_VERSION"
     )
     retrieval_query_max_chars: int = Field(
         default=2000, ge=1, validation_alias="RETRIEVAL_QUERY_MAX_CHARS"
     )
     retrieval_bm25_top_k: int = Field(
         default=100, ge=1, le=1000, validation_alias="RETRIEVAL_BM25_TOP_K"
+    )
+    retrieval_document_bm25_top_k: int = Field(
+        default=50, ge=1, le=1000, validation_alias="RETRIEVAL_DOCUMENT_BM25_TOP_K"
     )
     retrieval_dense_top_k: int = Field(
         default=100, ge=1, le=1000, validation_alias="RETRIEVAL_DENSE_TOP_K"
@@ -383,6 +386,9 @@ class Settings(BaseSettings):
     retrieval_bm25_weight: float = Field(default=1, gt=0, validation_alias="RETRIEVAL_BM25_WEIGHT")
     retrieval_dense_weight: float = Field(
         default=1, gt=0, validation_alias="RETRIEVAL_DENSE_WEIGHT"
+    )
+    retrieval_document_weight: float = Field(
+        default=0.5, ge=0, validation_alias="RETRIEVAL_DOCUMENT_WEIGHT"
     )
     retrieval_max_children_per_document: int = Field(
         default=8, ge=1, validation_alias="RETRIEVAL_MAX_CHILDREN_PER_DOCUMENT"

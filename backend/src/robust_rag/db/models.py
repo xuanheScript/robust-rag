@@ -1162,6 +1162,7 @@ class RetrievalTrace(Base):
         ForeignKey("graph_query_traces.id", ondelete="SET NULL"), nullable=True, index=True
     )
     graph_fallback_reason: Mapped[str | None] = mapped_column(Text)
+    document_candidates_json: Mapped[list[dict[str, object]]] = mapped_column(JSON, default=list)
     bm25_candidates_json: Mapped[list[dict[str, object]]] = mapped_column(JSON, default=list)
     dense_candidates_json: Mapped[list[dict[str, object]]] = mapped_column(JSON, default=list)
     graph_candidates_json: Mapped[list[dict[str, object]]] = mapped_column(JSON, default=list)

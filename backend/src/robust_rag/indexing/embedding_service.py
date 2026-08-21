@@ -98,6 +98,7 @@ class EmbeddingService:
             "rate_limit_fallback_seconds": self.rate_limit_fallback_seconds,
             "price_per_million_tokens": self.price_per_million_tokens,
             "input_type": "document",
+            "embedding_text_contract": "chunk_heading_content_v2",
         }
 
     def execute(self, job_id: uuid.UUID) -> str:
@@ -223,7 +224,7 @@ class EmbeddingService:
                         (
                             batch.id,
                             resumable_ids,
-                            [by_id[node_id].retrieval_text for node_id in resumable_ids],
+                            [chunk_embedding_text(by_id[node_id]) for node_id in resumable_ids],
                             sum(
                                 self._estimated_tokens(by_id[node_id]) for node_id in resumable_ids
                             ),
@@ -316,7 +317,7 @@ class EmbeddingService:
                     (
                         batch.id,
                         [node.id for node in group],
-                        [node.retrieval_text for node in group],
+                        [chunk_embedding_text(node) for node in group],
                         batch.estimated_tokens,
                     )
                 )
@@ -555,7 +556,8 @@ class EmbeddingService:
 
     @staticmethod
     def _estimated_tokens(node: RetrievalNode) -> int:
-        return max(node.token_count, (len(node.retrieval_text) + 3) // 4, 1)
+        text = chunk_embedding_text(node)
+        return max(node.token_count, (len(text) + 3) // 4, 1)
 
     @staticmethod
     def _error_value(error: EmbeddingAdapterError) -> dict[str, object]:
@@ -588,6 +590,21 @@ class EmbeddingService:
         job.finished_at = now
         job.updated_at = now
         job.document_version.status = VersionStatus.FAILED
+
+
+def chunk_embedding_text(node: RetrievalNode) -> str:
+    """Build the Chunk-only semantic representation.
+
+    Document title and source metadata deliberately stay out of this text. They
+    are document/context signals and must not make sibling chunks look equally
+    relevant to a query that happens to match the document title.
+    """
+
+    values = [
+        f"Heading: {' > '.join(node.heading_path)}" if node.heading_path else "",
+        node.content.strip(),
+    ]
+    return "\n".join(value for value in values if value)
 
 
 class UnavailableEmbeddingAdapter:

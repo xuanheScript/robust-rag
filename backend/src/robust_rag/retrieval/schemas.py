@@ -27,6 +27,9 @@ class Candidate:
     source_locators: list[dict[str, object]]
     attributes: dict[str, object]
     token_count: int
+    document_rank: int | None = None
+    document_score: float | None = None
+    document_rrf_score: float = 0
     bm25_rank: int | None = None
     bm25_score: float | None = None
     dense_rank: int | None = None
@@ -34,6 +37,7 @@ class Candidate:
     graph_rank: int | None = None
     graph_score: float | None = None
     graph_path: list[dict[str, object]] = field(default_factory=list)
+    chunk_rrf_score: float = 0
     rrf_score: float = 0
     rerank_score: float | None = None
     exact_match: bool = False
@@ -46,6 +50,9 @@ class Candidate:
             "document_id": str(self.document_id),
             "document_version_id": str(self.document_version_id),
             "parent_node_id": str(self.parent_node_id) if self.parent_node_id else None,
+            "document_rank": self.document_rank,
+            "document_score": self.document_score,
+            "document_rrf_score": self.document_rrf_score,
             "bm25_rank": self.bm25_rank,
             "bm25_score": self.bm25_score,
             "dense_rank": self.dense_rank,
@@ -53,6 +60,7 @@ class Candidate:
             "graph_rank": self.graph_rank,
             "graph_score": self.graph_score,
             "graph_path": self.graph_path,
+            "chunk_rrf_score": self.chunk_rrf_score,
             "rrf_score": self.rrf_score,
             "rerank_score": self.rerank_score,
             "exact_match": self.exact_match,
@@ -65,7 +73,6 @@ class Candidate:
 
     def rerank_text(self) -> str:
         values = [
-            f"Title: {self.title}" if self.title else "",
             f"Heading: {' > '.join(self.heading_path)}" if self.heading_path else "",
             f"Content types: {', '.join(self.content_types)}" if self.content_types else "",
             self.content,
@@ -106,6 +113,9 @@ class RetrievedChildRead(BaseModel):
     content: str
     content_types: list[str]
     source_locators: list[dict[str, object]]
+    document_rank: int | None
+    document_score: float | None
+    document_rrf_score: float
     bm25_rank: int | None
     bm25_score: float | None
     dense_rank: int | None
@@ -113,6 +123,7 @@ class RetrievedChildRead(BaseModel):
     graph_rank: int | None
     graph_score: float | None
     graph_path: list[dict[str, object]]
+    chunk_rrf_score: float
     rrf_score: float
     rerank_score: float | None
     final_rank: int
@@ -171,6 +182,7 @@ class RetrievalTraceRead(BaseModel):
     rerank_fallback_reason: str | None
     graph_query_trace_id: uuid.UUID | None
     graph_fallback_reason: str | None
+    document_candidates_json: list[dict[str, object]]
     bm25_candidates_json: list[dict[str, object]]
     dense_candidates_json: list[dict[str, object]]
     graph_candidates_json: list[dict[str, object]]

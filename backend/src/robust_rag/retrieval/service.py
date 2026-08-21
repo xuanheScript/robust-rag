@@ -12,7 +12,7 @@ from contextvars import copy_context
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import lru_cache
-from typing import Protocol, cast
+from typing import Protocol, TypeVar, cast
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
@@ -33,6 +33,7 @@ from robust_rag.graph.schemas import GraphQueryResult, GraphSearchHit
 from robust_rag.indexing.embedding import EmbeddingAdapter, EmbeddingAdapterError, EmbeddingResponse
 from robust_rag.indexing.embedding_service import build_embedding_adapter
 from robust_rag.indexing.opensearch import (
+    DocumentSearchHit,
     OpenSearchAdapter,
     OpenSearchAdapterError,
     SearchHit,
@@ -48,6 +49,7 @@ from robust_rag.retrieval.context import assemble_context
 from robust_rag.retrieval.fusion import (
     FusedRank,
     diversify_candidates,
+    fuse_document_hit_lists,
     fuse_query_hit_lists,
     reciprocal_rank_fusion,
 )
@@ -72,6 +74,8 @@ from robust_rag.retrieval.schemas import (
     RetrievedChildRead,
 )
 
+_SearchResultT = TypeVar("_SearchResultT", SearchHit, DocumentSearchHit)
+
 
 class RetrievalError(Exception):
     def __init__(self, code: str, message: str, *, retryable: bool) -> None:
@@ -90,7 +94,11 @@ class GraphRetriever(Protocol):
 @dataclass(frozen=True)
 class Bm25StageResult:
     hits: list[SearchHit]
+    document_hits: list[DocumentSearchHit]
     retries: int
+    document_retries: int
+    document_latency_ms: float
+    chunk_latency_ms: float
     latency_ms: float
 
 
@@ -136,11 +144,13 @@ class RetrievalService:
         return {
             "query_max_chars": self.settings.retrieval_query_max_chars,
             "bm25_top_k": self.settings.retrieval_bm25_top_k,
+            "document_bm25_top_k": self.settings.retrieval_document_bm25_top_k,
             "dense_top_k": self.settings.retrieval_dense_top_k,
             "rrf_top_k": self.settings.retrieval_rrf_top_k,
             "rrf_rank_constant": self.settings.retrieval_rrf_rank_constant,
             "bm25_weight": self.settings.retrieval_bm25_weight,
             "dense_weight": self.settings.retrieval_dense_weight,
+            "document_weight": self.settings.retrieval_document_weight,
             "graph_enabled": self.graph_retriever is not None and self.settings.graph_query_enabled,
             "graph_weight": self.settings.graph_rrf_weight,
             "max_children_per_document": self.settings.retrieval_max_children_per_document,
@@ -152,6 +162,13 @@ class RetrievalService:
             "context_parent_max_tokens": self.settings.retrieval_context_parent_max_tokens,
             "context_neighbor_limit": self.settings.retrieval_context_neighbor_limit,
             "chunks_read_alias": self.settings.opensearch_chunks_read_alias,
+            "documents_read_alias": self.settings.opensearch_documents_read_alias,
+            "chunk_lexical_fields": ["heading_path", "content"],
+            "document_lexical_fields": ["title", "original_filename"],
+            "chunk_dense_text_contract": "chunk_heading_content_v2",
+            "chunk_dense_embedding_config_version": (
+                self.settings.voyage_embedding_config_version
+            ),
         }
 
     def search(
@@ -185,6 +202,7 @@ class RetrievalService:
         )
         latency: dict[str, object] = {}
         usage: dict[str, object] = {}
+        document_hits: list[DocumentSearchHit] = []
         bm25_hits: list[SearchHit] = []
         dense_hits: list[SearchHit] = []
         graph_hits: list[GraphSearchHit] = []
@@ -214,6 +232,7 @@ class RetrievalService:
                     input={
                         "lexical_queries": lexical_queries,
                         "dense_queries": dense_queries,
+                        "document_bm25_top_k": self.settings.retrieval_document_bm25_top_k,
                         "bm25_top_k": self.settings.retrieval_bm25_top_k,
                         "dense_top_k": self.settings.retrieval_dense_top_k,
                     },
@@ -242,6 +261,7 @@ class RetrievalService:
                     )
                     fanout_span.update(
                         output={
+                            "document_hit_count": len(bm25_result.document_hits),
                             "bm25_hit_count": len(bm25_result.hits),
                             "dense_hit_count": len(dense_result.hits),
                         },
@@ -258,9 +278,14 @@ class RetrievalService:
                 dense_result = self._run_dense_queries(dense_queries, trace_id)
 
             if bm25_result is not None:
+                document_hits = bm25_result.document_hits
                 bm25_hits = bm25_result.hits
+                usage["document_bm25_retries"] = bm25_result.document_retries
+                usage["document_bm25_query_count"] = len(lexical_queries)
                 usage["bm25_retries"] = bm25_result.retries
                 usage["bm25_query_count"] = len(lexical_queries)
+                latency["document_bm25"] = bm25_result.document_latency_ms
+                latency["chunk_bm25"] = bm25_result.chunk_latency_ms
                 latency["bm25"] = bm25_result.latency_ms
 
             if dense_result is not None:
@@ -316,6 +341,13 @@ class RetrievalService:
                 latency["graph"] = _elapsed_ms(started)
 
             started = time.perf_counter()
+            node_document_ids = self._node_document_ids(
+                [
+                    *[hit.node_id for hit in bm25_hits],
+                    *[hit.node_id for hit in dense_hits],
+                    *[hit.node_id for hit in graph_hits],
+                ]
+            )
             fused = reciprocal_rank_fusion(
                 bm25_hits,
                 dense_hits,
@@ -324,6 +356,9 @@ class RetrievalService:
                 bm25_weight=self.settings.retrieval_bm25_weight,
                 dense_weight=self.settings.retrieval_dense_weight,
                 graph_weight=self.settings.graph_rrf_weight,
+                document_hits=document_hits,
+                node_document_ids=node_document_ids,
+                document_weight=self.settings.retrieval_document_weight,
                 limit=self.settings.retrieval_rrf_top_k,
             )
             candidates = self._hydrate_candidates(
@@ -436,6 +471,7 @@ class RetrievalService:
                         "dense": dense_queries,
                     }
                 ],
+                "documents": [_document_hit_snapshot(hit) for hit in document_hits],
                 "bm25": [_hit_snapshot(hit) for hit in bm25_hits],
                 "dense": [_hit_snapshot(hit) for hit in dense_hits],
                 "graph": [hit.snapshot() for hit in graph_hits],
@@ -490,32 +526,65 @@ class RetrievalService:
 
     def _run_bm25_stage(self, query: str, trace_id: uuid.UUID) -> Bm25StageResult:
         started = time.perf_counter()
+        document_started = time.perf_counter()
         with observe(
-            "retrieval.bm25",
+            "retrieval.document_bm25",
+            as_type="retriever",
+            input={"query": query, "top_k": self.settings.retrieval_document_bm25_top_k},
+            metadata={"retrieval_trace_id": str(trace_id), "signal_level": "document"},
+        ) as document_span:
+            document_hits, document_retries = self._search_with_retry(
+                lambda: self.search_adapter.search_document_bm25_hits(
+                    self.settings.opensearch_documents_read_alias,
+                    query,
+                    self.settings.retrieval_document_bm25_top_k,
+                )
+            )
+            document_latency_ms = _elapsed_ms(document_started)
+            document_span.update(
+                output={
+                    "hit_count": len(document_hits),
+                    "top_hits": [_document_hit_snapshot(hit) for hit in document_hits[:10]],
+                },
+                metadata={
+                    "retry_count": document_retries,
+                    "latency_ms": document_latency_ms,
+                },
+            )
+
+        chunk_started = time.perf_counter()
+        with observe(
+            "retrieval.chunk_bm25",
             as_type="retriever",
             input={"query": query, "top_k": self.settings.retrieval_bm25_top_k},
-            metadata={"retrieval_trace_id": str(trace_id)},
+            metadata={"retrieval_trace_id": str(trace_id), "signal_level": "chunk"},
         ) as span:
             hits, retries = self._search_with_retry(
-                lambda: self.search_adapter.search_bm25_hits(
+                lambda: self.search_adapter.search_chunk_bm25_hits(
                     self.settings.opensearch_chunks_read_alias,
                     query,
                     self.settings.retrieval_bm25_top_k,
                 )
             )
-            latency_ms = _elapsed_ms(started)
+            chunk_latency_ms = _elapsed_ms(chunk_started)
             span.update(
                 output={
                     "hit_count": len(hits),
                     "top_hits": [_hit_snapshot(hit) for hit in hits[:10]],
                 },
-                metadata={"retry_count": retries, "latency_ms": latency_ms},
+                metadata={"retry_count": retries, "latency_ms": chunk_latency_ms},
             )
-        return Bm25StageResult(hits=hits, retries=retries, latency_ms=latency_ms)
+        return Bm25StageResult(
+            hits=hits,
+            document_hits=document_hits,
+            retries=retries,
+            document_retries=document_retries,
+            document_latency_ms=document_latency_ms,
+            chunk_latency_ms=chunk_latency_ms,
+            latency_ms=_elapsed_ms(started),
+        )
 
-    def _run_bm25_queries(
-        self, queries: list[str], trace_id: uuid.UUID
-    ) -> Bm25StageResult:
+    def _run_bm25_queries(self, queries: list[str], trace_id: uuid.UUID) -> Bm25StageResult:
         started = time.perf_counter()
         results = [self._run_bm25_stage(query, trace_id) for query in queries]
         hits = (
@@ -527,9 +596,22 @@ class RetrievalService:
                 limit=self.settings.retrieval_bm25_top_k,
             )
         )
+        document_hits = (
+            results[0].document_hits
+            if len(results) == 1
+            else fuse_document_hit_lists(
+                [result.document_hits for result in results],
+                rank_constant=self.settings.retrieval_rrf_rank_constant,
+                limit=self.settings.retrieval_document_bm25_top_k,
+            )
+        )
         return Bm25StageResult(
             hits=hits,
+            document_hits=document_hits,
             retries=sum(result.retries for result in results),
+            document_retries=sum(result.document_retries for result in results),
+            document_latency_ms=sum(result.document_latency_ms for result in results),
+            chunk_latency_ms=sum(result.chunk_latency_ms for result in results),
             latency_ms=_elapsed_ms(started),
         )
 
@@ -578,6 +660,7 @@ class RetrievalService:
                         self.settings.opensearch_chunks_read_alias,
                         embedding.vectors[0],
                         self.settings.retrieval_dense_top_k,
+                        self.settings.voyage_embedding_config_version,
                     )
                 )
                 dense_latency_ms = _elapsed_ms(dense_started)
@@ -608,9 +691,7 @@ class RetrievalService:
             latency_ms=pipeline_latency_ms,
         )
 
-    def _run_dense_queries(
-        self, queries: list[str], trace_id: uuid.UUID
-    ) -> DenseStageResult:
+    def _run_dense_queries(self, queries: list[str], trace_id: uuid.UUID) -> DenseStageResult:
         started = time.perf_counter()
         results = [self._run_dense_stage(query, trace_id) for query in queries]
         hits = (
@@ -747,6 +828,9 @@ class RetrievalService:
                     source_locators=node.source_locators_json,
                     attributes=node.attributes_json,
                     token_count=node.token_count,
+                    document_rank=rank.document_rank,
+                    document_score=rank.document_score,
+                    document_rrf_score=rank.document_rrf_score,
                     bm25_rank=rank.bm25_rank,
                     bm25_score=rank.bm25_score,
                     dense_rank=rank.dense_rank,
@@ -754,11 +838,31 @@ class RetrievalService:
                     graph_rank=rank.graph_rank,
                     graph_score=rank.graph_score,
                     graph_path=rank.graph_path,
+                    chunk_rrf_score=rank.chunk_rrf_score,
                     rrf_score=rank.rrf_score,
                     exact_match=any(_is_exact_match(query, node) for query in queries),
                 )
             )
         return candidates
+
+    def _node_document_ids(self, node_ids: list[str]) -> dict[str, str]:
+        parsed: list[uuid.UUID] = []
+        for node_id in dict.fromkeys(node_ids):
+            try:
+                parsed.append(uuid.UUID(node_id))
+            except ValueError:
+                continue
+        if not parsed:
+            return {}
+        with self.session_factory() as db:
+            rows = list(
+                db.execute(
+                    select(RetrievalNode.id, RetrievalNode.document_id).where(
+                        RetrievalNode.id.in_(parsed)
+                    )
+                )
+            )
+        return {str(node_id): str(document_id) for node_id, document_id in rows}
 
     def _load_context_nodes(self, selected: list[Candidate]) -> dict[uuid.UUID, NodeValue]:
         node_ids: set[uuid.UUID] = set()
@@ -841,8 +945,8 @@ class RetrievalService:
         raise AssertionError("retry loop must return or raise")
 
     def _search_with_retry(
-        self, operation: Callable[[], list[SearchHit]]
-    ) -> tuple[list[SearchHit], int]:
+        self, operation: Callable[[], list[_SearchResultT]]
+    ) -> tuple[list[_SearchResultT], int]:
         for retry_count in range(self.settings.opensearch_max_retries + 1):
             try:
                 return operation(), retry_count
@@ -887,6 +991,7 @@ class RetrievalService:
             if trace is None:
                 raise RuntimeError("Retrieval trace disappeared before completion")
             trace.status = status
+            trace.document_candidates_json = stage_values["documents"]
             trace.bm25_candidates_json = stage_values["bm25"]
             trace.dense_candidates_json = stage_values["dense"]
             trace.graph_candidates_json = stage_values["graph"]
@@ -926,6 +1031,9 @@ class RetrievalService:
             content=candidate.content,
             content_types=candidate.content_types,
             source_locators=candidate.source_locators,
+            document_rank=candidate.document_rank,
+            document_score=candidate.document_score,
+            document_rrf_score=candidate.document_rrf_score,
             bm25_rank=candidate.bm25_rank,
             bm25_score=candidate.bm25_score,
             dense_rank=candidate.dense_rank,
@@ -933,6 +1041,7 @@ class RetrievalService:
             graph_rank=candidate.graph_rank,
             graph_score=candidate.graph_score,
             graph_path=candidate.graph_path,
+            chunk_rrf_score=candidate.chunk_rrf_score,
             rrf_score=candidate.rrf_score,
             rerank_score=candidate.rerank_score,
             final_rank=candidate.final_rank or 0,
@@ -969,7 +1078,16 @@ def get_retrieval_service() -> RetrievalService:
 
 
 def _hit_snapshot(hit: SearchHit) -> dict[str, object]:
-    return {"node_id": hit.node_id, "rank": hit.rank, "score": hit.score}
+    return {
+        "node_id": hit.node_id,
+        "document_id": hit.document_id,
+        "rank": hit.rank,
+        "score": hit.score,
+    }
+
+
+def _document_hit_snapshot(hit: DocumentSearchHit) -> dict[str, object]:
+    return {"document_id": hit.document_id, "rank": hit.rank, "score": hit.score}
 
 
 def _elapsed_ms(started: float) -> float:
@@ -978,7 +1096,8 @@ def _elapsed_ms(started: float) -> float:
 
 def _is_exact_match(query: str, node: RetrievalNode) -> bool:
     normalized_query = query.casefold()
-    haystack = f"{node.title or ''}\n{node.retrieval_text}".casefold()
+    heading = " > ".join(node.heading_path)
+    haystack = f"{heading}\n{node.content}".casefold()
     if normalized_query in haystack:
         return True
     identifiers = re.findall(r"(?=\S*[0-9])[\w./-]{3,}", normalized_query)

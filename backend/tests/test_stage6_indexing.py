@@ -27,7 +27,7 @@ from robust_rag.indexing.embedding import (
     EmbeddingResponse,
     VoyageEmbeddingAdapter,
 )
-from robust_rag.indexing.embedding_service import EmbeddingService
+from robust_rag.indexing.embedding_service import EmbeddingService, chunk_embedding_text
 from robust_rag.indexing.gate import RetrievalNodeGateService, _table_header_missing
 from robust_rag.indexing.opensearch import MemoryOpenSearchAdapter
 from robust_rag.indexing.rate_limit import VoyageRateLimiter
@@ -133,6 +133,7 @@ def _stage6_settings() -> Settings:
     return Settings(_env_file=None).model_copy(
         update={
             "voyage_embedding_dimension": 4,
+            "voyage_embedding_config_version": "test-voyage-v1",
             "opensearch_bulk_actions": 2,
             "opensearch_max_retries": 1,
             "opensearch_retry_base_seconds": 0,
@@ -238,6 +239,29 @@ def test_embedding_batches_retry_audit_cost_and_idempotency(
     assert response.json()[0]["batches"]
 
 
+def test_chunk_embedding_text_excludes_document_title_and_source_metadata(
+    session_factory: sessionmaker[Session], storage: LocalFileStorage
+) -> None:
+    _, version_id, job_id = _prepare_chunked_job(session_factory, storage)
+    adapter = FakeEmbeddingAdapter()
+    service = _embedding_service(session_factory, adapter)
+
+    assert service.execute(job_id) == "deferred"
+    with session_factory() as db:
+        nodes = list(
+            db.scalars(select(RetrievalNode).where(RetrievalNode.document_version_id == version_id))
+        )
+
+    submitted = [text for batch in adapter.calls for text in batch]
+    expected = [chunk_embedding_text(node) for node in nodes]
+    assert sorted(submitted) == sorted(expected)
+    assert all(node.content.strip() in chunk_embedding_text(node) for node in nodes)
+    for node in nodes:
+        if node.title and node.title not in node.content:
+            assert node.title not in chunk_embedding_text(node)
+    assert service.config_snapshot["embedding_text_contract"] == "chunk_heading_content_v2"
+
+
 def test_embedding_pauses_before_over_budget_batch_and_resumes_same_run(
     session_factory: sessionmaker[Session], storage: LocalFileStorage
 ) -> None:
@@ -299,6 +323,12 @@ def test_ready_projection_supports_bm25_dense_delete_rebuild_and_alias_switch(
     first_vector = adapter.visible("rag-chunks-read")[0]["embedding"]
     assert isinstance(first_vector, list)
     assert adapter.search_dense("rag-chunks-read", first_vector)
+    assert adapter.search_dense_hits(
+        "rag-chunks-read", first_vector, embedding_config_version="test-voyage-v1"
+    )
+    assert not adapter.search_dense_hits(
+        "rag-chunks-read", first_vector, embedding_config_version="legacy-title-vector-v1"
+    )
     assert service.execute(job_id) == "succeeded"
     assert len(adapter.visible("rag-chunks-read")) == first_call_count
 

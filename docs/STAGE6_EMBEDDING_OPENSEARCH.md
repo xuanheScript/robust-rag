@@ -82,7 +82,7 @@ DELETE /api/v1/documents/{document_id}
 VOYAGE_API_KEY
 VOYAGE_EMBEDDING_MODEL=voyage-4
 VOYAGE_EMBEDDING_DIMENSION=1024
-VOYAGE_EMBEDDING_CONFIG_VERSION=stage6-voyage-v1
+VOYAGE_EMBEDDING_CONFIG_VERSION=stage6-chunk-content-v2
 VOYAGE_EMBEDDING_BATCH_TOKENS=8000
 VOYAGE_EMBEDDING_RATE_LIMIT_ENABLED=true
 VOYAGE_EMBEDDING_RATE_LIMIT_RPM=3
@@ -95,6 +95,8 @@ OPENSEARCH_PASSWORD
 OPENSEARCH_CA_CERT
 OPENSEARCH_INDEX_CONFIG_VERSION=stage6-opensearch-v2
 ```
+
+`stage6-chunk-content-v2` 的 Chunk 向量文本只包含 `heading_path + content`，不再包含文档标题、页码、Sheet 或其他来源元数据。Chunk 投影同时写入 `embedding_config_version`，在线 Dense 检索只使用与当前配置版本一致的向量。升级该契约后需要重新处理文档；仅执行索引重建不会重新生成向量。
 
 缺少 Voyage Key 或 OpenSearch URL 时，Worker 不会伪造成功，也不会静默跳过；Job 会保存明确的不可重试配置错误。
 

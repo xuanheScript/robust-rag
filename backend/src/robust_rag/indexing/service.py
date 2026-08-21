@@ -35,6 +35,7 @@ from robust_rag.db.models import (
     StageRun,
 )
 from robust_rag.indexing.opensearch import (
+    DocumentSearchHit,
     HttpOpenSearchAdapter,
     OpenSearchAdapter,
     OpenSearchAdapterError,
@@ -819,6 +820,7 @@ class IndexingService:
             ),
             "quality_flags": [str(value) for value in issue_codes],
             "embedding_model": node.embedding_model,
+            "embedding_config_version": node.embedding_config_version,
             "embedding": node.embedding_vector,
             "is_active": False,
             "document_updated_at": version.document.updated_at.isoformat(),
@@ -979,8 +981,24 @@ class UnavailableOpenSearchAdapter:
         del alias, query, size
         self._raise()
 
-    def search_dense_hits(self, alias: str, vector: list[float], size: int = 10) -> list[SearchHit]:
-        del alias, vector, size
+    def search_document_bm25_hits(
+        self, alias: str, query: str, size: int = 10
+    ) -> list[DocumentSearchHit]:
+        del alias, query, size
+        self._raise()
+
+    def search_chunk_bm25_hits(self, alias: str, query: str, size: int = 10) -> list[SearchHit]:
+        del alias, query, size
+        self._raise()
+
+    def search_dense_hits(
+        self,
+        alias: str,
+        vector: list[float],
+        size: int = 10,
+        embedding_config_version: str | None = None,
+    ) -> list[SearchHit]:
+        del alias, vector, size, embedding_config_version
         self._raise()
 
 
